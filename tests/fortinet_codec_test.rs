@@ -1,4 +1,4 @@
-use forti_vpn::tunnel::codec::{FortinetCodec, FortinetFrame};
+use forti_client::tunnel::codec::{FortinetCodec, FortinetFrame};
 
 #[test]
 fn test_encode_fortinet_frame() {

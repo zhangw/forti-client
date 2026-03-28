@@ -1,4 +1,4 @@
-use forti_vpn::ppp::codec::{PppFrame, PppProtocol};
+use forti_client::ppp::codec::{PppFrame, PppProtocol};
 
 #[test]
 fn test_ppp_protocol_values() {

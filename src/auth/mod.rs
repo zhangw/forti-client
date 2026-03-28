@@ -22,9 +22,12 @@ impl AuthClient {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let tls_config = rustls::ClientConfig::builder()
+        let mut tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
+
+        // Enable SSLKEYLOGFILE for TLS packet analysis (Wireshark)
+        tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
 
         Ok(Self {
             server: server.to_string(),

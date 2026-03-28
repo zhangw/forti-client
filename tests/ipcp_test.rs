@@ -1,4 +1,4 @@
-use forti_vpn::ppp::ipcp::{IpcpCode, IpcpOption, IpcpPacket, IpcpState};
+use forti_client::ppp::ipcp::{IpcpCode, IpcpOption, IpcpPacket, IpcpState};
 use std::net::Ipv4Addr;
 
 #[test]

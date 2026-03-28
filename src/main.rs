@@ -1,12 +1,12 @@
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
-use forti_vpn::auth::AuthClient;
-use forti_vpn::tunnel::TlsTunnel;
-use forti_vpn::ppp::PppEngine;
+use forti_client::auth::AuthClient;
+use forti_client::tunnel::TlsTunnel;
+use forti_client::ppp::PppEngine;
 use std::io::Write;
 
 #[derive(Parser, Debug)]
-#[command(name = "forti-vpn", about = "FortiGate SSL VPN client")]
+#[command(name = "forti-client", about = "FortiGate SSL VPN client")]
 struct Cli {
     /// VPN gateway hostname or IP
     #[arg(short, long)]

@@ -1,4 +1,4 @@
-use forti_vpn::ppp::lcp::{LcpPacket, LcpCode, LcpOption, LcpState};
+use forti_client::ppp::lcp::{LcpPacket, LcpCode, LcpOption, LcpState};
 
 #[test]
 fn test_encode_configure_request_mru_magic() {

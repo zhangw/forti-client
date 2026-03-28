@@ -1,5 +1,5 @@
 [package]
-name = "forti-vpn"
+name = "forti-client"
 version = "0.1.0"
 edition = "2021"
 description = "A Rust CLI client for FortiGate SSL VPN"

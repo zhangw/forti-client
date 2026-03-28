@@ -4,15 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A Rust CLI client (`forti-vpn`) that speaks the FortiGate SSL VPN wire protocol directly, targeting macOS. This fills a gap where no existing client provides macOS-native networking (utun + SystemConfiguration DNS) + SAML/SSO + DTLS + userspace PPP together.
+A Rust CLI client (`forti-client`) that speaks the FortiGate SSL VPN wire protocol directly, targeting macOS. This fills a gap where no existing client provides macOS-native networking (utun + SystemConfiguration DNS) + SAML/SSO + DTLS + userspace PPP together.
 
 **Status:** Phase 1 (feasibility) is complete and validated against a real FortiGate. SAML auth, TLS tunnel, and PPP negotiation all work end-to-end. Phase 2 will add TUN device, DNS/routes, keepalive, and DTLS.
 
 ## Build and Test Commands
 
 ```bash
-cd forti-vpn
-
 # Build
 cargo build
 
@@ -52,7 +50,7 @@ TLS Connection (rustls/tokio-rustls)
       -> LCP / IPCP / IP6CP / CCP / IPv4 data / IPv6 data
 ```
 
-### Module Layout (`forti-vpn/src/`)
+### Module Layout (`src/`)
 
 - **`ppp/`** — Standalone PPP engine with no network dependencies (testable in isolation)
   - `mod.rs` — `PppEngine` orchestrating LCP + IPCP negotiation over the tunnel
@@ -97,4 +95,4 @@ Rust 2021 edition, tokio 1.x (full), hyper 1.8, rustls 0.23, tokio-rustls 0.26, 
 
 - `docs/fortigate_sslvpn_wire_protocol.md` — Complete wire protocol spec (reverse-engineered from OpenConnect + openfortivpn)
 - `docs/superpowers/specs/2026-03-28-rust-fortigate-vpn-client-design.md` — Full design spec with crate ecosystem analysis and macOS platform details
-- `docs/superpowers/plans/2026-03-28-forti-vpn-phase1-feasibility.md` — Phase 1 implementation plan (10 tasks, TDD approach with test-first for each module)
+- `docs/superpowers/plans/2026-03-28-forti-client-phase1-feasibility.md` — Phase 1 implementation plan (10 tasks, TDD approach with test-first for each module)
