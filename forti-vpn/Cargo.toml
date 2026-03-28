@@ -1,0 +1,43 @@
+[package]
+name = "forti-vpn"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust CLI client for FortiGate SSL VPN"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# TLS
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+
+# HTTP (auth + tunnel upgrade)
+hyper = { version = "1", features = ["http1", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1"] }
+http = "1"
+http-body-util = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Utilities
+bytes = "1"
+rand = "0.8"
+
+[dev-dependencies]
+tokio-test = "0.4"
