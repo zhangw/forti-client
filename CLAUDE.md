@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Rust CLI client (`forti-client`) that speaks the FortiGate SSL VPN wire protocol directly, targeting macOS. This fills a gap where no existing client provides macOS-native networking (utun + SystemConfiguration DNS) + SAML/SSO + DTLS + userspace PPP together.
 
-**Status:** Phase 1 (feasibility) is complete and validated against a real FortiGate. SAML auth, TLS tunnel, and PPP negotiation all work end-to-end. Phase 2 will add TUN device, DNS/routes, keepalive, and DTLS.
+**Status:** Phase 1 (auth + PPP negotiation) and Phase 2 (data plane) are complete and validated against a real FortiGate. The VPN is fully functional: SAML auth, TLS tunnel, PPP negotiation, TUN device, split-tunnel routing, DNS, keepalive, and packet forwarding all work end-to-end. Phase 3 will add DTLS, reconnect, sleep/wake, and IPv6.
 
 ## Build and Test Commands
 
@@ -14,7 +14,7 @@ A Rust CLI client (`forti-client`) that speaks the FortiGate SSL VPN wire protoc
 # Build
 cargo build
 
-# Run all tests (25 tests across 4 test files)
+# Run all tests (29 tests across 5 test files)
 cargo test
 
 # Run a single test file
@@ -22,15 +22,19 @@ cargo test --test fortinet_codec_test
 cargo test --test ppp_codec_test
 cargo test --test lcp_test
 cargo test --test ipcp_test
+cargo test --test routes_test
 
 # Run a specific test by name
 cargo test test_encode_fortinet_frame
 
-# Run with SAML auth against a real FortiGate
-RUST_LOG=debug cargo run -- --server sslvpn.example.com --port 10443 --saml
+# Run with SAML auth (requires sudo for TUN/routes/DNS)
+cargo build && sudo RUST_LOG=debug ./target/debug/forti-client --server sslvpn.example.com --port 10443 --saml
 
 # Run with credential auth
-RUST_LOG=debug cargo run -- --server sslvpn.example.com --username user
+cargo build && sudo RUST_LOG=debug ./target/debug/forti-client --server sslvpn.example.com --username user
+
+# Run with TLS key logging for Wireshark analysis
+cargo build && sudo SSLKEYLOGFILE=~/.ssl-key.log RUST_LOG=debug ./target/debug/forti-client --server sslvpn.example.com --port 10443 --saml
 
 # Check without building
 cargo check
@@ -48,14 +52,15 @@ TLS Connection (rustls/tokio-rustls)
   -> Fortinet Wire Frame (6-byte header: [total_len:BE16][0x5050][payload_len:BE16])
     -> PPP Frame ([FF 03][protocol:BE16] or just [protocol:BE16] without address/control)
       -> LCP / IPCP / IP6CP / CCP / IPv4 data / IPv6 data
+        -> Raw IP packets read/written to macOS utun device
 ```
 
 ### Module Layout (`src/`)
 
 - **`ppp/`** — Standalone PPP engine with no network dependencies (testable in isolation)
-  - `mod.rs` — `PppEngine` orchestrating LCP + IPCP negotiation over the tunnel
+  - `mod.rs` — `PppEngine` orchestrating LCP + IPCP negotiation; `into_lcp()` exposes LCP state for post-negotiation keepalive
   - `codec.rs` — PPP frame encode/decode (supports both with and without `FF 03` prefix)
-  - `lcp.rs` — LCP state machine (MRU, Magic-Number, Echo keepalive; rejects PFCOMP/ACCOMP)
+  - `lcp.rs` — LCP state machine (MRU, Magic-Number, Echo keepalive, Terminate-Request; rejects PFCOMP/ACCOMP)
   - `ipcp.rs` — IPCP negotiation (IPv4 + DNS assignment; handles Configure-Reject by removing rejected options)
 - **`tunnel/`** — Transport layer
   - `codec.rs` — Fortinet wire frame codec (6-byte header with `0x5050` magic), including streaming `FortinetCodec` with desync recovery
@@ -63,6 +68,11 @@ TLS Connection (rustls/tokio-rustls)
 - **`auth/`** — HTTP authentication against FortiGate
   - `mod.rs` — Credential auth, SAML/SSO auth (browser-based with localhost callback on port 8020), 2FA support (tokeninfo + HTML form + FortiToken Mobile push)
   - `xml.rs` — Tunnel config XML parser (supports both single and double-quoted attributes)
+- **`tun/`** — macOS network configuration
+  - `mod.rs` — TUN device creation via `tun-rs` (utun)
+  - `routes.rs` — Split-tunnel route install/remove via `/sbin/route`
+  - `dns.rs` — DNS configuration via `scutil` (supplemental resolver)
+- **`vpn.rs`** — Main event loop: `tokio::select!` multiplexing TUN reads, tunnel reads, LCP keepalive timer, and Ctrl+C. Handles setup (TUN, routes, DNS) and cleanup on exit.
 - **`main.rs`** — CLI entry point with `--saml` flag for SSO, `--username`/`--password` for credential auth
 - **`error.rs`** — Error types via thiserror
 
@@ -78,23 +88,23 @@ TLS Connection (rustls/tokio-rustls)
 - Real FortiGate XML uses single-quoted attributes (`ipv4='10.8.2.6'`), not double quotes
 - Fortinet wire frame `total_len` = `payload_len + 6`
 
+### macOS Platform Details (learned from live testing)
+
+- **TUN (tun-rs 2.8.1)**: Uses `DeviceBuilder::new().ipv4(ip, 32, None).build_async()`. tun-rs handles AF headers internally — read/write raw IP packets directly (no 4-byte AF prefix). Detect IP version from first nibble (`0x4`=IPv4, `0x6`=IPv6).
+- **DNS**: `scutil` input must have no leading whitespace. Stdin must be closed after writing for scutil to process commands. Use `SupplementalMatchDomains * ""` for catch-all supplemental resolver.
+- **Routes**: `/sbin/route add -net <ip>/<prefix> -interface <utun>` for subnets, `-host <ip>` for /32. Tolerate "File exists" errors.
+- **Privilege**: Requires `sudo` — build first, then `sudo ./target/debug/forti-client`. Don't use `sudo cargo run` (interferes with terminal input for SAML).
+
 ### Tech Stack
 
-Rust 2021 edition, tokio 1.x (full), hyper 1.8, rustls 0.23, tokio-rustls 0.26, clap 4, tracing 0.1, thiserror 2, bytes 1.x. DTLS will use `openssl` crate (only mature DTLS option in Rust).
-
-### macOS-Specific Design Decisions
-
-- **TUN**: Uses `tun-rs` crate (utun). Every packet has a mandatory 4-byte AF header on macOS
-- **DNS**: `/etc/resolver/` files for split DNS + `scutil` for full tunnel (not `/etc/resolv.conf` — macOS ignores it)
-- **Routes**: Shell out to `/sbin/route` or use `net-route` crate (PF_ROUTE socket)
-- **No pppd**: Userspace PPP eliminates Apple's broken pppd (kernel panics on Apple Silicon, route hijacking, DNS races)
-- **No Network Extension**: Raw utun + routes + scutil (like Tailscale's `tailscaled`); NE requires app bundle + Apple Developer entitlement
-- **Privilege**: Runs as root via `sudo` in Phase 1; future: split into privileged launchd daemon + unprivileged CLI
+Rust 2021 edition, tokio 1.x (full), hyper 1.8, rustls 0.23, tokio-rustls 0.26, tun-rs 2.8, clap 4, tracing 0.1, thiserror 2, bytes 1.x. DTLS will use `openssl` crate (only mature DTLS option in Rust).
 
 ## Reference Documents
 
 - `docs/fortigate_sslvpn_wire_protocol.md` — Complete wire protocol spec (reverse-engineered from OpenConnect + openfortivpn)
-- `docs/phase1-findings.md` — Real-server testing findings: protocol deviations, negotiation trace, SAML flow details
-- `docs/phase2-architecture.md` — Phase 2 data plane architecture: TUN device, routes, DNS, event loop, keepalive
-- `docs/superpowers/specs/2026-03-28-rust-fortigate-vpn-client-design.md` — Full design spec with crate ecosystem analysis and macOS platform details
-- `docs/superpowers/plans/2026-03-28-forti-vpn-phase1-feasibility.md` — Phase 1 implementation plan (10 tasks, TDD approach with test-first for each module)
+- `docs/phase1-findings.md` — Phase 1 real-server findings: protocol deviations, negotiation trace, SAML flow
+- `docs/phase2-findings.md` — Phase 2 real-server findings: tun-rs AF header behavior, DNS scutil format, live test results
+- `docs/phase2-architecture.md` — Phase 2 data plane architecture design
+- `docs/superpowers/specs/2026-03-28-rust-fortigate-vpn-client-design.md` — Full design spec with crate ecosystem analysis
+- `docs/superpowers/plans/2026-03-28-forti-vpn-phase1-feasibility.md` — Phase 1 implementation plan
+- `docs/superpowers/plans/2026-03-29-forti-client-phase2-data-plane.md` — Phase 2 implementation plan
