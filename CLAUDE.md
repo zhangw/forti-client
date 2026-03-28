@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Rust CLI client (`forti-vpn`) that speaks the FortiGate SSL VPN wire protocol directly, targeting macOS. This fills a gap where no existing client provides macOS-native networking (utun + SystemConfiguration DNS) + SAML/SSO + DTLS + userspace PPP together.
 
-The project is in early development. Phase 1 (feasibility) covers PPP codec, HTTP authentication, and TLS tunnel upgrade. Phase 2/3 will add TUN device, DNS/routes, SAML, and DTLS.
+**Status:** Phase 1 (feasibility) is complete and validated against a real FortiGate. SAML auth, TLS tunnel, and PPP negotiation all work end-to-end. Phase 2 will add TUN device, DNS/routes, keepalive, and DTLS.
 
 ## Build and Test Commands
 
@@ -16,7 +16,7 @@ cd forti-vpn
 # Build
 cargo build
 
-# Run all tests
+# Run all tests (25 tests across 4 test files)
 cargo test
 
 # Run a single test file
@@ -28,7 +28,10 @@ cargo test --test ipcp_test
 # Run a specific test by name
 cargo test test_encode_fortinet_frame
 
-# Run with logging
+# Run with SAML auth against a real FortiGate
+RUST_LOG=debug cargo run -- --server vpn.example.com --port 10443 --saml
+
+# Run with credential auth
 RUST_LOG=debug cargo run -- --server vpn.example.com --username user
 
 # Check without building
@@ -45,33 +48,37 @@ cargo clippy
 ```
 TLS Connection (rustls/tokio-rustls)
   -> Fortinet Wire Frame (6-byte header: [total_len:BE16][0x5050][payload_len:BE16])
-    -> PPP Frame (4-byte header: [FF 03][protocol:BE16])
+    -> PPP Frame ([FF 03][protocol:BE16] or just [protocol:BE16] without address/control)
       -> LCP / IPCP / IP6CP / CCP / IPv4 data / IPv6 data
 ```
 
 ### Module Layout (`forti-vpn/src/`)
 
 - **`ppp/`** — Standalone PPP engine with no network dependencies (testable in isolation)
-  - `codec.rs` — PPP frame encode/decode (`FF 03` + 2-byte protocol + payload)
+  - `mod.rs` — `PppEngine` orchestrating LCP + IPCP negotiation over the tunnel
+  - `codec.rs` — PPP frame encode/decode (supports both with and without `FF 03` prefix)
   - `lcp.rs` — LCP state machine (MRU, Magic-Number, Echo keepalive; rejects PFCOMP/ACCOMP)
-  - `ipcp.rs` — IPCP negotiation (IPv4 + DNS assignment from server)
+  - `ipcp.rs` — IPCP negotiation (IPv4 + DNS assignment; handles Configure-Reject by removing rejected options)
 - **`tunnel/`** — Transport layer
-  - `codec.rs` — Fortinet wire frame codec (6-byte header with `0x5050` magic), including streaming `FortinetCodec` for extracting frames from a byte buffer
-  - `mod.rs` — TLS tunnel establishment (upgrades HTTP connection to raw PPP-over-TLS)
+  - `codec.rs` — Fortinet wire frame codec (6-byte header with `0x5050` magic), including streaming `FortinetCodec` with desync recovery
+  - `mod.rs` — TLS tunnel establishment (raw HTTP/1.1 upgrade to binary PPP-over-TLS)
 - **`auth/`** — HTTP authentication against FortiGate
-  - `mod.rs` — Credential auth (`POST /remote/logincheck` with `credential` field, not `password`)
-  - `xml.rs` — Tunnel config XML parser (`GET /remote/fortisslvpn_xml`)
-- **`main.rs`** — CLI entry point and args via clap
+  - `mod.rs` — Credential auth, SAML/SSO auth (browser-based with localhost callback on port 8020), 2FA support (tokeninfo + HTML form + FortiToken Mobile push)
+  - `xml.rs` — Tunnel config XML parser (supports both single and double-quoted attributes)
+- **`main.rs`** — CLI entry point with `--saml` flag for SSO, `--username`/`--password` for credential auth
 - **`error.rs`** — Error types via thiserror
 
-### Key Protocol Details
+### Key Protocol Details (learned from real-server testing)
 
 - The password field in login POST is named `credential`, not `password`
-- FortiGate sends LCP Configure-Request with PFCOMP (type 7) and ACCOMP (type 8) — always reject both; the server rejects compressed frames
-- PPP address/control field is always `FF 03` — no compression negotiated
-- IPCP: client sends all-zeros to request assignment; server assigns IPv4, DNS (options 129/130), NBNS (options 131/132)
-- After `GET /remote/sslvpn-tunnel`, the server sends NO HTTP response on success — it silently transitions to raw binary PPP framing. If the first bytes look like `HTTP/`, it's an error. The tunnel module writes raw HTTP on the TLS stream (not via hyper) then switches to binary mode
-- Fortinet wire frame `total_len` = `payload_len + 6` (counts from byte 2 onward)
+- FortiGate sends LCP Configure-Request with PFCOMP (type 7) and ACCOMP (type 8) — always reject both
+- PPP frames from the server may omit the `FF 03` address/control prefix — the codec handles both formats
+- IPCP: server may Configure-Reject DNS options (0x81/0x82) — must resend without them. DNS is assigned via XML config instead.
+- After `GET /remote/sslvpn-tunnel`, the server sends NO HTTP response on success — silently transitions to binary PPP. Some servers wait for the client to send the first LCP packet before responding.
+- `GET /remote/fortisslvpn` resource reservation is required before XML config fetch or tunnel upgrade
+- The server may close the TCP connection between HTTP requests — each step (login, reservation, XML, tunnel) should use a fresh TLS connection
+- Real FortiGate XML uses single-quoted attributes (`ipv4='10.8.2.6'`), not double quotes
+- Fortinet wire frame `total_len` = `payload_len + 6`
 
 ### Tech Stack
 
