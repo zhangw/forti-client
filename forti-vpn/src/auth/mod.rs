@@ -67,7 +67,7 @@ impl AuthClient {
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Content-Length", body.len())
             .body(http_body_util::Full::new(bytes::Bytes::from(body)))
-            .map_err(|e| FortiError::Http(e))?;
+            .map_err(FortiError::Http)?;
 
         info!("Sending login request");
         let resp = sender.send_request(req).await
@@ -98,7 +98,7 @@ impl AuthClient {
             .header("Host", &self.server)
             .header("Cookie", format!("SVPNCOOKIE={}", svpn_cookie))
             .body(http_body_util::Full::new(bytes::Bytes::new()))
-            .map_err(|e| FortiError::Http(e))?;
+            .map_err(FortiError::Http)?;
 
         debug!("Fetching tunnel configuration");
         let resp = sender.send_request(req).await

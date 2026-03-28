@@ -60,6 +60,12 @@ impl FortinetFrame {
 
 pub struct FortinetCodec;
 
+impl Default for FortinetCodec {
+    fn default() -> Self {
+        Self
+    }
+}
+
 impl FortinetCodec {
     pub fn new() -> Self {
         Self
