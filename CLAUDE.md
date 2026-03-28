@@ -94,5 +94,7 @@ Rust 2021 edition, tokio 1.x (full), hyper 1.8, rustls 0.23, tokio-rustls 0.26, 
 ## Reference Documents
 
 - `docs/fortigate_sslvpn_wire_protocol.md` — Complete wire protocol spec (reverse-engineered from OpenConnect + openfortivpn)
+- `docs/phase1-findings.md` — Real-server testing findings: protocol deviations, negotiation trace, SAML flow details
+- `docs/phase2-architecture.md` — Phase 2 data plane architecture: TUN device, routes, DNS, event loop, keepalive
 - `docs/superpowers/specs/2026-03-28-rust-fortigate-vpn-client-design.md` — Full design spec with crate ecosystem analysis and macOS platform details
-- `docs/superpowers/plans/2026-03-28-forti-client-phase1-feasibility.md` — Phase 1 implementation plan (10 tasks, TDD approach with test-first for each module)
+- `docs/superpowers/plans/2026-03-28-forti-vpn-phase1-feasibility.md` — Phase 1 implementation plan (10 tasks, TDD approach with test-first for each module)
