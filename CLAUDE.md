@@ -61,7 +61,7 @@ TLS Connection (rustls/tokio-rustls)
 - **`auth/`** — HTTP authentication against FortiGate
   - `mod.rs` — Credential auth (`POST /remote/logincheck` with `credential` field, not `password`)
   - `xml.rs` — Tunnel config XML parser (`GET /remote/fortisslvpn_xml`)
-- **`config.rs`** — CLI args via clap
+- **`main.rs`** — CLI entry point and args via clap
 - **`error.rs`** — Error types via thiserror
 
 ### Key Protocol Details
@@ -70,7 +70,7 @@ TLS Connection (rustls/tokio-rustls)
 - FortiGate sends LCP Configure-Request with PFCOMP (type 7) and ACCOMP (type 8) — always reject both; the server rejects compressed frames
 - PPP address/control field is always `FF 03` — no compression negotiated
 - IPCP: client sends all-zeros to request assignment; server assigns IPv4, DNS (options 129/130), NBNS (options 131/132)
-- After `GET /remote/sslvpn-tunnel`, the HTTP connection transitions to raw binary PPP framing on the same TLS socket — this is why we use `hyper` (exposes the socket) instead of `reqwest` (hides it)
+- After `GET /remote/sslvpn-tunnel`, the server sends NO HTTP response on success — it silently transitions to raw binary PPP framing. If the first bytes look like `HTTP/`, it's an error. The tunnel module writes raw HTTP on the TLS stream (not via hyper) then switches to binary mode
 - Fortinet wire frame `total_len` = `payload_len + 6` (counts from byte 2 onward)
 
 ### Tech Stack
