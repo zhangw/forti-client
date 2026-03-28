@@ -73,13 +73,13 @@ async fn main() -> anyhow::Result<()> {
     };
 
     tracing::info!(
-        "Authenticated. Tunnel config: IP={}, DNS={:?}, {} routes",
+        "Authenticated. IP={}, DNS={:?}, {} routes",
         auth_result.tunnel_config.ip_address,
         auth_result.tunnel_config.dns_servers,
         auth_result.tunnel_config.routes.len(),
     );
 
-    // Step 2: Establish TLS tunnel
+    // Establish TLS tunnel
     tracing::info!("Establishing TLS tunnel");
     let mut tunnel = TlsTunnel::connect(
         &cli.server,
@@ -89,26 +89,19 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Step 3: PPP negotiation
+    // PPP negotiation
     tracing::info!("Running PPP negotiation");
     let mut ppp = PppEngine::new(1500);
     let ipcp_config = ppp.negotiate(&mut tunnel).await?;
 
-    tracing::info!("PPP negotiation complete!");
-    tracing::info!("  Assigned IP:    {}", ipcp_config.ip_address);
+    tracing::info!("PPP negotiation complete — IP={}", ipcp_config.ip_address);
     if let Some(dns) = ipcp_config.primary_dns {
-        tracing::info!("  Primary DNS:    {}", dns);
-    }
-    if let Some(dns) = ipcp_config.secondary_dns {
-        tracing::info!("  Secondary DNS:  {}", dns);
+        tracing::info!("  Primary DNS: {}", dns);
     }
 
-    tracing::info!("Phase 1 feasibility validated — tunnel is up and negotiated.");
-    tracing::info!("Press Ctrl+C to disconnect.");
-
-    // Keep the tunnel alive with LCP Echo
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("Disconnecting...");
+    // Extract LCP state for keepalive and run the VPN data plane
+    let lcp = ppp.into_lcp();
+    forti_client::vpn::run(tunnel, lcp, &auth_result.tunnel_config).await?;
 
     Ok(())
 }
