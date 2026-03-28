@@ -35,6 +35,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 
+# TUN device (macOS utun)
+tun-rs = { version = "2", features = ["async"] }
+
 # Utilities
 bytes = "1"
 rand = "0.8"
