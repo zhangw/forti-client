@@ -77,7 +77,6 @@ impl PppEngine {
                     let ccp_reject = build_protocol_reject(
                         PppProtocol::Ccp.to_u16(),
                         ppp.data(),
-                        self.lcp.our_magic(),
                     );
                     self.send_ppp(tunnel, PppProtocol::Lcp, ccp_reject).await?;
                 }
@@ -148,7 +147,7 @@ impl PppEngine {
 }
 
 /// Build an LCP Protocol-Reject packet (code 8).
-fn build_protocol_reject(rejected_protocol: u16, rejected_data: &[u8], _magic: u32) -> Vec<u8> {
+fn build_protocol_reject(rejected_protocol: u16, rejected_data: &[u8]) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&rejected_protocol.to_be_bytes());
     payload.extend_from_slice(rejected_data);

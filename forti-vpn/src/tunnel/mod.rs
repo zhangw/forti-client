@@ -43,28 +43,32 @@ impl TlsTunnel {
 
         info!("Sent tunnel upgrade request");
 
+        // After sending the tunnel request, read the first bytes.
+        // Per the FortiGate wire protocol spec: on success, the server sends NO
+        // HTTP response — the connection silently transitions to raw binary PPP
+        // framing. Only on failure does the server send an HTTP error response.
         let mut response_buf = vec![0u8; 4096];
         let n = tls.read(&mut response_buf).await?;
-        let response_str = String::from_utf8_lossy(&response_buf[..n]);
+        if n == 0 {
+            return Err(FortiError::TunnelError(
+                "connection closed after tunnel request".into(),
+            ));
+        }
 
-        if !response_str.contains("200") {
+        let leftover = if response_buf[..n].starts_with(b"HTTP/") {
+            // Error: server sent an HTTP response instead of transitioning to tunnel
+            let response_str = String::from_utf8_lossy(&response_buf[..n]);
             return Err(FortiError::TunnelError(format!(
                 "tunnel upgrade failed: {}",
                 response_str.lines().next().unwrap_or("empty response"),
             )));
-        }
-
-        debug!(
-            "Tunnel upgrade response: {}",
-            response_str.lines().next().unwrap_or("")
-        );
-
-        let header_end = response_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(n);
-
-        let leftover = if header_end < n {
-            response_buf[header_end..n].to_vec()
         } else {
-            Vec::new()
+            // Success: these are the first bytes of binary PPP tunnel data
+            debug!(
+                "Tunnel active — received {} bytes of initial PPP data",
+                n
+            );
+            response_buf[..n].to_vec()
         };
 
         info!(

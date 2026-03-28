@@ -318,10 +318,10 @@ impl IpcpState {
         }
     }
 
-    /// Returns the negotiated configuration if the IP address has been
-    /// assigned (non-zero), regardless of whether the ACK has been received.
+    /// Returns the negotiated configuration only after the ACK has been
+    /// received (negotiation complete) and an IP address has been assigned.
     pub fn config(&self) -> Option<IpcpConfig> {
-        if self.ip_address.is_unspecified() {
+        if !self.negotiation_complete || self.ip_address.is_unspecified() {
             return None;
         }
         Some(IpcpConfig {

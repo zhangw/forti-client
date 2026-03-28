@@ -44,7 +44,15 @@ impl FortinetFrame {
                 buf[2], buf[3]
             )));
         }
+        let total_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
         let payload_len = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+        if total_len != payload_len + HEADER_LEN {
+            return Err(FortiError::ProtocolError(format!(
+                "frame length mismatch: total_len={} but payload_len+6={}",
+                total_len,
+                payload_len + HEADER_LEN,
+            )));
+        }
         if buf.len() < HEADER_LEN + payload_len {
             return Err(FortiError::ProtocolError(format!(
                 "frame truncated: have {} bytes, need {}",
@@ -75,9 +83,32 @@ impl FortinetCodec {
         if buf.len() < HEADER_LEN {
             return None;
         }
+
         if buf[2..4] != FORTINET_MAGIC {
-            return None;
+            // Protocol desync — scan forward for magic bytes
+            if let Some(pos) = buf.windows(2).position(|w| w == FORTINET_MAGIC) {
+                // The magic is at offset `pos`, but it should be at offset 2.
+                // So the frame header starts at `pos - 2` if pos >= 2.
+                if pos >= 2 {
+                    let _discarded: Vec<u8> = buf.drain(..pos - 2).collect();
+                    // Try again with the realigned buffer
+                    return self.try_decode(buf);
+                } else {
+                    // Magic too close to start, discard up to magic position
+                    let _discarded: Vec<u8> = buf.drain(..pos).collect();
+                    return None;
+                }
+            } else {
+                // No magic found anywhere — discard all but last byte
+                // (magic could straddle reads)
+                let keep = 1;
+                if buf.len() > keep {
+                    buf.drain(..buf.len() - keep);
+                }
+                return None;
+            }
         }
+
         let payload_len = u16::from_be_bytes([buf[4], buf[5]]) as usize;
         let frame_len = HEADER_LEN + payload_len;
         if buf.len() < frame_len {

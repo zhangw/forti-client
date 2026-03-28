@@ -50,12 +50,12 @@ impl AuthClient {
         // Step 1: POST /remote/logincheck
         let body = if let Some(realm) = realm {
             format!(
-                "ajax=1&username={}&credential={}&realm={}",
+                "ajax=1&username={}&credential={}&realm={}&just_logged_in=1",
                 urlencoded(username), urlencoded(password), urlencoded(realm),
             )
         } else {
             format!(
-                "ajax=1&username={}&credential={}",
+                "ajax=1&username={}&credential={}&just_logged_in=1",
                 urlencoded(username), urlencoded(password),
             )
         };
@@ -64,6 +64,7 @@ impl AuthClient {
             .method("POST")
             .uri("/remote/logincheck")
             .header("Host", &self.server)
+            .header("User-Agent", "Mozilla/5.0 SV1")
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Content-Length", body.len())
             .body(http_body_util::Full::new(bytes::Bytes::from(body)))
@@ -96,6 +97,7 @@ impl AuthClient {
             .method("GET")
             .uri("/remote/fortisslvpn_xml?dual_stack=1")
             .header("Host", &self.server)
+            .header("User-Agent", "Mozilla/5.0 SV1")
             .header("Cookie", format!("SVPNCOOKIE={}", svpn_cookie))
             .body(http_body_util::Full::new(bytes::Bytes::new()))
             .map_err(FortiError::Http)?;

@@ -27,11 +27,22 @@ impl TunnelConfig {
             .unwrap_or(Ipv4Addr::UNSPECIFIED);
 
         let mut dns_servers = Vec::new();
-        if let Some(dns1) = extract_text(xml, "dns") {
+        // Attribute format: <dns ip="..."/>
+        if let Some(dns1) = extract_tag_attr(xml, "dns", "ip") {
             if let Ok(addr) = dns1.parse() { dns_servers.push(addr); }
         }
-        if let Some(dns2) = extract_text(xml, "dns2") {
+        // Attribute format: <dns2 ip="..."/>
+        if let Some(dns2) = extract_tag_attr(xml, "dns2", "ip") {
             if let Ok(addr) = dns2.parse() { dns_servers.push(addr); }
+        }
+        // Fallback: text format <dns>x.x.x.x</dns>
+        if dns_servers.is_empty() {
+            if let Some(dns1) = extract_text(xml, "dns") {
+                if let Ok(addr) = dns1.parse() { dns_servers.push(addr); }
+            }
+            if let Some(dns2) = extract_text(xml, "dns2") {
+                if let Ok(addr) = dns2.parse() { dns_servers.push(addr); }
+            }
         }
 
         let mut routes = Vec::new();
@@ -56,29 +67,56 @@ impl TunnelConfig {
     }
 }
 
+/// Check that the character after the tag name is a valid tag-name terminator
+/// (whitespace, `>`, `/`, or end-of-string). This prevents `<dns` from matching `<dns2>`.
+fn is_tag_boundary(c: Option<char>) -> bool {
+    match c {
+        None => true,
+        Some(ch) => ch.is_whitespace() || ch == '>' || ch == '/',
+    }
+}
+
 fn extract_text(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{}", tag);
     let close = format!("</{}>", tag);
-    let start_idx = xml.find(&open)?;
-    let after_open = &xml[start_idx + open.len()..];
-    let content_start = after_open.find('>')? + 1;
-    let content = &after_open[content_start..];
-    let end_idx = content.find(&close)?;
-    let text = content[..end_idx].trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
+    let mut search_from = 0;
+    while let Some(pos) = xml[search_from..].find(&open) {
+        let abs_pos = search_from + pos;
+        let after_open = &xml[abs_pos + open.len()..];
+        if !is_tag_boundary(after_open.chars().next()) {
+            search_from = abs_pos + open.len();
+            continue;
+        }
+        let content_start = after_open.find('>')? + 1;
+        let content = &after_open[content_start..];
+        let end_idx = content.find(&close)?;
+        let text = content[..end_idx].trim().to_string();
+        return if text.is_empty() { None } else { Some(text) };
+    }
+    None
 }
 
 fn extract_tag_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
     let open = format!("<{}", tag);
-    let start_idx = xml.find(&open)?;
-    let after_open = &xml[start_idx + open.len()..];
-    let tag_end = after_open.find('>')?;
-    let tag_content = &after_open[..tag_end];
-    let attr_pattern = format!("{}=\"", attr);
-    let attr_start = tag_content.find(&attr_pattern)?;
-    let value_start = attr_start + attr_pattern.len();
-    let value_end = tag_content[value_start..].find('"')?;
-    Some(tag_content[value_start..value_start + value_end].to_string())
+    let mut search_from = 0;
+    while let Some(pos) = xml[search_from..].find(&open) {
+        let abs_pos = search_from + pos;
+        let after_open = &xml[abs_pos + open.len()..];
+        if !is_tag_boundary(after_open.chars().next()) {
+            search_from = abs_pos + open.len();
+            continue;
+        }
+        let tag_end = after_open.find('>')?;
+        let tag_content = &after_open[..tag_end];
+        let attr_pattern = format!("{}=\"", attr);
+        if let Some(attr_start) = tag_content.find(&attr_pattern) {
+            let value_start = attr_start + attr_pattern.len();
+            let value_end = tag_content[value_start..].find('"')?;
+            return Some(tag_content[value_start..value_start + value_end].to_string());
+        }
+        search_from = abs_pos + open.len();
+    }
+    None
 }
 
 fn find_all_tag_attrs(xml: &str, tag: &str) -> Vec<std::collections::HashMap<String, String>> {
@@ -89,6 +127,10 @@ fn find_all_tag_attrs(xml: &str, tag: &str) -> Vec<std::collections::HashMap<Str
     while let Some(pos) = xml[search_from..].find(&open) {
         let abs_pos = search_from + pos;
         let after_open = &xml[abs_pos + open.len()..];
+        if !is_tag_boundary(after_open.chars().next()) {
+            search_from = abs_pos + open.len();
+            continue;
+        }
         if let Some(tag_end) = after_open.find('>') {
             let tag_content = &after_open[..tag_end];
             let mut attrs = std::collections::HashMap::new();
