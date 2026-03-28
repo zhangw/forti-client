@@ -1,6 +1,6 @@
 use crate::error::{FortiError, Result};
 use std::net::Ipv4Addr;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use tracing::{info, debug};
 
 const SCUTIL_SERVICE: &str = "State:/Network/Service/forti-client/DNS";
@@ -14,29 +14,33 @@ pub fn configure_dns(servers: &[Ipv4Addr]) -> Result<()> {
     let server_strs: Vec<String> = servers.iter().map(|s| s.to_string()).collect();
     let servers_joined = server_strs.join(" ");
 
+    // scutil commands — no leading whitespace, each on its own line
     let scutil_input = format!(
-        "d.init\n\
-         d.add ServerAddresses * {}\n\
-         d.add SupplementalMatchDomains * \"\"\n\
-         set {}\n",
-        servers_joined, SCUTIL_SERVICE,
+        "d.init\nd.add ServerAddresses * {servers}\nd.add SupplementalMatchDomains * \"\"\nset {service}\n",
+        servers = servers_joined,
+        service = SCUTIL_SERVICE,
     );
 
     debug!("Configuring DNS via scutil:\n{}", scutil_input.trim());
 
-    let output = Command::new("/usr/sbin/scutil")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+    let mut child = Command::new("/usr/sbin/scutil")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(scutil_input.as_bytes())?;
-            }
-            child.wait_with_output()
-        })
-        .map_err(|e| FortiError::TunnelError(format!("failed to run scutil: {}", e)))?;
+        .map_err(|e| FortiError::TunnelError(format!("failed to spawn scutil: {}", e)))?;
+
+    // Write input and close stdin so scutil processes it
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut()
+            .ok_or_else(|| FortiError::TunnelError("failed to open scutil stdin".into()))?;
+        stdin.write_all(scutil_input.as_bytes())
+            .map_err(|e| FortiError::TunnelError(format!("failed to write to scutil: {}", e)))?;
+    } // stdin is dropped here, closing the pipe
+
+    let output = child.wait_with_output()
+        .map_err(|e| FortiError::TunnelError(format!("scutil failed: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -51,15 +55,17 @@ pub fn remove_dns() {
     let scutil_input = format!("remove {}\n", SCUTIL_SERVICE);
 
     let result = Command::new("/usr/sbin/scutil")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(scutil_input.as_bytes())?;
-            }
+            {
+                use std::io::Write;
+                if let Some(ref mut stdin) = child.stdin {
+                    stdin.write_all(scutil_input.as_bytes())?;
+                }
+            } // close stdin
             child.wait_with_output()
         });
 

@@ -61,34 +61,55 @@ async fn event_loop(
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut missed_echoes: u32 = 0;
     let mut tun_buf = vec![0u8; 4096];
+    let mut pkt_count: u64 = 0;
 
     loop {
         tokio::select! {
-            // TUN -> Tunnel (outbound: app sends packet through VPN)
+            // TUN → Tunnel (outbound: app sends packet through VPN)
             result = tun_dev.recv(&mut tun_buf) => {
                 let n = result.map_err(|e| FortiError::TunnelError(
                     format!("TUN read error: {}", e)
                 ))?;
-                if n <= 4 {
-                    continue; // too short -- no IP packet after AF header
+                if n == 0 {
+                    continue;
                 }
-                // Strip the 4-byte AF header (macOS utun requirement)
-                let ip_packet = &tun_buf[4..n];
-                let ppp = PppFrame::new(PppProtocol::Ipv4, ip_packet.to_vec());
+
+                // tun-rs on macOS gives raw IP packets (no AF header).
+                // Determine IP version from the first nibble.
+                let version = tun_buf[0] >> 4;
+                let protocol = match version {
+                    4 => PppProtocol::Ipv4,
+                    6 => {
+                        debug!("TUN: ignoring outbound IPv6 packet");
+                        continue;
+                    }
+                    _ => {
+                        debug!("TUN: unknown IP version {}, skipping", version);
+                        continue;
+                    }
+                };
+
+                pkt_count += 1;
+                if pkt_count <= 5 {
+                    debug!("TUN → tunnel: {} bytes IPv4", n);
+                }
+                let ppp = PppFrame::new(protocol, tun_buf[..n].to_vec());
                 tunnel.send_frame(ppp.encode()).await?;
             }
 
-            // Tunnel -> TUN (inbound: FortiGate sends packet to us)
+            // Tunnel → TUN (inbound: FortiGate sends packet to us)
             result = tunnel.recv_frame() => {
                 let frame = result?;
                 let ppp = PppFrame::decode(frame.payload())?;
 
                 match ppp.protocol() {
                     PppProtocol::Ipv4 => {
-                        // Prepend 4-byte AF_INET header for macOS utun
-                        let mut buf = vec![0u8, 0, 0, 2]; // AF_INET = 2
-                        buf.extend_from_slice(ppp.data());
-                        tun_dev.send(&buf).await.map_err(|e| {
+                        // tun-rs expects raw IP packets (no AF header)
+                        pkt_count += 1;
+                        if pkt_count <= 10 {
+                            debug!("Tunnel → TUN: {} bytes IPv4", ppp.data().len());
+                        }
+                        tun_dev.send(ppp.data()).await.map_err(|e| {
                             FortiError::TunnelError(format!("TUN write error: {}", e))
                         })?;
                     }
@@ -100,7 +121,7 @@ async fn event_loop(
                             tunnel.send_frame(ppp_frame.encode()).await?;
                         }
                         if code == 10 {
-                            // Echo-Reply received -- peer is alive
+                            // Echo-Reply received — peer is alive
                             missed_echoes = 0;
                         }
                         if code == 5 {
@@ -110,7 +131,7 @@ async fn event_loop(
                         }
                     }
                     PppProtocol::Ipv6 => {
-                        debug!("Ignoring IPv6 packet");
+                        debug!("Ignoring inbound IPv6 packet");
                     }
                     other => {
                         debug!("Ignoring PPP protocol {:?}", other);
