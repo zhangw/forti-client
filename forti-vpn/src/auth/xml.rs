@@ -27,13 +27,11 @@ impl TunnelConfig {
             .unwrap_or(Ipv4Addr::UNSPECIFIED);
 
         let mut dns_servers = Vec::new();
-        // Attribute format: <dns ip="..."/>
-        if let Some(dns1) = extract_tag_attr(xml, "dns", "ip") {
-            if let Ok(addr) = dns1.parse() { dns_servers.push(addr); }
-        }
-        // Attribute format: <dns2 ip="..."/>
-        if let Some(dns2) = extract_tag_attr(xml, "dns2", "ip") {
-            if let Ok(addr) = dns2.parse() { dns_servers.push(addr); }
+        // Collect all <dns ip="..."/> entries
+        for attrs in find_all_tag_attrs(xml, "dns") {
+            if let Some(ip_str) = attrs.get("ip") {
+                if let Ok(addr) = ip_str.parse() { dns_servers.push(addr); }
+            }
         }
         // Fallback: text format <dns>x.x.x.x</dns>
         if dns_servers.is_empty() {
@@ -54,8 +52,12 @@ impl TunnelConfig {
             }
         }
 
-        let idle_timeout = extract_text(xml, "idle-timeout").and_then(|s| s.parse().ok());
-        let auth_timeout = extract_text(xml, "auth-timeout").and_then(|s| s.parse().ok());
+        let idle_timeout = extract_tag_attr(xml, "idle-timeout", "val")
+            .or_else(|| extract_text(xml, "idle-timeout"))
+            .and_then(|s| s.parse().ok());
+        let auth_timeout = extract_tag_attr(xml, "auth-timeout", "val")
+            .or_else(|| extract_text(xml, "auth-timeout"))
+            .and_then(|s| s.parse().ok());
         let dtls_port = extract_text(xml, "dtls-config")
             .and_then(|s| extract_text(&s, "port"))
             .and_then(|s| s.parse().ok());
@@ -67,8 +69,7 @@ impl TunnelConfig {
     }
 }
 
-/// Check that the character after the tag name is a valid tag-name terminator
-/// (whitespace, `>`, `/`, or end-of-string). This prevents `<dns` from matching `<dns2>`.
+/// Check that the character after the tag name is a valid tag-name terminator.
 fn is_tag_boundary(c: Option<char>) -> bool {
     match c {
         None => true,
@@ -96,6 +97,7 @@ fn extract_text(xml: &str, tag: &str) -> Option<String> {
     None
 }
 
+/// Extract a specific attribute value from a tag, supporting both single and double quotes.
 fn extract_tag_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
     let open = format!("<{}", tag);
     let mut search_from = 0;
@@ -108,17 +110,15 @@ fn extract_tag_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
         }
         let tag_end = after_open.find('>')?;
         let tag_content = &after_open[..tag_end];
-        let attr_pattern = format!("{}=\"", attr);
-        if let Some(attr_start) = tag_content.find(&attr_pattern) {
-            let value_start = attr_start + attr_pattern.len();
-            let value_end = tag_content[value_start..].find('"')?;
-            return Some(tag_content[value_start..value_start + value_end].to_string());
+        if let Some(value) = find_attr_value(tag_content, attr) {
+            return Some(value);
         }
         search_from = abs_pos + open.len();
     }
     None
 }
 
+/// Find all occurrences of a tag and extract their attributes (supports single and double quotes).
 fn find_all_tag_attrs(xml: &str, tag: &str) -> Vec<std::collections::HashMap<String, String>> {
     let open = format!("<{}", tag);
     let mut results = Vec::new();
@@ -133,24 +133,72 @@ fn find_all_tag_attrs(xml: &str, tag: &str) -> Vec<std::collections::HashMap<Str
         }
         if let Some(tag_end) = after_open.find('>') {
             let tag_content = &after_open[..tag_end];
-            let mut attrs = std::collections::HashMap::new();
-            let mut remaining = tag_content;
-            while let Some(eq_pos) = remaining.find("=\"") {
-                let before_eq = &remaining[..eq_pos];
-                let attr_name = before_eq.rsplit_once(char::is_whitespace)
-                    .map(|(_, name)| name)
-                    .unwrap_or(before_eq)
-                    .trim();
-                let value_start = eq_pos + 2;
-                if let Some(value_end) = remaining[value_start..].find('"') {
-                    let value = &remaining[value_start..value_start + value_end];
-                    attrs.insert(attr_name.to_string(), value.to_string());
-                    remaining = &remaining[value_start + value_end + 1..];
-                } else { break; }
-            }
+            let attrs = parse_all_attrs(tag_content);
             if !attrs.is_empty() { results.push(attrs); }
             search_from = abs_pos + open.len() + tag_end;
         } else { break; }
     }
     results
+}
+
+/// Find the value of a specific attribute, supporting both `attr="val"` and `attr='val'`.
+fn find_attr_value(tag_content: &str, attr: &str) -> Option<String> {
+    // Try double quotes
+    let dq_pattern = format!("{}=\"", attr);
+    if let Some(start) = tag_content.find(&dq_pattern) {
+        let value_start = start + dq_pattern.len();
+        if let Some(value_end) = tag_content[value_start..].find('"') {
+            return Some(tag_content[value_start..value_start + value_end].to_string());
+        }
+    }
+    // Try single quotes
+    let sq_pattern = format!("{}='", attr);
+    if let Some(start) = tag_content.find(&sq_pattern) {
+        let value_start = start + sq_pattern.len();
+        if let Some(value_end) = tag_content[value_start..].find('\'') {
+            return Some(tag_content[value_start..value_start + value_end].to_string());
+        }
+    }
+    None
+}
+
+/// Parse all attributes from tag content, supporting both quote styles.
+fn parse_all_attrs(tag_content: &str) -> std::collections::HashMap<String, String> {
+    let mut attrs = std::collections::HashMap::new();
+    let mut remaining = tag_content;
+
+    while !remaining.is_empty() {
+        // Find the next = sign
+        let eq_pos = match remaining.find('=') {
+            Some(p) => p,
+            None => break,
+        };
+
+        // Extract attribute name (word before =)
+        let before_eq = &remaining[..eq_pos];
+        let attr_name = before_eq.rsplit_once(char::is_whitespace)
+            .map(|(_, name)| name)
+            .unwrap_or(before_eq)
+            .trim();
+
+        // Check what quote character follows =
+        let after_eq = &remaining[eq_pos + 1..];
+        let quote_char = match after_eq.chars().next() {
+            Some(c @ '"') | Some(c @ '\'') => c,
+            _ => { remaining = &remaining[eq_pos + 1..]; continue; }
+        };
+
+        let value_start = 1; // skip the opening quote
+        if let Some(value_end) = after_eq[value_start..].find(quote_char) {
+            let value = &after_eq[value_start..value_start + value_end];
+            if !attr_name.is_empty() {
+                attrs.insert(attr_name.to_string(), value.to_string());
+            }
+            remaining = &after_eq[value_start + value_end + 1..];
+        } else {
+            break;
+        }
+    }
+
+    attrs
 }

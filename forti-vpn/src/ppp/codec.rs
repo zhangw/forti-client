@@ -70,20 +70,31 @@ impl PppFrame {
         buf
     }
 
+    /// Decode from wire bytes. Supports both formats:
+    /// - Standard: [FF][03][protocol:BE16][data...]
+    /// - Compressed (no address/control): [protocol:BE16][data...]
     pub fn decode(buf: &[u8]) -> Result<Self> {
-        if buf.len() < 4 {
+        if buf.len() < 2 {
             return Err(FortiError::ProtocolError(
-                "PPP frame too short, need at least 4 bytes".into(),
+                "PPP frame too short, need at least 2 bytes".into(),
             ));
         }
-        if buf[0] != 0xFF || buf[1] != 0x03 {
-            return Err(FortiError::ProtocolError(format!(
-                "invalid PPP address/control: {:02X}{:02X}, expected FF03",
-                buf[0], buf[1]
-            )));
+
+        if buf[0] == 0xFF && buf[1] == 0x03 {
+            // Standard PPP with address/control header
+            if buf.len() < 4 {
+                return Err(FortiError::ProtocolError(
+                    "PPP frame too short, need at least 4 bytes with address/control".into(),
+                ));
+            }
+            let protocol = PppProtocol::from_u16(u16::from_be_bytes([buf[2], buf[3]]));
+            let data = buf[4..].to_vec();
+            Ok(Self { protocol, data })
+        } else {
+            // No address/control header — protocol field is at the start
+            let protocol = PppProtocol::from_u16(u16::from_be_bytes([buf[0], buf[1]]));
+            let data = buf[2..].to_vec();
+            Ok(Self { protocol, data })
         }
-        let protocol = PppProtocol::from_u16(u16::from_be_bytes([buf[2], buf[3]]));
-        let data = buf[4..].to_vec();
-        Ok(Self { protocol, data })
     }
 }

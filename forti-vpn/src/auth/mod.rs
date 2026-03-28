@@ -2,6 +2,7 @@ pub mod xml;
 
 use crate::error::{FortiError, Result};
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, debug};
 
 #[derive(Debug)]
@@ -32,7 +33,12 @@ impl AuthClient {
         })
     }
 
-    pub async fn login(&self, username: &str, password: &str, realm: Option<&str>) -> Result<AuthResult> {
+    /// Create a new TLS+HTTP connection to the server.
+    async fn new_http_connection(&self) -> Result<(
+        hyper::client::conn::http1::SendRequest<http_body_util::Full<bytes::Bytes>>,
+        tokio_rustls::TlsConnector,
+        rustls::pki_types::ServerName<'static>,
+    )> {
         let connector = tokio_rustls::TlsConnector::from(self.tls_config.clone());
         let server_name = rustls::pki_types::ServerName::try_from(self.server.clone())
             .map_err(|e| FortiError::TunnelError(format!("invalid server name: {}", e)))?;
@@ -42,12 +48,17 @@ impl AuthClient {
             .map_err(|e| FortiError::TunnelError(format!("TLS connect failed: {}", e)))?;
 
         let io = hyper_util::rt::TokioIo::new(tls);
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await
+        let (sender, conn) = hyper::client::conn::http1::handshake(io).await
             .map_err(|e| FortiError::TunnelError(format!("HTTP handshake failed: {}", e)))?;
 
         tokio::spawn(conn);
+        Ok((sender, connector, server_name))
+    }
 
+    pub async fn login(&self, username: &str, password: &str, realm: Option<&str>) -> Result<AuthResult> {
         // Step 1: POST /remote/logincheck
+        let (mut sender, _connector, _server_name) = self.new_http_connection().await?;
+
         let body = if let Some(realm) = realm {
             format!(
                 "ajax=1&username={}&credential={}&realm={}&just_logged_in=1",
@@ -74,25 +85,234 @@ impl AuthClient {
         let resp = sender.send_request(req).await
             .map_err(|e| FortiError::TunnelError(format!("login request failed: {}", e)))?;
 
-        debug!("Login response status: {}", resp.status());
+        let status = resp.status();
+        debug!("Login response status: {}", status);
 
-        let svpn_cookie = resp.headers()
-            .get_all("set-cookie")
-            .iter()
-            .find_map(|v| {
-                let s = v.to_str().ok()?;
-                if s.starts_with("SVPNCOOKIE=") {
-                    let val = s.split(';').next()?;
-                    Some(val.trim_start_matches("SVPNCOOKIE=").to_string())
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| FortiError::AuthFailed("no SVPNCOOKIE in login response".into()))?;
+        // Log all Set-Cookie headers for debugging
+        for cookie_hdr in resp.headers().get_all("set-cookie").iter() {
+            debug!("Set-Cookie: {:?}", cookie_hdr);
+        }
 
-        info!("Authentication successful, got SVPNCOOKIE");
+        // Extract SVPNCOOKIE if present
+        let svpn_cookie = extract_svpncookie(&resp);
 
-        // Step 2: GET /remote/fortisslvpn_xml
+        // Read the response body for 2FA detection
+        let resp_body = http_body_util::BodyExt::collect(resp.into_body()).await
+            .map_err(|e| FortiError::TunnelError(format!("failed to read login body: {}", e)))?;
+        let resp_text = String::from_utf8_lossy(&resp_body.to_bytes()).to_string();
+        debug!("Login response body: {}", &resp_text[..resp_text.len().min(500)]);
+
+        // Check for 2FA requirement
+        let svpn_cookie = if let Some(cookie) = svpn_cookie {
+            // Got cookie — but check if 2FA is still needed
+            // Some FortiGates return a partial cookie that requires 2FA completion
+            if resp_text.contains("tokeninfo=") || resp_text.contains("2fa") {
+                debug!("Got SVPNCOOKIE but 2FA appears required, proceeding with 2FA");
+                self.handle_2fa_tokeninfo(username, &resp_text, Some(&cookie)).await?
+            } else {
+                info!("Authentication successful, got SVPNCOOKIE");
+                cookie
+            }
+        } else if status.as_u16() == 401 {
+            // HTML form-based 2FA
+            debug!("401 response — HTML form 2FA");
+            self.handle_2fa_html_form(username, &resp_text).await?
+        } else if resp_text.contains("ret=") && resp_text.contains("tokeninfo=") {
+            // Tokeninfo-based 2FA (200 OK, no cookie)
+            debug!("Tokeninfo 2FA challenge detected");
+            self.handle_2fa_tokeninfo(username, &resp_text, None).await?
+        } else if status.as_u16() == 405 {
+            return Err(FortiError::AuthFailed("invalid credentials (405)".into()));
+        } else {
+            return Err(FortiError::AuthFailed(format!(
+                "login failed: status={}, body={}", status, &resp_text[..resp_text.len().min(200)]
+            )));
+        };
+
+        // Fetch tunnel config
+        let tunnel_config = self.fetch_tunnel_config(&svpn_cookie).await?;
+
+        Ok(AuthResult { svpn_cookie, tunnel_config })
+    }
+
+    /// Handle tokeninfo-based 2FA (most common).
+    /// Response body format: ret=<status>,tokeninfo=<type>,chal_msg=<prompt>,reqid=<id>,polid=<id>,grp=<group>,portal=<portal>,peer=<peer>,magic=<value>
+    async fn handle_2fa_tokeninfo(&self, username: &str, resp_text: &str, _existing_cookie: Option<&str>) -> Result<String> {
+        // Parse the tokeninfo fields
+        let fields = parse_tokeninfo_fields(resp_text);
+        let tokeninfo = fields.get("tokeninfo").map(|s| s.as_str()).unwrap_or("unknown");
+        let chal_msg = fields.get("chal_msg").map(|s| s.as_str()).unwrap_or("Enter verification code");
+        let reqid = fields.get("reqid").map(|s| s.as_str()).unwrap_or("");
+        let polid = fields.get("polid").map(|s| s.as_str()).unwrap_or("");
+        let grp = fields.get("grp").map(|s| s.as_str()).unwrap_or("");
+        let portal = fields.get("portal").map(|s| s.as_str()).unwrap_or("");
+        let peer = fields.get("peer").map(|s| s.as_str()).unwrap_or("");
+        let magic = fields.get("magic").map(|s| s.as_str()).unwrap_or("");
+
+        info!("2FA required (type: {})", tokeninfo);
+
+        // Check for FortiToken Mobile push
+        if tokeninfo == "ftm_push" {
+            info!("FortiToken Mobile push notification sent. Waiting for approval...");
+            // For push, send with empty code and ftmpush=1
+            let body = format!(
+                "username={}&code=&reqid={}&polid={}&grp={}&portal={}&peer={}&ftmpush=1",
+                urlencoded(username), urlencoded(reqid), urlencoded(polid),
+                urlencoded(grp), urlencoded(portal), urlencoded(peer),
+            );
+            return self.send_2fa_code(&body).await;
+        }
+
+        // Prompt user for OTP code
+        eprint!("{}: ", chal_msg);
+        std::io::Write::flush(&mut std::io::stderr())?;
+        let mut code = String::new();
+        std::io::stdin().read_line(&mut code)?;
+        let code = code.trim();
+
+        let body = format!(
+            "username={}&code={}&reqid={}&polid={}&grp={}&portal={}&peer={}&magic={}",
+            urlencoded(username), urlencoded(code), urlencoded(reqid),
+            urlencoded(polid), urlencoded(grp), urlencoded(portal),
+            urlencoded(peer), urlencoded(magic),
+        );
+
+        self.send_2fa_code(&body).await
+    }
+
+    /// Handle HTML form-based 2FA (401 response).
+    async fn handle_2fa_html_form(&self, username: &str, html: &str) -> Result<String> {
+        // Extract hidden fields from the HTML form
+        let magic = extract_html_field(html, "magic").unwrap_or_default();
+        let reqid = extract_html_field(html, "reqid").unwrap_or_default();
+        let grpid = extract_html_field(html, "grpid").unwrap_or_default();
+
+        info!("2FA required (HTML form)");
+        eprint!("Enter verification code: ");
+        std::io::Write::flush(&mut std::io::stderr())?;
+        let mut code = String::new();
+        std::io::stdin().read_line(&mut code)?;
+        let code = code.trim();
+
+        let body = format!(
+            "username={}&code={}&reqid={}&grpid={}&magic={}",
+            urlencoded(username), urlencoded(code),
+            urlencoded(&reqid), urlencoded(&grpid), urlencoded(&magic),
+        );
+
+        self.send_2fa_code(&body).await
+    }
+
+    /// Send the 2FA verification code and extract SVPNCOOKIE.
+    async fn send_2fa_code(&self, body: &str) -> Result<String> {
+        let (mut sender, _, _) = self.new_http_connection().await?;
+
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri("/remote/logincheck")
+            .header("Host", &self.server)
+            .header("User-Agent", "Mozilla/5.0 SV1")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Content-Length", body.len())
+            .body(http_body_util::Full::new(bytes::Bytes::from(body.to_string())))
+            .map_err(FortiError::Http)?;
+
+        debug!("Sending 2FA verification");
+        let resp = sender.send_request(req).await
+            .map_err(|e| FortiError::TunnelError(format!("2FA request failed: {}", e)))?;
+
+        debug!("2FA response status: {}", resp.status());
+
+        let cookie = extract_svpncookie(&resp)
+            .ok_or_else(|| FortiError::AuthFailed("2FA verification failed — no SVPNCOOKIE in response".into()))?;
+
+        info!("2FA verification successful");
+        Ok(cookie)
+    }
+
+    /// Authenticate via SAML/SSO: open browser, wait for IdP callback, exchange for SVPNCOOKIE.
+    pub async fn login_saml(&self) -> Result<AuthResult> {
+        let saml_port: u16 = 8020;
+
+        // Step 1: Start local HTTP server to receive the SAML callback
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", saml_port)).await
+            .map_err(|e| FortiError::AuthFailed(format!(
+                "failed to bind SAML callback on port {}: {} (is another VPN client running?)",
+                saml_port, e
+            )))?;
+
+        info!("SAML callback server listening on 127.0.0.1:{}", saml_port);
+
+        // Step 2: Open browser to SAML start URL
+        let saml_url = format!(
+            "https://{}:{}/remote/saml/start?redirect=1",
+            self.server, self.port,
+        );
+        info!("Opening browser for SAML authentication...");
+        info!("If browser doesn't open, navigate to: {}", saml_url);
+
+        if let Err(e) = std::process::Command::new("open").arg(&saml_url).spawn() {
+            debug!("Failed to open browser: {}", e);
+            eprintln!("\nPlease open this URL in your browser:\n  {}\n", saml_url);
+        }
+
+        // Step 3: Wait for the SAML callback with ?id=<session_id>
+        info!("Waiting for SAML authentication (complete login in your browser)...");
+        let session_id = wait_for_saml_callback(listener).await?;
+        info!("SAML callback received, exchanging for session cookie");
+
+        // Step 4: Exchange session ID for SVPNCOOKIE
+        let (mut sender, _, _) = self.new_http_connection().await?;
+
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri(format!("/remote/saml/auth_id?id={}", urlencoded(&session_id)))
+            .header("Host", &self.server)
+            .header("User-Agent", "Mozilla/5.0 SV1")
+            .body(http_body_util::Full::new(bytes::Bytes::new()))
+            .map_err(FortiError::Http)?;
+
+        debug!("Exchanging SAML session ID for SVPNCOOKIE");
+        let resp = sender.send_request(req).await
+            .map_err(|e| FortiError::TunnelError(format!("SAML auth_id request failed: {}", e)))?;
+
+        debug!("SAML auth_id response status: {}", resp.status());
+        for cookie_hdr in resp.headers().get_all("set-cookie").iter() {
+            debug!("Set-Cookie: {:?}", cookie_hdr);
+        }
+
+        let svpn_cookie = extract_svpncookie(&resp)
+            .ok_or_else(|| FortiError::AuthFailed("SAML auth failed — no SVPNCOOKIE in response".into()))?;
+
+        info!("SAML authentication successful");
+
+        // Step 5: Fetch tunnel configuration (same as credential flow)
+        let tunnel_config = self.fetch_tunnel_config(&svpn_cookie).await?;
+
+        Ok(AuthResult { svpn_cookie, tunnel_config })
+    }
+
+    /// Fetch tunnel config: GET /remote/fortisslvpn then GET /remote/fortisslvpn_xml
+    async fn fetch_tunnel_config(&self, svpn_cookie: &str) -> Result<xml::TunnelConfig> {
+        // Resource reservation
+        let (mut sender, _, _) = self.new_http_connection().await?;
+
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri("/remote/fortisslvpn")
+            .header("Host", &self.server)
+            .header("User-Agent", "Mozilla/5.0 SV1")
+            .header("Cookie", format!("SVPNCOOKIE={}", svpn_cookie))
+            .body(http_body_util::Full::new(bytes::Bytes::new()))
+            .map_err(FortiError::Http)?;
+
+        debug!("Reserving tunnel resources");
+        let resp = sender.send_request(req).await
+            .map_err(|e| FortiError::TunnelError(format!("resource reservation failed: {}", e)))?;
+        debug!("Resource reservation status: {}", resp.status());
+        let _ = http_body_util::BodyExt::collect(resp.into_body()).await;
+
+        // XML config
         let req = hyper::Request::builder()
             .method("GET")
             .uri("/remote/fortisslvpn_xml?dual_stack=1")
@@ -103,23 +323,140 @@ impl AuthClient {
             .map_err(FortiError::Http)?;
 
         debug!("Fetching tunnel configuration");
-        let resp = sender.send_request(req).await
-            .map_err(|e| FortiError::TunnelError(format!("XML config request failed: {}", e)))?;
+        let resp = match sender.send_request(req).await {
+            Ok(resp) => resp,
+            Err(_) => {
+                debug!("Reopening connection for XML config fetch");
+                let (mut sender2, _, _) = self.new_http_connection().await?;
+                let req = hyper::Request::builder()
+                    .method("GET")
+                    .uri("/remote/fortisslvpn_xml?dual_stack=1")
+                    .header("Host", &self.server)
+                    .header("User-Agent", "Mozilla/5.0 SV1")
+                    .header("Cookie", format!("SVPNCOOKIE={}", svpn_cookie))
+                    .body(http_body_util::Full::new(bytes::Bytes::new()))
+                    .map_err(FortiError::Http)?;
+                sender2.send_request(req).await
+                    .map_err(|e| FortiError::TunnelError(format!("XML config request failed: {}", e)))?
+            }
+        };
 
         let body = http_body_util::BodyExt::collect(resp.into_body()).await
             .map_err(|e| FortiError::TunnelError(format!("failed to read XML body: {}", e)))?;
         let body_bytes = body.to_bytes();
         let xml_text = String::from_utf8_lossy(&body_bytes);
+        debug!("Raw XML config:\n{}", xml_text);
 
         let tunnel_config = xml::TunnelConfig::parse(&xml_text)?;
         info!("Tunnel config: IP={}, DNS={:?}", tunnel_config.ip_address, tunnel_config.dns_servers);
 
-        Ok(AuthResult { svpn_cookie, tunnel_config })
+        Ok(tunnel_config)
     }
 
     pub fn server(&self) -> &str { &self.server }
     pub fn port(&self) -> u16 { self.port }
     pub fn tls_config(&self) -> Arc<rustls::ClientConfig> { self.tls_config.clone() }
+}
+
+/// Extract SVPNCOOKIE from response headers.
+fn extract_svpncookie<T>(resp: &hyper::Response<T>) -> Option<String> {
+    resp.headers()
+        .get_all("set-cookie")
+        .iter()
+        .find_map(|v| {
+            let s = v.to_str().ok()?;
+            if s.starts_with("SVPNCOOKIE=") {
+                let val = s.split(';').next()?;
+                let cookie = val.trim_start_matches("SVPNCOOKIE=").to_string();
+                // Some FortiGates set an empty cookie — treat as absent
+                if cookie.is_empty() || cookie == "0" {
+                    None
+                } else {
+                    Some(cookie)
+                }
+            } else {
+                None
+            }
+        })
+}
+
+/// Parse tokeninfo response fields: "ret=1,tokeninfo=ftm,chal_msg=Enter code,reqid=123,..."
+fn parse_tokeninfo_fields(text: &str) -> std::collections::HashMap<String, String> {
+    let mut fields = std::collections::HashMap::new();
+    // The tokeninfo response can span multiple lines; look for the line containing "ret="
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.contains("ret=") && !line.contains("tokeninfo=") {
+            continue;
+        }
+        for part in line.split(',') {
+            if let Some((key, value)) = part.split_once('=') {
+                fields.insert(key.trim().to_string(), value.trim().to_string());
+            }
+        }
+    }
+    fields
+}
+
+/// Extract a hidden input field value from HTML: <input type="hidden" name="fieldname" value="...">
+fn extract_html_field(html: &str, field_name: &str) -> Option<String> {
+    let name_pattern = format!("name=\"{}\"", field_name);
+    let pos = html.find(&name_pattern)?;
+    // Look for value="..." near this position
+    let nearby = &html[pos.saturating_sub(100)..html.len().min(pos + 200)];
+    let value_start = nearby.find("value=\"")? + 7;
+    let value_end = nearby[value_start..].find('"')?;
+    Some(nearby[value_start..value_start + value_end].to_string())
+}
+
+/// Wait for the SAML IdP to redirect the browser to our local callback server.
+/// Extracts the `id` parameter from the request URL.
+async fn wait_for_saml_callback(listener: tokio::net::TcpListener) -> Result<String> {
+    let (mut stream, addr) = listener.accept().await
+        .map_err(|e| FortiError::AuthFailed(format!("failed to accept SAML callback: {}", e)))?;
+
+    debug!("SAML callback connection from {}", addr);
+
+    // Read the HTTP request
+    let mut buf = vec![0u8; 4096];
+    let n = stream.read(&mut buf).await?;
+    let request = String::from_utf8_lossy(&buf[..n]);
+    debug!("SAML callback request:\n{}", &request[..request.len().min(500)]);
+
+    // Extract the `id` parameter from the GET request line
+    // Format: "GET /?id=<session_id> HTTP/1.1" or "GET /?id=<session_id>&... HTTP/1.1"
+    let session_id = request.lines()
+        .next()
+        .and_then(|line| {
+            let path = line.split_whitespace().nth(1)?;
+            // Parse query string
+            let query = path.split('?').nth(1)?;
+            for param in query.split('&') {
+                if let Some(value) = param.strip_prefix("id=") {
+                    return Some(value.to_string());
+                }
+            }
+            None
+        })
+        .ok_or_else(|| FortiError::AuthFailed(
+            "SAML callback did not contain an 'id' parameter".into()
+        ))?;
+
+    debug!("SAML session ID: {}", session_id);
+
+    // Send a response to the browser
+    let response = "HTTP/1.1 200 OK\r\n\
+        Content-Type: text/html\r\n\
+        Connection: close\r\n\
+        \r\n\
+        <html><body><h2>Authentication successful</h2>\
+        <p>You may close this browser tab and return to the terminal.</p>\
+        </body></html>";
+
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+
+    Ok(session_id)
 }
 
 fn urlencoded(s: &str) -> String {

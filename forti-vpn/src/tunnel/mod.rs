@@ -25,56 +25,71 @@ impl TlsTunnel {
             .map_err(|e| FortiError::TunnelError(format!("invalid server name: {}", e)))?;
 
         let tcp = tokio::net::TcpStream::connect(format!("{}:{}", server, port)).await?;
+        // Set TCP_NODELAY to avoid Nagle buffering
+        tcp.set_nodelay(true)?;
         let mut tls = connector
             .connect(server_name, tcp)
             .await
             .map_err(|e| FortiError::TunnelError(format!("TLS connect failed: {}", e)))?;
 
+        // Use HTTP/1.1 per the spec, with headers matching openfortivpn
         let http_req = format!(
             "GET /remote/sslvpn-tunnel HTTP/1.1\r\n\
-             Host: {}\r\n\
+             Host: {}:{}\r\n\
+             User-Agent: Mozilla/5.0 SV1\r\n\
+             Accept: */*\r\n\
+             Accept-Encoding: identity\r\n\
+             Pragma: no-cache\r\n\
+             Cache-Control: no-store, no-cache, must-revalidate\r\n\
              Cookie: SVPNCOOKIE={}\r\n\
+             Content-Length: 0\r\n\
              \r\n",
-            server, svpn_cookie,
+            server, port, svpn_cookie,
         );
 
+        debug!("Tunnel request:\n{}", http_req.trim());
         tls.write_all(http_req.as_bytes()).await?;
         tls.flush().await?;
 
         info!("Sent tunnel upgrade request");
 
-        // After sending the tunnel request, read the first bytes.
-        // Per the FortiGate wire protocol spec: on success, the server sends NO
-        // HTTP response — the connection silently transitions to raw binary PPP
-        // framing. Only on failure does the server send an HTTP error response.
+        // Don't wait for the server to send first — some FortiGates expect the
+        // client to initiate PPP. We'll do a short non-blocking check: if the
+        // server sends data quickly (HTTP error or LCP packet), read it.
+        // Otherwise, assume the tunnel is established and let PPP engine handle it.
         let mut response_buf = vec![0u8; 4096];
-        let n = tls.read(&mut response_buf).await?;
-        if n == 0 {
-            return Err(FortiError::TunnelError(
-                "connection closed after tunnel request".into(),
-            ));
-        }
-
-        let leftover = if response_buf[..n].starts_with(b"HTTP/") {
-            // Error: server sent an HTTP response instead of transitioning to tunnel
-            let response_str = String::from_utf8_lossy(&response_buf[..n]);
-            return Err(FortiError::TunnelError(format!(
-                "tunnel upgrade failed: {}",
-                response_str.lines().next().unwrap_or("empty response"),
-            )));
-        } else {
-            // Success: these are the first bytes of binary PPP tunnel data
-            debug!(
-                "Tunnel active — received {} bytes of initial PPP data",
+        let n = match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tls.read(&mut response_buf),
+        ).await {
+            Ok(Ok(0)) => {
+                return Err(FortiError::TunnelError("connection closed after tunnel request".into()));
+            }
+            Ok(Ok(n)) => {
+                // Got immediate data — check if it's an HTTP error
+                if response_buf[..n].starts_with(b"HTTP/") {
+                    let response_str = String::from_utf8_lossy(&response_buf[..n]);
+                    return Err(FortiError::TunnelError(format!(
+                        "tunnel upgrade failed: {}",
+                        response_str.lines().next().unwrap_or("empty response"),
+                    )));
+                }
+                debug!("Tunnel active — received {} bytes of initial PPP data", n);
                 n
-            );
-            response_buf[..n].to_vec()
+            }
+            Ok(Err(e)) => {
+                return Err(FortiError::TunnelError(format!("tunnel read error: {}", e)));
+            }
+            Err(_) => {
+                // Timeout — server didn't send anything in 2s.
+                // This is OK: tunnel is likely established, server waits for client to speak first.
+                info!("Tunnel established (server awaiting client LCP)");
+                0
+            }
         };
 
-        info!(
-            "TLS tunnel established, {} bytes of initial data",
-            leftover.len()
-        );
+        let leftover = response_buf[..n].to_vec();
+        info!("TLS tunnel ready, {} bytes of initial data", leftover.len());
 
         Ok(Self {
             tls_stream: tls,

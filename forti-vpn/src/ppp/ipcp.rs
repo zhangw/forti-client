@@ -61,6 +61,18 @@ pub enum IpcpOption {
 }
 
 impl IpcpOption {
+    /// Return the option type code.
+    pub fn option_type(&self) -> u8 {
+        match self {
+            Self::IpAddress(_) => 0x03,
+            Self::PrimaryDns(_) => 0x81,
+            Self::SecondaryDns(_) => 0x82,
+            Self::PrimaryNbns(_) => 0x83,
+            Self::SecondaryNbns(_) => 0x84,
+            Self::Unknown { option_type, .. } => *option_type,
+        }
+    }
+
     /// Encode a single option into its wire representation.
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -233,6 +245,8 @@ pub struct IpcpState {
     secondary_nbns: Option<Ipv4Addr>,
     negotiation_complete: bool,
     next_identifier: u8,
+    /// Option types the server rejected — excluded from future Configure-Requests
+    rejected_option_types: Vec<u8>,
 }
 
 impl IpcpState {
@@ -245,17 +259,27 @@ impl IpcpState {
             secondary_nbns: None,
             negotiation_complete: false,
             next_identifier: 1,
+            rejected_option_types: Vec::new(),
         }
     }
 
     /// Build the initial Configure-Request with all-zero addresses to solicit
     /// address assignment from the server.
     pub fn build_configure_request(&self) -> Vec<u8> {
-        let options = vec![
-            IpcpOption::IpAddress(self.ip_address),
-            IpcpOption::PrimaryDns(self.primary_dns.unwrap_or(Ipv4Addr::UNSPECIFIED)),
-            IpcpOption::SecondaryDns(self.secondary_dns.unwrap_or(Ipv4Addr::UNSPECIFIED)),
-        ];
+        let mut options: Vec<IpcpOption> = Vec::new();
+
+        // Always request IP address (type 3)
+        if !self.rejected_option_types.contains(&0x03) {
+            options.push(IpcpOption::IpAddress(self.ip_address));
+        }
+        // Request DNS only if not rejected
+        if !self.rejected_option_types.contains(&0x81) {
+            options.push(IpcpOption::PrimaryDns(self.primary_dns.unwrap_or(Ipv4Addr::UNSPECIFIED)));
+        }
+        if !self.rejected_option_types.contains(&0x82) {
+            options.push(IpcpOption::SecondaryDns(self.secondary_dns.unwrap_or(Ipv4Addr::UNSPECIFIED)));
+        }
+
         let pkt = IpcpPacket::new(IpcpCode::ConfigureRequest, self.next_identifier, options);
         pkt.encode()
     }
@@ -308,8 +332,19 @@ impl IpcpState {
                 vec![]
             }
             IpcpCode::ConfigureReject => {
-                debug!("IPCP: received ConfigureReject — ignoring for now");
-                vec![]
+                // Server rejected some options — remove them and resend
+                for opt in pkt.options() {
+                    let type_code = opt.option_type();
+                    debug!("IPCP: server rejected option type 0x{:02X}", type_code);
+                    if !self.rejected_option_types.contains(&type_code) {
+                        self.rejected_option_types.push(type_code);
+                    }
+                }
+                // Resend without the rejected options
+                self.next_identifier = self.next_identifier.wrapping_add(1);
+                let req = self.build_configure_request();
+                debug!("IPCP: resending ConfigureRequest without rejected options");
+                vec![req]
             }
             IpcpCode::Unknown(code) => {
                 debug!("IPCP: received unknown code {}", code);

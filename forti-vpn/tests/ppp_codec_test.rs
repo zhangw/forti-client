@@ -41,9 +41,12 @@ fn test_decode_unknown_protocol() {
 }
 
 #[test]
-fn test_decode_invalid_address_control() {
-    let wire = vec![0xFE, 0x03, 0x00, 0x21, 0x45];
-    assert!(PppFrame::decode(&wire).is_err());
+fn test_decode_without_address_control() {
+    // Compressed PPP frame: no FF 03 prefix, protocol starts directly
+    let wire = vec![0xC0, 0x21, 0x01, 0x01, 0x00, 0x04];
+    let frame = PppFrame::decode(&wire).unwrap();
+    assert_eq!(frame.protocol(), PppProtocol::Lcp);
+    assert_eq!(frame.data(), &[0x01, 0x01, 0x00, 0x04]);
 }
 
 #[test]

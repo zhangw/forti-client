@@ -16,9 +16,9 @@ struct Cli {
     #[arg(short, long, default_value = "443")]
     port: u16,
 
-    /// Username
+    /// Username (not needed for --saml)
     #[arg(short, long)]
-    username: String,
+    username: Option<String>,
 
     /// Password (if omitted, will prompt)
     #[arg(short = 'P', long)]
@@ -27,6 +27,10 @@ struct Cli {
     /// Realm (optional)
     #[arg(long)]
     realm: Option<String>,
+
+    /// Use SAML/SSO authentication (opens browser)
+    #[arg(long)]
+    saml: bool,
 }
 
 #[tokio::main]
@@ -40,23 +44,33 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let password = match cli.password {
-        Some(p) => p,
-        None => {
-            eprint!("Password: ");
-            std::io::stderr().flush()?;
-            let mut p = String::new();
-            std::io::stdin().read_line(&mut p)?;
-            p.trim().to_string()
-        }
-    };
-
-    // Step 1: Authenticate
-    tracing::info!("Authenticating to {}:{}", cli.server, cli.port);
     let auth_client = AuthClient::new(&cli.server, cli.port)?;
-    let auth_result = auth_client
-        .login(&cli.username, &password, cli.realm.as_deref())
-        .await?;
+
+    let auth_result = if cli.saml {
+        // SAML/SSO authentication
+        tracing::info!("Starting SAML authentication to {}:{}", cli.server, cli.port);
+        auth_client.login_saml().await?
+    } else {
+        // Credential authentication
+        let username = cli.username
+            .ok_or_else(|| anyhow::anyhow!("--username is required for credential auth (use --saml for SSO)"))?;
+
+        let password = match cli.password {
+            Some(p) => p,
+            None => {
+                eprint!("Password: ");
+                std::io::stderr().flush()?;
+                let mut p = String::new();
+                std::io::stdin().read_line(&mut p)?;
+                p.trim().to_string()
+            }
+        };
+
+        tracing::info!("Authenticating to {}:{}", cli.server, cli.port);
+        auth_client
+            .login(&username, &password, cli.realm.as_deref())
+            .await?
+    };
 
     tracing::info!(
         "Authenticated. Tunnel config: IP={}, DNS={:?}, {} routes",
