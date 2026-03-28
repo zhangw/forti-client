@@ -27,10 +27,10 @@ cargo test --test ipcp_test
 cargo test test_encode_fortinet_frame
 
 # Run with SAML auth against a real FortiGate
-RUST_LOG=debug cargo run -- --server vpn.example.com --port 10443 --saml
+RUST_LOG=debug cargo run -- --server sslvpn.example.com --port 10443 --saml
 
 # Run with credential auth
-RUST_LOG=debug cargo run -- --server vpn.example.com --username user
+RUST_LOG=debug cargo run -- --server sslvpn.example.com --username user
 
 # Check without building
 cargo check

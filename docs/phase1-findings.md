@@ -1,7 +1,7 @@
 # Phase 1 Findings — Real-Server Testing
 
 **Date:** 2026-03-28
-**Server:** vpn.example.com:10443 (FortiOS, SAML-only)
+**Server:** sslvpn.example.com:10443 (FortiOS, SAML-only)
 
 ## Protocol Deviations from Spec
 
@@ -101,7 +101,7 @@ DTLS data channel is available on the same port (10443/UDP).
 Complete Phase 1 negotiation (~120ms total):
 
 ```
-T+0ms     TLS handshake to vpn.example.com:10443
+T+0ms     TLS handshake to sslvpn.example.com:10443
 T+25ms    SAML auth complete, got SVPNCOOKIE
 T+60ms    GET /remote/fortisslvpn (resource reservation) → 200 OK
 T+90ms    GET /remote/fortisslvpn_xml → XML config (IP=10.8.2.6, DNS, 674 routes)
