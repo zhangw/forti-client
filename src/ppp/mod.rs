@@ -135,6 +135,11 @@ impl PppEngine {
         }
     }
 
+    /// Consume the engine and return the LCP state for keepalive use.
+    pub fn into_lcp(self) -> lcp::LcpState {
+        self.lcp
+    }
+
     async fn send_ppp(
         &self,
         tunnel: &mut TlsTunnel,

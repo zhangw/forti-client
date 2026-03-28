@@ -341,6 +341,13 @@ impl LcpState {
         pkt.encode()
     }
 
+    /// Build an LCP Terminate-Request for graceful shutdown.
+    pub fn build_terminate_request(&mut self) -> Vec<u8> {
+        let id = self.next_id();
+        let pkt = LcpPacket::new(LcpCode::TerminateRequest, id, Vec::new());
+        pkt.encode()
+    }
+
     /// Handle an incoming LCP packet. Returns zero or more response packets to send.
     pub fn handle_packet(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
         let pkt = match LcpPacket::decode(data) {
