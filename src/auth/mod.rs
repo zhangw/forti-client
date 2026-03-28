@@ -254,7 +254,16 @@ impl AuthClient {
         info!("Opening browser for SAML authentication...");
         info!("If browser doesn't open, navigate to: {}", saml_url);
 
-        if let Err(e) = std::process::Command::new("open").arg(&saml_url).spawn() {
+        // When running as root (sudo), `open` uses root's default browser.
+        // Use SUDO_USER to open the real user's preferred browser instead.
+        let open_result = if let Ok(user) = std::env::var("SUDO_USER") {
+            std::process::Command::new("sudo")
+                .args(["-u", &user, "open", &saml_url])
+                .spawn()
+        } else {
+            std::process::Command::new("open").arg(&saml_url).spawn()
+        };
+        if let Err(e) = open_result {
             debug!("Failed to open browser: {}", e);
             eprintln!("\nPlease open this URL in your browser:\n  {}\n", saml_url);
         }
