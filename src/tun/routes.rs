@@ -9,24 +9,21 @@ pub fn mask_to_prefix(mask: Ipv4Addr) -> u32 {
     u32::from_be_bytes(mask.octets()).count_ones()
 }
 
-/// Build the argument list for `/sbin/route add` for the given route.
-pub fn route_add_cmd(route: &Route, iface: &str) -> Vec<String> {
+fn route_cmd(verb: &str, route: &Route, iface: &str) -> Vec<String> {
     let prefix = mask_to_prefix(route.mask);
     if prefix == 32 {
-        vec!["add".into(), "-host".into(), route.ip.to_string(), "-interface".into(), iface.into()]
+        vec![verb.into(), "-host".into(), route.ip.to_string(), "-interface".into(), iface.into()]
     } else {
-        vec!["add".into(), "-net".into(), format!("{}/{}", route.ip, prefix), "-interface".into(), iface.into()]
+        vec![verb.into(), "-net".into(), format!("{}/{}", route.ip, prefix), "-interface".into(), iface.into()]
     }
 }
 
-/// Build the argument list for `/sbin/route delete` for the given route.
+pub fn route_add_cmd(route: &Route, iface: &str) -> Vec<String> {
+    route_cmd("add", route, iface)
+}
+
 pub fn route_delete_cmd(route: &Route, iface: &str) -> Vec<String> {
-    let prefix = mask_to_prefix(route.mask);
-    if prefix == 32 {
-        vec!["delete".into(), "-host".into(), route.ip.to_string(), "-interface".into(), iface.into()]
-    } else {
-        vec!["delete".into(), "-net".into(), format!("{}/{}", route.ip, prefix), "-interface".into(), iface.into()]
-    }
+    route_cmd("delete", route, iface)
 }
 
 /// Install split-tunnel routes via `/sbin/route add`.

@@ -11,6 +11,7 @@ pub struct TlsTunnel {
     tls_stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
     codec: FortinetCodec,
     read_buf: Vec<u8>,
+    recv_tmp: Vec<u8>,
 }
 
 impl TlsTunnel {
@@ -95,6 +96,7 @@ impl TlsTunnel {
             tls_stream: tls,
             codec: FortinetCodec::new(),
             read_buf: leftover,
+            recv_tmp: vec![0u8; 4096],
         })
     }
 
@@ -111,12 +113,11 @@ impl TlsTunnel {
             if let Some(frame) = self.codec.try_decode(&mut self.read_buf) {
                 return Ok(frame);
             }
-            let mut tmp = vec![0u8; 4096];
-            let n = self.tls_stream.read(&mut tmp).await?;
+            let n = self.tls_stream.read(&mut self.recv_tmp).await?;
             if n == 0 {
                 return Err(FortiError::TunnelError("tunnel closed by peer".into()));
             }
-            self.read_buf.extend_from_slice(&tmp[..n]);
+            self.read_buf.extend_from_slice(&self.recv_tmp[..n]);
         }
     }
 }

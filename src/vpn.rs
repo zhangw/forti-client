@@ -1,7 +1,7 @@
 use crate::auth::xml::TunnelConfig;
 use crate::error::{FortiError, Result};
 use crate::ppp::codec::{PppFrame, PppProtocol};
-use crate::ppp::lcp::LcpState;
+use crate::ppp::lcp::{LcpCode, LcpState};
 use crate::tunnel::TlsTunnel;
 use crate::tun;
 
@@ -43,10 +43,7 @@ pub async fn run(
     tun::routes::remove_routes(&config.routes, &iface_name);
     tun::dns::remove_dns();
 
-    // Send LCP Terminate-Request (best-effort)
-    let term_req = lcp.build_terminate_request();
-    let ppp_frame = PppFrame::new(PppProtocol::Lcp, term_req);
-    let _ = tunnel.send_frame(ppp_frame.encode()).await;
+    let _ = send_ppp(&mut tunnel, PppProtocol::Lcp, lcp.build_terminate_request()).await;
 
     info!("VPN disconnected.");
     result
@@ -93,8 +90,7 @@ async fn event_loop(
                 if pkt_count <= 5 {
                     debug!("TUN → tunnel: {} bytes IPv4", n);
                 }
-                let ppp = PppFrame::new(protocol, tun_buf[..n].to_vec());
-                tunnel.send_frame(ppp.encode()).await?;
+                send_ppp(tunnel, protocol, tun_buf[..n].to_vec()).await?;
             }
 
             // Tunnel → TUN (inbound: FortiGate sends packet to us)
@@ -114,18 +110,15 @@ async fn event_loop(
                         })?;
                     }
                     PppProtocol::Lcp => {
-                        let code = ppp.data().first().copied().unwrap_or(0);
+                        let code = LcpCode::from_u8(ppp.data().first().copied().unwrap_or(0));
                         let responses = lcp.handle_packet(ppp.data());
                         for resp in responses {
-                            let ppp_frame = PppFrame::new(PppProtocol::Lcp, resp);
-                            tunnel.send_frame(ppp_frame.encode()).await?;
+                            send_ppp(tunnel, PppProtocol::Lcp, resp).await?;
                         }
-                        if code == 10 {
-                            // Echo-Reply received — peer is alive
+                        if code == LcpCode::EchoReply {
                             missed_echoes = 0;
                         }
-                        if code == 5 {
-                            // Terminate-Request from server
+                        if code == LcpCode::TerminateRequest {
                             info!("Server sent LCP Terminate-Request");
                             return Ok(());
                         }
@@ -141,9 +134,7 @@ async fn event_loop(
 
             // Keepalive timer
             _ = keepalive.tick() => {
-                let echo = lcp.build_echo_request();
-                let ppp_frame = PppFrame::new(PppProtocol::Lcp, echo);
-                tunnel.send_frame(ppp_frame.encode()).await?;
+                send_ppp(tunnel, PppProtocol::Lcp, lcp.build_echo_request()).await?;
                 missed_echoes += 1;
                 if missed_echoes > 3 {
                     error!("Dead peer detected ({} missed echoes)", missed_echoes);
@@ -158,4 +149,9 @@ async fn event_loop(
             }
         }
     }
+}
+
+async fn send_ppp(tunnel: &mut TlsTunnel, protocol: PppProtocol, data: Vec<u8>) -> Result<()> {
+    let frame = PppFrame::new(protocol, data);
+    tunnel.send_frame(frame.encode()).await
 }
