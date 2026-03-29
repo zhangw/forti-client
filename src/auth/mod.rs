@@ -92,14 +92,7 @@ impl AuthClient {
         let status = resp.status();
         debug!("Login response status: {}", status);
 
-        // Log all Set-Cookie headers for debugging
-        for cookie_hdr in resp.headers().get_all("set-cookie").iter() {
-            if let Ok(s) = cookie_hdr.to_str() {
-                debug!("Set-Cookie: {}", redact_set_cookie(s));
-            }
-        }
-
-        // Extract SVPNCOOKIE if present
+        log_set_cookie_headers(&resp);
         let svpn_cookie = extract_svpncookie(&resp);
 
         // Read the response body for 2FA detection
@@ -291,11 +284,7 @@ impl AuthClient {
             .map_err(|e| FortiError::TunnelError(format!("SAML auth_id request failed: {}", e)))?;
 
         debug!("SAML auth_id response status: {}", resp.status());
-        for cookie_hdr in resp.headers().get_all("set-cookie").iter() {
-            if let Ok(s) = cookie_hdr.to_str() {
-                debug!("Set-Cookie: {}", redact_set_cookie(s));
-            }
-        }
+        log_set_cookie_headers(&resp);
 
         let svpn_cookie = extract_svpncookie(&resp)
             .ok_or_else(|| FortiError::AuthFailed("SAML auth failed — no SVPNCOOKIE in response".into()))?;
@@ -537,13 +526,20 @@ async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Resu
     }
 }
 
-/// Redact SVPNCOOKIE values from a Set-Cookie header string.
-/// Returns the header with the cookie value replaced by "<redacted>".
 fn redact_set_cookie(header: &str) -> String {
     if header.starts_with("SVPNCOOKIE=") {
         "SVPNCOOKIE=<redacted>".to_string()
     } else {
         header.to_string()
+    }
+}
+
+/// Log Set-Cookie headers with SVPNCOOKIE values redacted.
+fn log_set_cookie_headers<T>(resp: &hyper::Response<T>) {
+    for cookie_hdr in resp.headers().get_all("set-cookie").iter() {
+        if let Ok(s) = cookie_hdr.to_str() {
+            debug!("Set-Cookie: {}", redact_set_cookie(s));
+        }
     }
 }
 

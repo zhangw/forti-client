@@ -79,7 +79,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Set SSLKEYLOGFILE env var for rustls
         std::env::set_var("SSLKEYLOGFILE", path);
         tracing::warn!("TLS key logging enabled — writing to {}", path);
         tracing::warn!("This exposes TLS session secrets. Use only for debugging.");
