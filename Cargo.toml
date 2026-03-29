@@ -44,6 +44,7 @@ rand = "0.8"
 
 # macOS network reachability (SCNetworkReachability)
 system-configuration = "0.6"
+core-foundation = "0.9.4"
 
 [dev-dependencies]
 tokio-test = "0.4"

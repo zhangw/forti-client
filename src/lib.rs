@@ -5,3 +5,4 @@ pub mod tunnel;
 pub mod tun;
 pub mod vpn;
 pub mod reconnect;
+pub mod network_monitor;

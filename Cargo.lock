@@ -376,6 +376,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "core-foundation 0.9.4",
  "http",
  "http-body-util",
  "hyper",
