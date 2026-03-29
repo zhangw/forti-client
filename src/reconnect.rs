@@ -209,46 +209,52 @@ impl ReconnectController {
                 }
             };
 
-            // Run event loop — but also listen for sleep events
-            let reason = tokio::select! {
-                reason = vpn::event_loop(&mut tunnel, &mut lcp, &tun_dev) => {
-                    // Normal event loop exit
-                    let _ = Self::send_terminate(&mut tunnel, &mut lcp).await;
-                    drop(tunnel);
-                    reason
-                }
-                Some(PowerEvent::WillSleep) = power_rx.recv() => {
-                    // Graceful sleep shutdown
-                    info!("System going to sleep — closing tunnel gracefully");
-                    let _ = Self::send_terminate(&mut tunnel, &mut lcp).await;
-                    drop(tunnel);
+            // Drain stale power events before entering the event loop select.
+            // Without this, a stale HasPoweredOn would poison the pattern-matching
+            // select branch (tokio disables non-matching pattern branches).
+            while let Ok(event) = power_rx.try_recv() {
+                debug!("Draining stale power event: {:?}", event);
+            }
 
-                    // Enter WaitingForNetwork — wait for HasPoweredOn then Reachable
-                    self.state = ConnectionState::WaitingForNetwork;
-                    loop {
-                        tokio::select! {
-                            Some(power_event) = power_rx.recv() => {
-                                if matches!(power_event, PowerEvent::HasPoweredOn) {
-                                    info!("System woke up — waiting for network");
-                                }
-                            }
-                            Some(NetworkEvent::Reachable) = network_rx.recv() => {
-                                info!("Network reachable after wake — reconnecting");
-                                self.backoff.reset();
-                                break;
-                            }
-                            _ = tokio::signal::ctrl_c() => {
-                                info!("Ctrl+C during wake");
-                                self.state = ConnectionState::Cleanup;
-                                vpn::cleanup_tun(&self.tunnel_config, &iface_name);
-                                info!("VPN disconnected.");
-                                return Ok(());
+            // Run event loop — also check for sleep events between iterations.
+            // We can't use tokio::select! with event_loop + power_rx because
+            // event_loop borrows tunnel/lcp, preventing send_terminate in sleep path.
+            // Instead, check power_rx after event_loop returns.
+            let reason = vpn::event_loop(&mut tunnel, &mut lcp, &tun_dev).await;
+
+            // Check if a WillSleep arrived while the event loop was running
+            let is_sleep = matches!(power_rx.try_recv(), Ok(PowerEvent::WillSleep));
+
+            // Send LCP terminate before closing tunnel
+            let _ = Self::send_terminate(&mut tunnel, &mut lcp).await;
+            drop(tunnel);
+
+            if is_sleep {
+                info!("System going to sleep — waiting for wake");
+                self.state = ConnectionState::WaitingForNetwork;
+                loop {
+                    tokio::select! {
+                        Some(power_event) = power_rx.recv() => {
+                            if matches!(power_event, PowerEvent::HasPoweredOn) {
+                                info!("System woke up — waiting for network");
                             }
                         }
+                        Some(NetworkEvent::Reachable) = network_rx.recv() => {
+                            info!("Network reachable after wake — reconnecting");
+                            self.backoff.reset();
+                            break;
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("Ctrl+C during wake");
+                            self.state = ConnectionState::Cleanup;
+                            vpn::cleanup_tun(&self.tunnel_config, &iface_name);
+                            info!("VPN disconnected.");
+                            return Ok(());
+                        }
                     }
-                    continue; // Go back to top of loop to reconnect
                 }
-            };
+                continue; // Go back to top of loop to reconnect
+            }
             info!("Event loop exited: {:?}", reason);
 
             let action = classify_disconnect(&reason);
