@@ -144,7 +144,8 @@ impl ReconnectController {
     /// Run the reconnect loop. Returns only on user quit or unrecoverable error.
     pub async fn run(&mut self) -> Result<()> {
         // Setup TUN, routes, DNS (persist across reconnects)
-        let (tun_dev, iface_name) = vpn::setup_tun(&self.tunnel_config)?;
+        let (mut tun_dev, mut iface_name) = vpn::setup_tun(&self.tunnel_config)?;
+        let mut current_ip = self.tunnel_config.ip_address;
         info!("Press Ctrl+C to disconnect.");
 
         // Start network monitor (uses hostname, not SocketAddr — supports DNS names)
@@ -164,10 +165,20 @@ impl ReconnectController {
             // its 30s timeout, and the timing gap heuristic will catch it on wake.
             let connect_result = self.connect_tunnel().await;
             let (mut tunnel, mut lcp) = match connect_result {
-                Ok(pair) => {
+                Ok((tunnel, lcp, new_ip)) => {
                     self.backoff.reset();
+                    // If server assigned a different IP, recreate TUN device + routes
+                    if new_ip != current_ip {
+                        warn!("IP changed: {} → {} — recreating TUN device", current_ip, new_ip);
+                        vpn::cleanup_tun(&self.tunnel_config, &iface_name);
+                        self.tunnel_config.ip_address = new_ip;
+                        let (new_tun, new_iface) = vpn::setup_tun(&self.tunnel_config)?;
+                        tun_dev = new_tun;
+                        iface_name = new_iface;
+                        current_ip = new_ip;
+                    }
                     info!("Tunnel established, entering data plane");
-                    pair
+                    (tunnel, lcp)
                 }
                 Err(e) => {
                     // Check if it's a cookie rejection (HTTP 403)
@@ -283,7 +294,8 @@ impl ReconnectController {
 
     /// Connect the TLS tunnel and run PPP negotiation.
     /// Uses the cookie fast path: skip resource reservation and XML fetch.
-    async fn connect_tunnel(&self) -> Result<(TlsTunnel, crate::ppp::lcp::LcpState)> {
+    /// Returns the tunnel, LCP state, and the IPCP-assigned IP address.
+    async fn connect_tunnel(&self) -> Result<(TlsTunnel, crate::ppp::lcp::LcpState, std::net::Ipv4Addr)> {
         let mut tunnel = TlsTunnel::connect(
             &self.auth_params.server,
             self.auth_params.port,
@@ -292,10 +304,10 @@ impl ReconnectController {
         ).await?;
 
         let mut ppp = PppEngine::new(1500);
-        let _ipcp_config = ppp.negotiate(&mut tunnel).await?;
+        let ipcp_config = ppp.negotiate(&mut tunnel).await?;
         let lcp = ppp.into_lcp();
 
-        Ok((tunnel, lcp))
+        Ok((tunnel, lcp, ipcp_config.ip_address))
     }
 
     /// Re-authenticate (SAML or credential) and update stored cookie/config.
