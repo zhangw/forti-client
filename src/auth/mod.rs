@@ -93,7 +93,9 @@ impl AuthClient {
 
         // Log all Set-Cookie headers for debugging
         for cookie_hdr in resp.headers().get_all("set-cookie").iter() {
-            debug!("Set-Cookie: {:?}", cookie_hdr);
+            if let Ok(s) = cookie_hdr.to_str() {
+                debug!("Set-Cookie: {}", redact_set_cookie(s));
+            }
         }
 
         // Extract SVPNCOOKIE if present
@@ -103,7 +105,6 @@ impl AuthClient {
         let resp_body = http_body_util::BodyExt::collect(resp.into_body()).await
             .map_err(|e| FortiError::TunnelError(format!("failed to read login body: {}", e)))?;
         let resp_text = String::from_utf8_lossy(&resp_body.to_bytes()).to_string();
-        debug!("Login response body: {}", &resp_text[..resp_text.len().min(500)]);
 
         // Check for 2FA requirement
         let svpn_cookie = if let Some(cookie) = svpn_cookie {
@@ -128,7 +129,7 @@ impl AuthClient {
             return Err(FortiError::AuthFailed("invalid credentials (405)".into()));
         } else {
             return Err(FortiError::AuthFailed(format!(
-                "login failed: status={}, body={}", status, &resp_text[..resp_text.len().min(200)]
+                "login failed: status={}", status
             )));
         };
 
@@ -290,7 +291,9 @@ impl AuthClient {
 
         debug!("SAML auth_id response status: {}", resp.status());
         for cookie_hdr in resp.headers().get_all("set-cookie").iter() {
-            debug!("Set-Cookie: {:?}", cookie_hdr);
+            if let Ok(s) = cookie_hdr.to_str() {
+                debug!("Set-Cookie: {}", redact_set_cookie(s));
+            }
         }
 
         let svpn_cookie = extract_svpncookie(&resp)
@@ -357,7 +360,7 @@ impl AuthClient {
             .map_err(|e| FortiError::TunnelError(format!("failed to read XML body: {}", e)))?;
         let body_bytes = body.to_bytes();
         let xml_text = String::from_utf8_lossy(&body_bytes);
-        debug!("Raw XML config:\n{}", xml_text);
+        debug!("Received XML config ({} bytes)", xml_text.len());
 
         let tunnel_config = xml::TunnelConfig::parse(&xml_text)?;
         info!("Tunnel config: IP={}, DNS={:?}", tunnel_config.ip_address, tunnel_config.dns_servers);
@@ -433,7 +436,11 @@ async fn wait_for_saml_callback(listener: tokio::net::TcpListener) -> Result<Str
     let mut buf = vec![0u8; 4096];
     let n = stream.read(&mut buf).await?;
     let request = String::from_utf8_lossy(&buf[..n]);
-    debug!("SAML callback request:\n{}", &request[..request.len().min(500)]);
+    if let Some(request_line) = request.lines().next() {
+        // Log method only — request line contains session ID in the URL
+        let method = request_line.split_whitespace().next().unwrap_or("?");
+        debug!("SAML callback: received {} request", method);
+    }
 
     // Extract the `id` parameter from the GET request line
     // Format: "GET /?id=<session_id> HTTP/1.1" or "GET /?id=<session_id>&... HTTP/1.1"
@@ -454,7 +461,7 @@ async fn wait_for_saml_callback(listener: tokio::net::TcpListener) -> Result<Str
             "SAML callback did not contain an 'id' parameter".into()
         ))?;
 
-    debug!("SAML session ID: {}", session_id);
+    debug!("SAML session ID received ({} chars)", session_id.len());
 
     // Send a response to the browser — auto-close the tab
     let response = "HTTP/1.1 200 OK\r\n\
@@ -474,6 +481,16 @@ async fn wait_for_saml_callback(listener: tokio::net::TcpListener) -> Result<Str
     Ok(session_id)
 }
 
+/// Redact SVPNCOOKIE values from a Set-Cookie header string.
+/// Returns the header with the cookie value replaced by "<redacted>".
+fn redact_set_cookie(header: &str) -> String {
+    if header.starts_with("SVPNCOOKIE=") {
+        "SVPNCOOKIE=<redacted>".to_string()
+    } else {
+        header.to_string()
+    }
+}
+
 fn urlencoded(s: &str) -> String {
     let mut result = String::new();
     for b in s.bytes() {
@@ -485,4 +502,27 @@ fn urlencoded(s: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_redact_svpncookie() {
+        let input = "SVPNCOOKIE=abc123secret; path=/; secure; HttpOnly";
+        assert_eq!(redact_set_cookie(input), "SVPNCOOKIE=<redacted>");
+    }
+
+    #[test]
+    fn test_no_redact_other_cookie() {
+        let input = "OTHERCOOKIE=value123; path=/";
+        assert_eq!(redact_set_cookie(input), "OTHERCOOKIE=value123; path=/");
+    }
+
+    #[test]
+    fn test_redact_empty_svpncookie() {
+        let input = "SVPNCOOKIE=; path=/";
+        assert_eq!(redact_set_cookie(input), "SVPNCOOKIE=<redacted>");
+    }
 }

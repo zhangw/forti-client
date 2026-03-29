@@ -48,7 +48,17 @@ impl TlsTunnel {
             server, port, svpn_cookie,
         );
 
-        debug!("Tunnel request:\n{}", http_req.trim());
+        let redacted_req = http_req.lines()
+            .map(|line| {
+                if line.trim_start().starts_with("Cookie: SVPNCOOKIE=") {
+                    "Cookie: SVPNCOOKIE=<redacted>"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        debug!("Tunnel request:\n{}", redacted_req.trim());
         tls.write_all(http_req.as_bytes()).await?;
         tls.flush().await?;
 
