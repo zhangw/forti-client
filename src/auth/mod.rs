@@ -456,13 +456,16 @@ async fn wait_for_saml_callback(listener: tokio::net::TcpListener) -> Result<Str
 
     debug!("SAML session ID: {}", session_id);
 
-    // Send a response to the browser
+    // Send a response to the browser — auto-close the tab
     let response = "HTTP/1.1 200 OK\r\n\
         Content-Type: text/html\r\n\
         Connection: close\r\n\
         \r\n\
-        <html><body><h2>Authentication successful</h2>\
-        <p>You may close this browser tab and return to the terminal.</p>\
+        <html><body>\
+        <h2>Authentication successful</h2>\
+        <p>This tab will close automatically.</p>\
+        <script>window.close();</script>\
+        <noscript><p>You may close this browser tab and return to the terminal.</p></noscript>\
         </body></html>";
 
     let _ = stream.write_all(response.as_bytes()).await;
