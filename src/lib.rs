@@ -6,3 +6,4 @@ pub mod tun;
 pub mod vpn;
 pub mod reconnect;
 pub mod network_monitor;
+pub mod power_monitor;
