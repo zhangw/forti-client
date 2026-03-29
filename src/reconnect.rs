@@ -85,7 +85,6 @@ use crate::ppp::PppEngine;
 use crate::tunnel::TlsTunnel;
 use crate::vpn;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn, error};
@@ -148,11 +147,8 @@ impl ReconnectController {
         let (tun_dev, iface_name) = vpn::setup_tun(&self.tunnel_config)?;
         info!("Press Ctrl+C to disconnect.");
 
-        // Start network monitor
-        let server_addr: SocketAddr = format!("{}:{}", self.auth_params.server, self.auth_params.port)
-            .parse()
-            .map_err(|e| FortiError::TunnelError(format!("invalid server address: {}", e)))?;
-        let (_network_monitor, mut network_rx) = NetworkMonitor::start(server_addr)
+        // Start network monitor (uses hostname, not SocketAddr — supports DNS names)
+        let (_network_monitor, mut network_rx) = NetworkMonitor::start(&self.auth_params.server)
             .map_err(|e| FortiError::TunnelError(format!("network monitor failed: {}", e)))?;
 
         // Start power monitor

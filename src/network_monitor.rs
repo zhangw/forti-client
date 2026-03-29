@@ -1,5 +1,5 @@
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
-use std::net::SocketAddr;
+use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use system_configuration::network_reachability::{ReachabilityFlags, SCNetworkReachability};
@@ -21,23 +21,38 @@ pub struct NetworkMonitor {
 }
 
 impl NetworkMonitor {
-    /// Start monitoring reachability to the given address.
+    /// Start monitoring reachability to the given hostname.
     /// Returns the monitor handle and a receiver for network events.
-    pub fn start(server_addr: SocketAddr) -> Result<(Self, mpsc::Receiver<NetworkEvent>), String> {
+    pub fn start(server_host: &str) -> Result<(Self, mpsc::Receiver<NetworkEvent>), String> {
         let (tx, rx) = mpsc::channel(16);
+        let host = server_host.to_string();
 
         let thread = std::thread::Builder::new()
             .name("network-monitor".into())
             .spawn(move || {
-                Self::run_reachability(server_addr, tx);
+                Self::run_reachability(&host, tx);
             })
             .map_err(|e| format!("failed to spawn network monitor thread: {}", e))?;
 
         Ok((Self { _thread: thread }, rx))
     }
 
-    fn run_reachability(addr: SocketAddr, tx: mpsc::Sender<NetworkEvent>) {
-        let mut reachability = SCNetworkReachability::from(addr);
+    fn run_reachability(host: &str, tx: mpsc::Sender<NetworkEvent>) {
+        let c_host = match CString::new(host) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Invalid hostname for reachability: {}", e);
+                return;
+            }
+        };
+
+        let mut reachability = match SCNetworkReachability::from_host(&c_host) {
+            Some(r) => r,
+            None => {
+                warn!("Failed to create SCNetworkReachability for {}", host);
+                return;
+            }
+        };
 
         // Track last known state to only send events on transitions.
         // Using AtomicBool because the callback is Fn (not FnMut).
@@ -89,7 +104,7 @@ impl NetworkMonitor {
             return;
         }
 
-        info!("Network monitor started for {}", addr);
+        info!("Network monitor started for {}", host);
         CFRunLoop::run_current();
         debug!("Network monitor thread exiting");
     }
