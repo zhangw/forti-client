@@ -31,3 +31,34 @@ pub fn classify_disconnect(reason: &DisconnectReason) -> ReconnectAction {
         _ => ReconnectAction::RetryWithCookie,
     }
 }
+
+use std::time::Duration;
+
+const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Exponential backoff timer: 1s, 2s, 4s, 8s, ..., capped at 60s.
+pub struct Backoff {
+    current: Duration,
+}
+
+impl Backoff {
+    pub fn new() -> Self {
+        Self { current: BACKOFF_INITIAL }
+    }
+
+    /// Return the current backoff duration.
+    pub fn current(&self) -> Duration {
+        self.current
+    }
+
+    /// Advance to the next backoff interval.
+    pub fn next(&mut self) {
+        self.current = (self.current * 2).min(BACKOFF_MAX);
+    }
+
+    /// Reset backoff to initial value (after successful reconnect).
+    pub fn reset(&mut self) {
+        self.current = BACKOFF_INITIAL;
+    }
+}
