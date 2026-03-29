@@ -66,13 +66,16 @@ impl Backoff {
 use crate::auth::AuthClient;
 use crate::auth::xml::TunnelConfig;
 use crate::error::{FortiError, Result};
+use crate::network_monitor::{NetworkEvent, NetworkMonitor};
 use crate::ppp::codec::{PppFrame, PppProtocol};
 use crate::ppp::PppEngine;
 use crate::tunnel::TlsTunnel;
 use crate::vpn;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn, error};
 
 /// Current state of the reconnect controller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +133,13 @@ impl ReconnectController {
         let (tun_dev, iface_name) = vpn::setup_tun(&self.tunnel_config)?;
         info!("Press Ctrl+C to disconnect.");
 
+        // Start network monitor
+        let server_addr: SocketAddr = format!("{}:{}", self.auth_params.server, self.auth_params.port)
+            .parse()
+            .map_err(|e| FortiError::TunnelError(format!("invalid server address: {}", e)))?;
+        let (_network_monitor, mut network_rx) = NetworkMonitor::start(server_addr)
+            .map_err(|e| FortiError::TunnelError(format!("network monitor failed: {}", e)))?;
+
         self.state = ConnectionState::Connected;
 
         loop {
@@ -163,13 +173,8 @@ impl ReconnectController {
                     warn!("Tunnel connect failed: {}. Retrying in {:?}", e, delay);
                     self.backoff.next();
 
-                    // Sleep with Ctrl+C escape
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("Ctrl+C during backoff");
-                            break;
-                        }
+                    if self.wait_for_retry(delay, &mut network_rx).await {
+                        break;
                     }
                     continue;
                 }
@@ -195,13 +200,8 @@ impl ReconnectController {
                     info!("Reconnecting in {:?}...", delay);
                     self.backoff.next();
 
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("Ctrl+C during backoff");
-                            self.state = ConnectionState::Cleanup;
-                            break;
-                        }
+                    if self.wait_for_retry(delay, &mut network_rx).await {
+                        break;
                     }
                 }
                 ReconnectAction::ReAuthenticate => {
@@ -214,13 +214,8 @@ impl ReconnectController {
                             error!("Re-authentication failed: {}", e);
                             let delay = self.backoff.current();
                             self.backoff.next();
-                            tokio::select! {
-                                _ = tokio::time::sleep(delay) => {}
-                                _ = tokio::signal::ctrl_c() => {
-                                    info!("Ctrl+C during backoff");
-                                    self.state = ConnectionState::Cleanup;
-                                    break;
-                                }
+                            if self.wait_for_retry(delay, &mut network_rx).await {
+                                break;
                             }
                         }
                     }
@@ -289,5 +284,40 @@ impl ReconnectController {
     async fn send_terminate(tunnel: &mut TlsTunnel, lcp: &mut crate::ppp::lcp::LcpState) -> Result<()> {
         let frame = PppFrame::new(PppProtocol::Lcp, lcp.build_terminate_request());
         tunnel.send_frame(frame.encode()).await
+    }
+
+    /// Wait for backoff timer, but cancel early if network becomes reachable.
+    /// Returns true if user pressed Ctrl+C (should exit).
+    async fn wait_for_retry(
+        &mut self,
+        delay: Duration,
+        network_rx: &mut mpsc::Receiver<NetworkEvent>,
+    ) -> bool {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => false,
+            event = network_rx.recv() => {
+                match event {
+                    Some(NetworkEvent::Reachable) => {
+                        info!("Network reachable — reconnecting immediately");
+                        self.backoff.reset();
+                        false
+                    }
+                    Some(NetworkEvent::Unreachable) => {
+                        info!("Network unreachable — resetting backoff");
+                        self.backoff.reset();
+                        false
+                    }
+                    None => {
+                        debug!("Network monitor channel closed");
+                        false
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl+C during backoff");
+                self.state = ConnectionState::Cleanup;
+                true
+            }
+        }
     }
 }
