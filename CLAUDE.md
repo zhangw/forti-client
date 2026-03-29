@@ -101,6 +101,11 @@ TLS Connection (rustls/tokio-rustls)
 - **Routes**: `/sbin/route add -net <ip>/<prefix> -interface <utun>` for subnets, `-host <ip>` for /32. Tolerate "File exists" errors.
 - **Privilege**: Requires `sudo` — build first, then `sudo ./target/debug/forti-client`. Don't use `sudo cargo run` (interferes with terminal input for SAML).
 
+### Known Accepted Risks
+
+- **SAML callback local race (medium):** The localhost SAML callback server (port 8020) validates request structure (GET + non-empty `id=`) and has timeouts, but cannot bind a cryptographic nonce to the browser session. FortiGate controls the callback URL (`http://127.0.0.1:8020/`) and `/remote/saml/start` does not accept a custom `state` parameter. A local attacker who knows the protocol can still race a valid-looking `id=` request. Mitigation: the `id` is validated server-side during the cookie exchange — a forged `id` will fail, producing an auth error rather than a hijacked session. This is a protocol-level limitation shared with openfortivpn.
+- **Transitive unmaintained crate (`paste`, RUSTSEC-2024-0436):** No CVE, dependency is deep-transitive via the networking stack. Tracked for upstream migration.
+
 ### Tech Stack
 
 Rust 2021 edition, tokio 1.x (full), hyper 1.8, rustls 0.23, tokio-rustls 0.26, tun-rs 2.8, clap 4, tracing 0.1, thiserror 2, bytes 1.x, secrecy 0.10 (credential zeroization), system-configuration 0.6 (SCNetworkReachability), core-foundation 0.9 (CFRunLoop), IOKit (FFI). DTLS will use `openssl` crate (only mature DTLS option in Rust).
