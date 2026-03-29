@@ -4,3 +4,4 @@ pub mod auth;
 pub mod tunnel;
 pub mod tun;
 pub mod vpn;
+pub mod reconnect;
