@@ -3,7 +3,7 @@ pub mod xml;
 use crate::error::{FortiError, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, debug};
+use tracing::{info, debug, warn};
 
 #[derive(Debug)]
 pub struct AuthResult {
@@ -426,59 +426,99 @@ fn extract_html_field(html: &str, field_name: &str) -> Option<String> {
 
 /// Wait for the SAML IdP to redirect the browser to our local callback server.
 /// Extracts the `id` parameter from the request URL.
+/// Rejects malformed/invalid requests and continues listening until a valid
+/// callback is received or the attempt limit is exhausted.
 async fn wait_for_saml_callback(listener: tokio::net::TcpListener) -> Result<String> {
-    let (mut stream, addr) = listener.accept().await
-        .map_err(|e| FortiError::AuthFailed(format!("failed to accept SAML callback: {}", e)))?;
+    // Accept up to 5 connections, rejecting invalid ones
+    for attempt in 0..5 {
+        let (mut stream, addr) = listener.accept().await
+            .map_err(|e| FortiError::AuthFailed(format!("failed to accept SAML callback: {}", e)))?;
 
-    debug!("SAML callback connection from {}", addr);
+        debug!("SAML callback connection from {} (attempt {})", addr, attempt + 1);
 
-    // Read the HTTP request
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-    if let Some(request_line) = request.lines().next() {
+        // Read the HTTP request — handle errors defensively so a single
+        // bad connection doesn't abort the entire listener
+        let mut buf = vec![0u8; 4096];
+        let n = match stream.read(&mut buf).await {
+            Ok(0) => {
+                debug!("SAML callback: connection closed without data");
+                let _ = stream.shutdown().await;
+                continue;
+            }
+            Ok(n) => n,
+            Err(e) => {
+                debug!("SAML callback: read error: {}", e);
+                let _ = stream.shutdown().await;
+                continue;
+            }
+        };
+        let request = String::from_utf8_lossy(&buf[..n]);
+
         // Log method only — request line contains session ID in the URL
-        let method = request_line.split_whitespace().next().unwrap_or("?");
-        debug!("SAML callback: received {} request", method);
+        if let Some(request_line) = request.lines().next() {
+            let method = request_line.split_whitespace().next().unwrap_or("?");
+            debug!("SAML callback: received {} request", method);
+        }
+
+        // Validate: must be GET with ?id= parameter
+        let session_id = request.lines()
+            .next()
+            .and_then(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                // Must be "GET <path> HTTP/1.x"
+                if parts.len() < 2 || parts[0] != "GET" {
+                    return None;
+                }
+                let path = parts[1];
+                let query = path.split('?').nth(1)?;
+                for param in query.split('&') {
+                    if let Some(value) = param.strip_prefix("id=") {
+                        if !value.is_empty() {
+                            return Some(value.to_string());
+                        }
+                    }
+                }
+                None
+            });
+
+        match session_id {
+            Some(id) => {
+                debug!("SAML session ID received ({} chars)", id.len());
+
+                // Send success response
+                let response = "HTTP/1.1 200 OK\r\n\
+                    Content-Type: text/html\r\n\
+                    Connection: close\r\n\
+                    \r\n\
+                    <html><body>\
+                    <h2>Authentication successful</h2>\
+                    <p>This tab will close automatically.</p>\
+                    <script>window.close();</script>\
+                    <noscript><p>You may close this browser tab and return to the terminal.</p></noscript>\
+                    </body></html>";
+
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+                return Ok(id);
+            }
+            None => {
+                // Invalid request — reject and continue listening
+                warn!("Rejected invalid SAML callback (no valid id parameter), continuing to listen");
+                let response = "HTTP/1.1 400 Bad Request\r\n\
+                    Content-Type: text/plain\r\n\
+                    Connection: close\r\n\
+                    \r\n\
+                    Invalid callback request";
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+                continue;
+            }
+        }
     }
 
-    // Extract the `id` parameter from the GET request line
-    // Format: "GET /?id=<session_id> HTTP/1.1" or "GET /?id=<session_id>&... HTTP/1.1"
-    let session_id = request.lines()
-        .next()
-        .and_then(|line| {
-            let path = line.split_whitespace().nth(1)?;
-            // Parse query string
-            let query = path.split('?').nth(1)?;
-            for param in query.split('&') {
-                if let Some(value) = param.strip_prefix("id=") {
-                    return Some(value.to_string());
-                }
-            }
-            None
-        })
-        .ok_or_else(|| FortiError::AuthFailed(
-            "SAML callback did not contain an 'id' parameter".into()
-        ))?;
-
-    debug!("SAML session ID received ({} chars)", session_id.len());
-
-    // Send a response to the browser — auto-close the tab
-    let response = "HTTP/1.1 200 OK\r\n\
-        Content-Type: text/html\r\n\
-        Connection: close\r\n\
-        \r\n\
-        <html><body>\
-        <h2>Authentication successful</h2>\
-        <p>This tab will close automatically.</p>\
-        <script>window.close();</script>\
-        <noscript><p>You may close this browser tab and return to the terminal.</p></noscript>\
-        </body></html>";
-
-    let _ = stream.write_all(response.as_bytes()).await;
-    let _ = stream.shutdown().await;
-
-    Ok(session_id)
+    Err(FortiError::AuthFailed(
+        "SAML callback: too many invalid requests, giving up".into()
+    ))
 }
 
 /// Redact SVPNCOOKIE values from a Set-Cookie header string.
