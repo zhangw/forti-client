@@ -1,8 +1,7 @@
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 use forti_client::auth::AuthClient;
-use forti_client::tunnel::TlsTunnel;
-use forti_client::ppp::PppEngine;
+use forti_client::reconnect::{AuthParams, ReconnectController};
 use std::io::Write;
 
 #[derive(Parser, Debug)]
@@ -46,30 +45,33 @@ async fn main() -> anyhow::Result<()> {
 
     let auth_client = AuthClient::new(&cli.server, cli.port)?;
 
-    let auth_result = if cli.saml {
-        // SAML/SSO authentication
-        tracing::info!("Starting SAML authentication to {}:{}", cli.server, cli.port);
-        auth_client.login_saml().await?
-    } else {
-        // Credential authentication
-        let username = cli.username
-            .ok_or_else(|| anyhow::anyhow!("--username is required for credential auth (use --saml for SSO)"))?;
-
-        let password = match cli.password {
-            Some(p) => p,
-            None => {
+    // Prompt for password early (before we need sudo/root)
+    let password = if !cli.saml {
+        match cli.password.clone() {
+            Some(p) => Some(p),
+            None if cli.username.is_some() => {
                 eprint!("Password: ");
                 std::io::stderr().flush()?;
                 let mut p = String::new();
                 std::io::stdin().read_line(&mut p)?;
-                p.trim().to_string()
+                Some(p.trim().to_string())
             }
-        };
+            None => None,
+        }
+    } else {
+        None
+    };
 
+    let auth_result = if cli.saml {
+        tracing::info!("Starting SAML authentication to {}:{}", cli.server, cli.port);
+        auth_client.login_saml().await?
+    } else {
+        let username = cli.username.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--username is required for credential auth (use --saml for SSO)"))?;
+        let pw = password.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("password required"))?;
         tracing::info!("Authenticating to {}:{}", cli.server, cli.port);
-        auth_client
-            .login(&username, &password, cli.realm.as_deref())
-            .await?
+        auth_client.login(username, pw, cli.realm.as_deref()).await?
     };
 
     tracing::info!(
@@ -79,29 +81,23 @@ async fn main() -> anyhow::Result<()> {
         auth_result.tunnel_config.routes.len(),
     );
 
-    // Establish TLS tunnel
-    tracing::info!("Establishing TLS tunnel");
-    let mut tunnel = TlsTunnel::connect(
-        &cli.server,
-        cli.port,
-        &auth_result.svpn_cookie,
-        auth_client.tls_config(),
-    )
-    .await?;
+    let auth_params = AuthParams {
+        server: cli.server,
+        port: cli.port,
+        saml: cli.saml,
+        username: cli.username,
+        password,
+        realm: cli.realm,
+        tls_config: auth_client.tls_config(),
+    };
 
-    // PPP negotiation
-    tracing::info!("Running PPP negotiation");
-    let mut ppp = PppEngine::new(1500);
-    let ipcp_config = ppp.negotiate(&mut tunnel).await?;
+    let mut controller = ReconnectController::new(
+        auth_params,
+        auth_result.svpn_cookie,
+        auth_result.tunnel_config,
+    );
 
-    tracing::info!("PPP negotiation complete — IP={}", ipcp_config.ip_address);
-    if let Some(dns) = ipcp_config.primary_dns {
-        tracing::info!("  Primary DNS: {}", dns);
-    }
-
-    // Extract LCP state for keepalive and run the VPN data plane
-    let lcp = ppp.into_lcp();
-    forti_client::vpn::run(tunnel, lcp, &auth_result.tunnel_config).await?;
+    controller.run().await?;
 
     Ok(())
 }
