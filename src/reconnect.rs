@@ -75,6 +75,8 @@ impl Backoff {
     }
 }
 
+use secrecy::{SecretString, ExposeSecret};
+
 use crate::auth::AuthClient;
 use crate::auth::xml::TunnelConfig;
 use crate::error::{FortiError, Result};
@@ -112,7 +114,7 @@ pub struct AuthParams {
     pub port: u16,
     pub saml: bool,
     pub username: Option<String>,
-    pub password: Option<String>,
+    pub password: Option<SecretString>,
     pub realm: Option<String>,
     pub tls_config: Arc<rustls::ClientConfig>,
 }
@@ -313,10 +315,10 @@ impl ReconnectController {
         } else {
             let username = self.auth_params.username.as_deref()
                 .ok_or_else(|| FortiError::AuthFailed("no username for re-auth".into()))?;
-            let password = self.auth_params.password.as_deref()
+            let password = self.auth_params.password.as_ref()
                 .ok_or_else(|| FortiError::AuthFailed("no password for re-auth".into()))?;
             info!("Re-authenticating with credentials...");
-            auth_client.login(username, password, self.auth_params.realm.as_deref()).await?
+            auth_client.login(username, password.expose_secret(), self.auth_params.realm.as_deref()).await?
         };
 
         self.svpn_cookie = auth_result.svpn_cookie;

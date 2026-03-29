@@ -41,6 +41,7 @@ tun-rs = { version = "2", features = ["async"] }
 # Utilities
 bytes = "1"
 rand = "0.8"
+secrecy = "0.10"
 
 # macOS network reachability (SCNetworkReachability)
 system-configuration = "0.6"

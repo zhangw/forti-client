@@ -2,9 +2,10 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 use forti_client::auth::AuthClient;
 use forti_client::reconnect::{AuthParams, ReconnectController};
+use secrecy::{SecretString, ExposeSecret};
 use std::io::Write;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(name = "forti-client", about = "FortiGate SSL VPN client")]
 struct Cli {
     /// VPN gateway hostname or IP
@@ -41,20 +42,20 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     let auth_client = AuthClient::new(&cli.server, cli.port)?;
 
     // Prompt for password early (before we need sudo/root)
-    let password = if !cli.saml {
-        match cli.password.clone() {
-            Some(p) => Some(p),
+    let password: Option<SecretString> = if !cli.saml {
+        match cli.password.take() {
+            Some(p) => Some(SecretString::from(p)),
             None if cli.username.is_some() => {
                 eprint!("Password: ");
                 std::io::stderr().flush()?;
                 let mut p = String::new();
                 std::io::stdin().read_line(&mut p)?;
-                Some(p.trim().to_string())
+                Some(SecretString::from(p.trim().to_string()))
             }
             None => None,
         }
@@ -68,10 +69,10 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let username = cli.username.as_deref()
             .ok_or_else(|| anyhow::anyhow!("--username is required for credential auth (use --saml for SSO)"))?;
-        let pw = password.as_deref()
+        let pw = password.as_ref()
             .ok_or_else(|| anyhow::anyhow!("password required"))?;
         tracing::info!("Authenticating to {}:{}", cli.server, cli.port);
-        auth_client.login(username, pw, cli.realm.as_deref()).await?
+        auth_client.login(username, pw.expose_secret(), cli.realm.as_deref()).await?
     };
 
     tracing::info!(
