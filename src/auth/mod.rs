@@ -18,7 +18,7 @@ pub struct AuthClient {
 }
 
 impl AuthClient {
-    pub fn new(server: &str, port: u16) -> Result<Self> {
+    pub fn new(server: &str, port: u16, enable_keylog: bool) -> Result<Self> {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -26,8 +26,9 @@ impl AuthClient {
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
-        // Enable SSLKEYLOGFILE for TLS packet analysis (Wireshark)
-        tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
+        if enable_keylog {
+            tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
+        }
 
         Ok(Self {
             server: server.to_string(),

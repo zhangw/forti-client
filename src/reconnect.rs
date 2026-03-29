@@ -117,6 +117,7 @@ pub struct AuthParams {
     pub password: Option<SecretString>,
     pub realm: Option<String>,
     pub tls_config: Arc<rustls::ClientConfig>,
+    pub enable_keylog: bool,
 }
 
 /// Reconnect controller: owns TUN/routes/DNS, drives the reconnect state machine.
@@ -307,6 +308,7 @@ impl ReconnectController {
         let auth_client = AuthClient::new(
             &self.auth_params.server,
             self.auth_params.port,
+            self.auth_params.enable_keylog,
         )?;
 
         let auth_result = if self.auth_params.saml {
