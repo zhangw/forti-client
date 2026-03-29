@@ -73,6 +73,7 @@ use crate::auth::AuthClient;
 use crate::auth::xml::TunnelConfig;
 use crate::error::{FortiError, Result};
 use crate::network_monitor::{NetworkEvent, NetworkMonitor};
+use crate::power_monitor::{PowerMonitor, PowerEvent};
 use crate::ppp::codec::{PppFrame, PppProtocol};
 use crate::ppp::PppEngine;
 use crate::tunnel::TlsTunnel;
@@ -94,6 +95,8 @@ pub enum ConnectionState {
     Reconnecting { attempt: u32 },
     /// Cookie expired — running full re-authentication.
     ReAuthenticating,
+    /// Waiting for network to return after sleep/wake (Layer 3).
+    WaitingForNetwork,
     /// Final cleanup before exit.
     Cleanup,
 }
@@ -146,6 +149,10 @@ impl ReconnectController {
         let (_network_monitor, mut network_rx) = NetworkMonitor::start(server_addr)
             .map_err(|e| FortiError::TunnelError(format!("network monitor failed: {}", e)))?;
 
+        // Start power monitor
+        let (_power_monitor, mut power_rx) = PowerMonitor::start()
+            .map_err(|e| FortiError::TunnelError(format!("power monitor failed: {}", e)))?;
+
         self.state = ConnectionState::Connected;
 
         loop {
@@ -186,13 +193,47 @@ impl ReconnectController {
                 }
             };
 
-            // Run event loop
-            let reason = vpn::event_loop(&mut tunnel, &mut lcp, &tun_dev).await;
-            info!("Event loop exited: {:?}", reason);
+            // Run event loop — but also listen for sleep events
+            let reason = tokio::select! {
+                reason = vpn::event_loop(&mut tunnel, &mut lcp, &tun_dev) => {
+                    // Normal event loop exit
+                    let _ = Self::send_terminate(&mut tunnel, &mut lcp).await;
+                    drop(tunnel);
+                    reason
+                }
+                Some(PowerEvent::WillSleep) = power_rx.recv() => {
+                    // Graceful sleep shutdown
+                    info!("System going to sleep — closing tunnel gracefully");
+                    let _ = Self::send_terminate(&mut tunnel, &mut lcp).await;
+                    drop(tunnel);
 
-            // Send LCP terminate if tunnel is still usable
-            let _ = Self::send_terminate(&mut tunnel, &mut lcp).await;
-            drop(tunnel); // Close TLS connection
+                    // Enter WaitingForNetwork — wait for HasPoweredOn then Reachable
+                    self.state = ConnectionState::WaitingForNetwork;
+                    loop {
+                        tokio::select! {
+                            Some(power_event) = power_rx.recv() => {
+                                if matches!(power_event, PowerEvent::HasPoweredOn) {
+                                    info!("System woke up — waiting for network");
+                                }
+                            }
+                            Some(NetworkEvent::Reachable) = network_rx.recv() => {
+                                info!("Network reachable after wake — reconnecting");
+                                self.backoff.reset();
+                                break;
+                            }
+                            _ = tokio::signal::ctrl_c() => {
+                                info!("Ctrl+C during wake");
+                                self.state = ConnectionState::Cleanup;
+                                vpn::cleanup_tun(&self.tunnel_config, &iface_name);
+                                info!("VPN disconnected.");
+                                return Ok(());
+                            }
+                        }
+                    }
+                    continue; // Go back to top of loop to reconnect
+                }
+            };
+            info!("Event loop exited: {:?}", reason);
 
             let action = classify_disconnect(&reason);
             match action {

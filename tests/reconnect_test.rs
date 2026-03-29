@@ -115,9 +115,16 @@ fn test_state_transitions() {
         ConnectionState::Connected,
         ConnectionState::Reconnecting { attempt: 1 },
         ConnectionState::ReAuthenticating,
+        ConnectionState::WaitingForNetwork,
         ConnectionState::Cleanup,
     ];
-    assert_eq!(states.len(), 5);
+    assert_eq!(states.len(), 6);
+}
+
+#[test]
+fn test_waiting_for_network_state() {
+    let state = ConnectionState::WaitingForNetwork;
+    assert!(matches!(state, ConnectionState::WaitingForNetwork));
 }
 
 #[test]
