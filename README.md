@@ -9,6 +9,7 @@ A Rust CLI client for FortiGate SSL VPN on macOS. Connects to FortiGate gateways
 - **Split-tunnel routing** — installs only the routes pushed by the FortiGate
 - **DNS configuration** — configures macOS resolver via `scutil`
 - **LCP keepalive** — automatic dead peer detection
+- **Auto-reconnect** — exponential backoff, network change detection, sleep/wake handling
 - **Graceful cleanup** — removes routes, DNS, and TUN device on disconnect
 
 ## Requirements
@@ -56,12 +57,13 @@ You'll be prompted for your password. If 2FA is enabled, you'll be prompted for 
 ### Options
 
 ```
-  -s, --server <SERVER>      VPN gateway hostname or IP (required)
-  -p, --port <PORT>          VPN gateway port [default: 443]
-  -u, --username <USERNAME>  Username (not needed for --saml)
-  -P, --password <PASSWORD>  Password (if omitted, will prompt)
-      --realm <REALM>        Realm/user-group (optional)
-      --saml                 Use SAML/SSO authentication
+  -s, --server <SERVER>              VPN gateway hostname or IP (required)
+  -p, --port <PORT>                  VPN gateway port [default: 443]
+  -u, --username <USERNAME>          Username (not needed for --saml)
+  -P, --password <PASSWORD>          Password (if omitted, will prompt)
+      --realm <REALM>                Realm/user-group (optional)
+      --saml                         Use SAML/SSO authentication
+      --tls-keylog-file <PATH>       TLS key logging for Wireshark (opt-in)
 ```
 
 ### Verbose logging
@@ -73,10 +75,12 @@ sudo RUST_LOG=debug ./target/release/forti-client --server sslvpn.example.com --
 ### TLS key logging (for Wireshark)
 
 ```bash
-sudo SSLKEYLOGFILE=~/.ssl-key.log ./target/release/forti-client --server sslvpn.example.com --saml
+sudo ./target/release/forti-client --server sslvpn.example.com --saml --tls-keylog-file ~/.ssl-key.log
 ```
 
 Then in Wireshark: **Preferences > Protocols > TLS > (Pre)-Master-Secret log filename** → point to `~/.ssl-key.log`.
+
+**Note:** TLS key logging is disabled by default and requires the explicit `--tls-keylog-file` flag. The path is validated (symlinks and world-writable directories are rejected).
 
 ## Verify it's working
 
@@ -122,7 +126,6 @@ TLS (rustls) → Fortinet Wire Frame (0x5050 magic)
 
 - macOS only (uses utun kernel interface)
 - TLS tunnel only (no DTLS/UDP acceleration yet)
-- No auto-reconnect on network change or sleep/wake
 - No IPv6 support yet
 - Requires `sudo` (no privilege separation yet)
 - SAML callback listens on port 8020 (must be free)

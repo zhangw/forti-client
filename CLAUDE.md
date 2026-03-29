@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Rust CLI client (`forti-client`) that speaks the FortiGate SSL VPN wire protocol directly, targeting macOS. This fills a gap where no existing client provides macOS-native networking (utun + SystemConfiguration DNS) + SAML/SSO + DTLS + userspace PPP together.
 
-**Status:** Phases 1–3 complete. SAML auth, TLS tunnel, PPP negotiation, TUN device, split-tunnel routing, DNS, keepalive, packet forwarding, auto-reconnect with exponential backoff, network change detection (SCNetworkReachability), and macOS sleep/wake handling (IOKit) all work end-to-end. Phase 4 will add DTLS and IPv6.
+**Status:** Phases 1–3 complete + security hardening. SAML auth, TLS tunnel, PPP negotiation, TUN device, split-tunnel routing, DNS, keepalive, packet forwarding, auto-reconnect with exponential backoff, network change detection (SCNetworkReachability), and macOS sleep/wake handling (IOKit) all work end-to-end. Security review completed: log redaction, SAML callback hardening, credential memory protection (`secrecy`), TLS keylog opt-in. Phase 4 will add DTLS and IPv6.
 
 ## Build and Test Commands
 
@@ -14,7 +14,7 @@ A Rust CLI client (`forti-client`) that speaks the FortiGate SSL VPN wire protoc
 # Build
 cargo build
 
-# Run all tests (47 tests across 8 test files)
+# Run all tests (50 tests across 8 test files + auth unit tests)
 cargo test
 
 # Run a single test file
@@ -36,8 +36,8 @@ cargo build && sudo RUST_LOG=debug ./target/debug/forti-client --server sslvpn.e
 # Run with credential auth
 cargo build && sudo RUST_LOG=debug ./target/debug/forti-client --server sslvpn.example.com --username user
 
-# Run with TLS key logging for Wireshark analysis
-cargo build && sudo SSLKEYLOGFILE=~/.ssl-key.log RUST_LOG=debug ./target/debug/forti-client --server sslvpn.example.com --port 10443 --saml
+# Run with TLS key logging for Wireshark analysis (requires explicit opt-in flag)
+cargo build && sudo RUST_LOG=debug ./target/debug/forti-client --server sslvpn.example.com --port 10443 --saml --tls-keylog-file ~/.ssl-key.log
 
 # Check without building
 cargo check
@@ -69,7 +69,7 @@ TLS Connection (rustls/tokio-rustls)
   - `codec.rs` — Fortinet wire frame codec (6-byte header with `0x5050` magic), including streaming `FortinetCodec` with desync recovery
   - `mod.rs` — TLS tunnel establishment (raw HTTP/1.1 upgrade to binary PPP-over-TLS)
 - **`auth/`** — HTTP authentication against FortiGate
-  - `mod.rs` — Credential auth, SAML/SSO auth (browser-based with localhost callback on port 8020), 2FA support (tokeninfo + HTML form + FortiToken Mobile push)
+  - `mod.rs` — Credential auth, SAML/SSO auth (browser-based with localhost callback on port 8020, hardened with request validation + 5-min timeout + 5-sec per-connection read timeout), 2FA support (tokeninfo + HTML form + FortiToken Mobile push). Debug logs redact SVPNCOOKIE and session IDs.
   - `xml.rs` — Tunnel config XML parser (supports both single and double-quoted attributes)
 - **`tun/`** — macOS network configuration
   - `mod.rs` — TUN device creation via `tun-rs` (utun)
@@ -79,7 +79,7 @@ TLS Connection (rustls/tokio-rustls)
 - **`reconnect.rs`** — `ReconnectController` state machine wrapping the event loop. Owns TUN/routes/DNS lifetime (persist across reconnects). Handles `DisconnectReason`/`ReconnectAction` classification, `Backoff` (exponential, 1s–60s cap), cookie reuse fast path, automatic SAML re-auth, `WaitingForNetwork` state for sleep/wake, and `detect_sleep_gap` timing heuristic.
 - **`network_monitor.rs`** — `NetworkMonitor` using `system-configuration` crate for SCNetworkReachability callbacks. Dedicated thread with CFRunLoop, sends `NetworkEvent::Reachable`/`Unreachable` via tokio channel. Cancels backoff on network return.
 - **`power_monitor.rs`** — `PowerMonitor` using IOKit FFI for macOS sleep/wake notifications (`WillSleep`, `HasPoweredOn`). Dedicated thread with CFRunLoop, sends `PowerEvent` via tokio channel. Acknowledges sleep via `IOAllowPowerChange`.
-- **`main.rs`** — CLI entry point with `--saml` flag for SSO, `--username`/`--password` for credential auth. Delegates to `ReconnectController` after initial authentication.
+- **`main.rs`** — CLI entry point with `--saml` flag for SSO, `--username`/`--password` for credential auth, `--tls-keylog-file` for opt-in TLS key logging (with path validation). Password stored as `SecretString` (zeroized on drop). Delegates to `ReconnectController` after initial authentication.
 - **`error.rs`** — Error types via thiserror
 
 ### Key Protocol Details (learned from real-server testing)
@@ -103,7 +103,7 @@ TLS Connection (rustls/tokio-rustls)
 
 ### Tech Stack
 
-Rust 2021 edition, tokio 1.x (full), hyper 1.8, rustls 0.23, tokio-rustls 0.26, tun-rs 2.8, clap 4, tracing 0.1, thiserror 2, bytes 1.x, system-configuration 0.6 (SCNetworkReachability), core-foundation 0.9 (CFRunLoop), IOKit (FFI). DTLS will use `openssl` crate (only mature DTLS option in Rust).
+Rust 2021 edition, tokio 1.x (full), hyper 1.8, rustls 0.23, tokio-rustls 0.26, tun-rs 2.8, clap 4, tracing 0.1, thiserror 2, bytes 1.x, secrecy 0.10 (credential zeroization), system-configuration 0.6 (SCNetworkReachability), core-foundation 0.9 (CFRunLoop), IOKit (FFI). DTLS will use `openssl` crate (only mature DTLS option in Rust).
 
 ## Reference Documents
 
@@ -116,3 +116,7 @@ Rust 2021 edition, tokio 1.x (full), hyper 1.8, rustls 0.23, tokio-rustls 0.26, 
 - `docs/superpowers/plans/2026-03-29-forti-client-phase2-data-plane.md` — Phase 2 implementation plan
 - `docs/superpowers/specs/2026-03-29-phase3-reconnect-sleep-wake-design.md` — Phase 3 design spec (reconnect, network detection, sleep/wake)
 - `docs/superpowers/plans/2026-03-29-phase3-reconnect-sleep-wake.md` — Phase 3 implementation plan
+- `docs/security-review-plan.md` — Security review plan for Codex agent (9 review areas)
+- `docs/security-review/2026-03-29-security-findings.md` — Security audit findings (6 findings)
+- `docs/security-review/2026-03-29-security-remediation-roadmap.md` — Remediation roadmap (all fixed)
+- `docs/superpowers/plans/2026-03-29-security-remediation.md` — Security remediation implementation plan
