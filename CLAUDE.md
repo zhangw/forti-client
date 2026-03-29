@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Rust CLI client (`forti-client`) that speaks the FortiGate SSL VPN wire protocol directly, targeting macOS. This fills a gap where no existing client provides macOS-native networking (utun + SystemConfiguration DNS) + SAML/SSO + DTLS + userspace PPP together.
 
-**Status:** Phase 1 (auth + PPP negotiation) and Phase 2 (data plane) are complete and validated against a real FortiGate. The VPN is fully functional: SAML auth, TLS tunnel, PPP negotiation, TUN device, split-tunnel routing, DNS, keepalive, and packet forwarding all work end-to-end. Phase 3 will add DTLS, reconnect, sleep/wake, and IPv6.
+**Status:** Phases 1–3 complete. SAML auth, TLS tunnel, PPP negotiation, TUN device, split-tunnel routing, DNS, keepalive, packet forwarding, auto-reconnect with exponential backoff, network change detection (SCNetworkReachability), and macOS sleep/wake handling (IOKit) all work end-to-end. Phase 4 will add DTLS and IPv6.
 
 ## Build and Test Commands
 
@@ -14,7 +14,7 @@ A Rust CLI client (`forti-client`) that speaks the FortiGate SSL VPN wire protoc
 # Build
 cargo build
 
-# Run all tests (29 tests across 5 test files)
+# Run all tests (47 tests across 8 test files)
 cargo test
 
 # Run a single test file
@@ -23,6 +23,9 @@ cargo test --test ppp_codec_test
 cargo test --test lcp_test
 cargo test --test ipcp_test
 cargo test --test routes_test
+cargo test --test reconnect_test
+cargo test --test network_monitor_test
+cargo test --test power_monitor_test
 
 # Run a specific test by name
 cargo test test_encode_fortinet_frame
@@ -72,8 +75,11 @@ TLS Connection (rustls/tokio-rustls)
   - `mod.rs` — TUN device creation via `tun-rs` (utun)
   - `routes.rs` — Split-tunnel route install/remove via `/sbin/route`
   - `dns.rs` — DNS configuration via `scutil` (supplemental resolver)
-- **`vpn.rs`** — Main event loop: `tokio::select!` multiplexing TUN reads, tunnel reads, LCP keepalive timer, and Ctrl+C. Handles setup (TUN, routes, DNS) and cleanup on exit.
-- **`main.rs`** — CLI entry point with `--saml` flag for SSO, `--username`/`--password` for credential auth
+- **`vpn.rs`** — Data plane event loop: `tokio::select!` multiplexing TUN reads, tunnel reads, LCP keepalive timer, timing gap heuristic, and Ctrl+C. Provides `setup_tun()`, `cleanup_tun()`, and `event_loop()` (returns `DisconnectReason`).
+- **`reconnect.rs`** — `ReconnectController` state machine wrapping the event loop. Owns TUN/routes/DNS lifetime (persist across reconnects). Handles `DisconnectReason`/`ReconnectAction` classification, `Backoff` (exponential, 1s–60s cap), cookie reuse fast path, automatic SAML re-auth, `WaitingForNetwork` state for sleep/wake, and `detect_sleep_gap` timing heuristic.
+- **`network_monitor.rs`** — `NetworkMonitor` using `system-configuration` crate for SCNetworkReachability callbacks. Dedicated thread with CFRunLoop, sends `NetworkEvent::Reachable`/`Unreachable` via tokio channel. Cancels backoff on network return.
+- **`power_monitor.rs`** — `PowerMonitor` using IOKit FFI for macOS sleep/wake notifications (`WillSleep`, `HasPoweredOn`). Dedicated thread with CFRunLoop, sends `PowerEvent` via tokio channel. Acknowledges sleep via `IOAllowPowerChange`.
+- **`main.rs`** — CLI entry point with `--saml` flag for SSO, `--username`/`--password` for credential auth. Delegates to `ReconnectController` after initial authentication.
 - **`error.rs`** — Error types via thiserror
 
 ### Key Protocol Details (learned from real-server testing)
@@ -97,7 +103,7 @@ TLS Connection (rustls/tokio-rustls)
 
 ### Tech Stack
 
-Rust 2021 edition, tokio 1.x (full), hyper 1.8, rustls 0.23, tokio-rustls 0.26, tun-rs 2.8, clap 4, tracing 0.1, thiserror 2, bytes 1.x. DTLS will use `openssl` crate (only mature DTLS option in Rust).
+Rust 2021 edition, tokio 1.x (full), hyper 1.8, rustls 0.23, tokio-rustls 0.26, tun-rs 2.8, clap 4, tracing 0.1, thiserror 2, bytes 1.x, system-configuration 0.6 (SCNetworkReachability), core-foundation 0.9 (CFRunLoop), IOKit (FFI). DTLS will use `openssl` crate (only mature DTLS option in Rust).
 
 ## Reference Documents
 
@@ -108,3 +114,5 @@ Rust 2021 edition, tokio 1.x (full), hyper 1.8, rustls 0.23, tokio-rustls 0.26, 
 - `docs/superpowers/specs/2026-03-28-rust-fortigate-vpn-client-design.md` — Full design spec with crate ecosystem analysis
 - `docs/superpowers/plans/2026-03-28-forti-vpn-phase1-feasibility.md` — Phase 1 implementation plan
 - `docs/superpowers/plans/2026-03-29-forti-client-phase2-data-plane.md` — Phase 2 implementation plan
+- `docs/superpowers/specs/2026-03-29-phase3-reconnect-sleep-wake-design.md` — Phase 3 design spec (reconnect, network detection, sleep/wake)
+- `docs/superpowers/plans/2026-03-29-phase3-reconnect-sleep-wake.md` — Phase 3 implementation plan
