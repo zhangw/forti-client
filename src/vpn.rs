@@ -49,6 +49,7 @@ pub async fn event_loop(
     let mut missed_echoes: u32 = 0;
     let mut tun_buf = vec![0u8; 4096];
     let mut pkt_count: u64 = 0;
+    let mut last_tick = std::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -138,6 +139,14 @@ pub async fn event_loop(
 
             // Keepalive timer
             _ = keepalive.tick() => {
+                // Timing gap heuristic: detect possible sleep/wake
+                if crate::reconnect::detect_sleep_gap(last_tick, Duration::from_secs(10)) {
+                    info!("Timing gap detected ({}s since last tick) — possible sleep/wake",
+                        last_tick.elapsed().as_secs());
+                    return DisconnectReason::DeadPeer;
+                }
+                last_tick = std::time::Instant::now();
+
                 if let Err(e) = send_ppp(tunnel, PppProtocol::Lcp, lcp.build_echo_request()).await {
                     return DisconnectReason::IoError(format!("keepalive send error: {}", e));
                 }

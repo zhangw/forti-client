@@ -32,7 +32,13 @@ pub fn classify_disconnect(reason: &DisconnectReason) -> ReconnectAction {
     }
 }
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Detect if the system likely slept by checking if elapsed time since the last
+/// keepalive tick is much larger than expected (> 3x the interval).
+pub fn detect_sleep_gap(last_tick: Instant, expected_interval: Duration) -> bool {
+    last_tick.elapsed() > expected_interval * 3
+}
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);

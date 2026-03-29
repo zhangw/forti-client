@@ -79,6 +79,27 @@ fn test_backoff_reset() {
     assert_eq!(backoff.current(), Duration::from_secs(1));
 }
 
+use std::time::Instant;
+
+#[test]
+fn test_no_gap_detected_for_normal_interval() {
+    let last = Instant::now() - Duration::from_secs(10);
+    assert!(!forti_client::reconnect::detect_sleep_gap(last, Duration::from_secs(10)));
+}
+
+#[test]
+fn test_gap_detected_for_long_pause() {
+    let last = Instant::now() - Duration::from_secs(45);
+    assert!(forti_client::reconnect::detect_sleep_gap(last, Duration::from_secs(10)));
+}
+
+#[test]
+fn test_no_gap_for_moderate_delay() {
+    // 20s elapsed with 10s interval — 2x is not enough to trigger (threshold is 3x)
+    let last = Instant::now() - Duration::from_secs(20);
+    assert!(!forti_client::reconnect::detect_sleep_gap(last, Duration::from_secs(10)));
+}
+
 use forti_client::reconnect::ConnectionState;
 
 #[test]
