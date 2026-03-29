@@ -166,33 +166,6 @@ pub async fn event_loop(
     }
 }
 
-/// Legacy entry point — runs setup, event loop, and cleanup.
-/// Kept for backward compatibility during transition; will be removed
-/// once ReconnectController is wired in.
-pub async fn run(
-    mut tunnel: TlsTunnel,
-    mut lcp: LcpState,
-    config: &TunnelConfig,
-) -> Result<()> {
-    let (tun_dev, iface_name) = setup_tun(config)?;
-
-    info!("Press Ctrl+C to disconnect.");
-
-    let reason = event_loop(&mut tunnel, &mut lcp, &tun_dev).await;
-
-    // Cleanup
-    cleanup_tun(config, &iface_name);
-    let _ = send_ppp(&mut tunnel, PppProtocol::Lcp, lcp.build_terminate_request()).await;
-    info!("VPN disconnected.");
-
-    match reason {
-        DisconnectReason::UserQuit | DisconnectReason::ServerTerminated => Ok(()),
-        DisconnectReason::DeadPeer => Err(FortiError::TunnelError("dead peer detected".into())),
-        DisconnectReason::TunnelClosed => Err(FortiError::TunnelError("tunnel closed by peer".into())),
-        DisconnectReason::IoError(msg) => Err(FortiError::TunnelError(msg)),
-    }
-}
-
 async fn send_ppp(tunnel: &mut TlsTunnel, protocol: PppProtocol, data: Vec<u8>) -> Result<()> {
     let frame = PppFrame::new(protocol, data);
     tunnel.send_frame(frame.encode()).await

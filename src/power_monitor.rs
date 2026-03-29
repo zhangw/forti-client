@@ -16,6 +16,7 @@ pub struct PowerMonitor {
 }
 
 // IOKit FFI bindings (minimal subset for power management)
+#[allow(non_upper_case_globals, dead_code)]
 mod ffi {
     use std::os::raw::{c_int, c_uint, c_void};
 
@@ -90,11 +91,11 @@ extern "C" fn power_callback(
     match message_type {
         ffi::kIOMessageSystemWillSleep => {
             debug!("IOKit: WillSleep");
-            let _ = ctx.tx.blocking_send(PowerEvent::WillSleep);
-            // Must acknowledge sleep promptly
+            // Acknowledge sleep first to avoid delaying the system if channel is full
             unsafe {
                 ffi::IOAllowPowerChange(ctx.root_port, message_argument as isize);
             }
+            let _ = ctx.tx.blocking_send(PowerEvent::WillSleep);
         }
         ffi::kIOMessageCanSystemSleep => {
             // Allow system to sleep (don't veto)

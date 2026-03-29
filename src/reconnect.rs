@@ -48,6 +48,12 @@ pub struct Backoff {
     current: Duration,
 }
 
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Backoff {
     pub fn new() -> Self {
         Self { current: BACKOFF_INITIAL }
@@ -157,6 +163,9 @@ impl ReconnectController {
 
         loop {
             // Connect tunnel + PPP
+            // Known limitation: WillSleep events during connect_tunnel() are deferred
+            // until the next tokio::select! iteration. The system will still sleep after
+            // its 30s timeout, and the timing gap heuristic will catch it on wake.
             let connect_result = self.connect_tunnel().await;
             let (mut tunnel, mut lcp) = match connect_result {
                 Ok(pair) => {
