@@ -42,5 +42,8 @@ tun-rs = { version = "2", features = ["async"] }
 bytes = "1"
 rand = "0.8"
 
+# macOS network reachability (SCNetworkReachability)
+system-configuration = "0.6"
+
 [dev-dependencies]
 tokio-test = "0.4"
