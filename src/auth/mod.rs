@@ -425,29 +425,48 @@ fn extract_html_field(html: &str, field_name: &str) -> Option<String> {
 }
 
 /// Wait for the SAML IdP to redirect the browser to our local callback server.
-/// Extracts the `id` parameter from the request URL.
-/// Rejects malformed/invalid requests and continues listening until a valid
-/// callback is received or the attempt limit is exhausted.
+/// Enforces a 5-minute overall timeout for the entire callback phase.
 async fn wait_for_saml_callback(listener: tokio::net::TcpListener) -> Result<String> {
-    // Accept up to 5 connections, rejecting invalid ones
-    for attempt in 0..5 {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        wait_for_saml_callback_inner(listener),
+    ).await {
+        Ok(inner) => inner,
+        Err(_) => Err(FortiError::AuthFailed(
+            "SAML authentication timed out after 5 minutes. Please retry.".into()
+        )),
+    }
+}
+
+/// Inner accept loop: extracts the `id` parameter from the browser callback URL.
+/// Rejects malformed/invalid requests and continues listening until a valid
+/// callback is received. The outer 5-minute timeout controls the overall budget.
+async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Result<String> {
+    loop {
         let (mut stream, addr) = listener.accept().await
             .map_err(|e| FortiError::AuthFailed(format!("failed to accept SAML callback: {}", e)))?;
 
-        debug!("SAML callback connection from {} (attempt {})", addr, attempt + 1);
+        debug!("SAML callback connection from {}", addr);
 
-        // Read the HTTP request — handle errors defensively so a single
-        // bad connection doesn't abort the entire listener
+        // Read the HTTP request with a per-connection timeout to prevent slowloris DoS
         let mut buf = vec![0u8; 4096];
-        let n = match stream.read(&mut buf).await {
-            Ok(0) => {
+        let n = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read(&mut buf),
+        ).await {
+            Ok(Ok(n)) if n > 0 => n,
+            Ok(Ok(_)) => {
                 debug!("SAML callback: connection closed without data");
                 let _ = stream.shutdown().await;
                 continue;
             }
-            Ok(n) => n,
-            Err(e) => {
+            Ok(Err(e)) => {
                 debug!("SAML callback: read error: {}", e);
+                let _ = stream.shutdown().await;
+                continue;
+            }
+            Err(_) => {
+                debug!("SAML callback: read timeout, rejecting connection");
                 let _ = stream.shutdown().await;
                 continue;
             }
@@ -515,10 +534,6 @@ async fn wait_for_saml_callback(listener: tokio::net::TcpListener) -> Result<Str
             }
         }
     }
-
-    Err(FortiError::AuthFailed(
-        "SAML callback: too many invalid requests, giving up".into()
-    ))
 }
 
 /// Redact SVPNCOOKIE values from a Set-Cookie header string.
