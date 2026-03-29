@@ -143,7 +143,7 @@ Per the protocol doc (Section 4.5), re-fetching `/remote/fortisslvpn_xml` after 
 
 ### Module: `src/network_monitor.rs`
 
-A dedicated `std::thread` runs a `CFRunLoop` with an `SCNetworkReachability` callback targeting the VPN server address. Events are sent via `tokio::sync::mpsc` channel.
+A dedicated `std::thread` runs a `CFRunLoop` with an `SCNetworkReachability` callback targeting the VPN server hostname (using `SCNetworkReachability::from_host()`, which supports DNS names directly). Events are sent via `tokio::sync::mpsc` channel.
 
 ```rust
 enum NetworkEvent {
@@ -156,7 +156,7 @@ enum NetworkEvent {
 
 - **During `Connected`:** `Unreachable` is logged but no action — LCP keepalive handles actual disconnect detection
 - **During `Reconnecting` with backoff:** `Reachable` **cancels the backoff timer** and triggers immediate reconnect. This is the key win — instead of waiting up to 60s, reconnect starts the instant WiFi is back.
-- **`Unreachable` during `Reconnecting`:** Reset backoff to initial (no point hammering a dead network)
+- **`Unreachable` during `Reconnecting`:** Keep current backoff (no point reconnecting faster when network is down)
 
 ### Why Not Primary Disconnect Trigger
 
@@ -194,23 +194,28 @@ enum PowerEvent {
 
 ### Sleep Sequence
 
-1. `WillSleep` received → send LCP Terminate-Request (graceful close)
-2. Close TLS connection (don't wait for response — system is sleeping)
-3. Acknowledge sleep to IOKit (`IOAllowPowerChange`) — must call or system hangs for 30s
-4. TUN device + routes + DNS stay in place
-5. Controller enters `WaitingForNetwork` state
+1. IOKit callback acknowledges sleep immediately (`IOAllowPowerChange`) and sends `WillSleep` to channel
+2. Event loop exits (dead peer, tunnel close, or timing gap — sleep disrupts the connection)
+3. Controller checks `power_rx` for `WillSleep` after event loop returns
+4. If sleep detected: send LCP Terminate-Request, close TLS connection
+5. TUN device + routes + DNS stay in place
+6. Controller enters `WaitingForNetwork` state
+
+**Note:** Power events are checked *after* the event loop returns, not concurrently via `tokio::select!`. This avoids borrow conflicts between the event loop (which borrows tunnel/lcp) and the sleep handler (which needs to close them). Stale power events are drained before each event loop iteration.
 
 ### Wake Sequence
 
-1. `HasPoweredOn` received → controller enters `WaitingForNetwork` state
-2. **Do NOT attempt reconnect yet** — WiFi hasn't reassociated
-3. Wait for `NetworkEvent::Reachable` from the network monitor (Layer 2)
-4. Once reachable → attempt reconnect with cookie reuse (fast path)
+1. `HasPoweredOn` received → logged, but don't reconnect yet (WiFi not ready)
+2. Wait for `NetworkEvent::Reachable` from the network monitor (Layer 2)
+3. Once reachable → attempt reconnect with cookie reuse (fast path)
+4. If server assigns different IP → TUN device recreated with new IP
 5. If cookie expired (30-second `tun-user-ses-timeout` likely exceeded during sleep) → automatic SAML re-auth
 
 ### Timing Gap Heuristic (Safety Net)
 
-In the event loop keepalive tick: if `Instant::now() - last_tick_time > 30s`, the system likely slept without IOKit notification reaching us. Treat as implicit wake → enter `Reconnecting` state. Five lines of code, zero dependencies, catches edge cases.
+In the event loop keepalive tick: if elapsed time since last tick exceeds 3x the keepalive interval (i.e., > 30s with a 10s interval), the system likely slept. This triggers a `DeadPeer` return which enters the reconnect flow. Five lines of code, zero dependencies, catches edge cases where IOKit notifications are missed.
+
+**Note:** `std::time::Instant` on macOS pauses during sleep, so the timing gap heuristic only detects sleep if the connection actually breaks. If the TLS connection survives a brief sleep, no reconnect is needed and the heuristic correctly does not fire.
 
 ### IOKit FFI Scope (~80 lines unsafe)
 
@@ -250,27 +255,24 @@ All wrapped in a safe `PowerMonitor` struct: `fn new() -> Result<(PowerMonitor, 
                     ┌──────▼──────┐
               ┌─────│  Connected  │◄──────────────────┐
               │     └──────┬──────┘                    │
-              │            │ error / WillSleep         │ success
-              │     ┌──────▼──────┐                    │
-              │     │Disconnecting│ (close TLS,        │
-              │     │             │  send LCP Term)    │
-              │     └──────┬──────┘                    │
+              │            │ event_loop exits           │ success
+              │            │ (error / sleep / peer)     │
               │            │                           │
-              │     ┌──────▼──────────┐                │
-              │     │WaitingForNetwork│ (sleep/wake    │
-              │     │ (optional)      │  path only)    │
-              │     └──────┬──────────┘                │
-              │            │ NetworkEvent::Reachable    │
-              │     ┌──────▼──────┐                    │
-              │     │ Reconnecting │──── success ──────┘
-              │     │              │
-              │     └──────┬──────┘
+              │      WillSleep?──yes──┐                │
+              │            │          │                │
+              │            │   ┌──────▼──────────┐     │
+              │            │   │WaitingForNetwork│     │
+              │            │   └──────┬──────────┘     │
+              │            │          │ Reachable      │
+              │     ┌──────▼──────────▼──┐             │
+              │     │   Reconnecting     │── success ──┘
+              │     └──────┬─────────────┘
               │            │ cookie rejected (HTTP 403)
               │     ┌──────▼──────────┐
-              │     │ReAuthenticating │ (SAML browser / creds)
+              │     │ReAuthenticating │ (SAML / creds)
               │     └──────┬──────────┘
-              │            │ new cookie
-              │            └───────► Reconnecting (retry with new cookie)
+              │            │ new cookie → retry
+              │            └───────► Reconnecting
               │
               │ Ctrl+C (from any state)
        ┌──────▼──────┐
@@ -280,31 +282,38 @@ All wrapped in a safe `PowerMonitor` struct: `fn new() -> Result<(PowerMonitor, 
             exit
 ```
 
-### Event Sources
+### Control Flow
 
-```rust
-tokio::select! {
-    // Only active during Connected state:
-    result = event_loop(...), if state == Connected => { ... }
+```
+loop {
+    drain stale power events
+    connect_tunnel() → TLS + PPP (returns IPCP IP)
+    if IP changed → recreate TUN device + routes
 
-    // Active in Reconnecting state:
-    _ = backoff_timer, if state == Reconnecting => { attempt_reconnect() }
+    event_loop() → runs until disconnect (returns DisconnectReason)
+    send LCP Terminate, drop tunnel
 
-    // Always active:
-    event = network_rx.recv() => { handle_network_event(event) }
-    event = power_rx.recv() => { handle_power_event(event) }
-    _ = tokio::signal::ctrl_c() => { state = Cleanup }
+    if WillSleep in power_rx:
+        enter WaitingForNetwork
+        wait for HasPoweredOn + Reachable (or Ctrl+C)
+        continue → reconnect
+
+    classify disconnect → RetryWithCookie or Exit
+    if Exit → break
+    wait_for_retry(backoff, network_rx) → sleep or immediate on Reachable
 }
+cleanup TUN/routes/DNS
 ```
 
 ### Key Invariants
 
-- TUN device, routes, DNS created once at startup, destroyed only at final cleanup (or IP change on re-auth)
+- TUN device, routes, DNS created once at startup, destroyed only at final cleanup (or IP change on reconnect)
 - Only one TLS tunnel exists at a time — old is dropped before new is created
 - Ctrl+C respected from any state, including mid-backoff and mid-re-auth
 - Backoff resets to 1s on any successful connection
 - `NetworkEvent::Reachable` cancels backoff and triggers immediate retry
 - `WaitingForNetwork` is only entered via sleep/wake path — network-drop reconnects go straight to `Reconnecting` with backoff
+- Power events are checked *after* event_loop returns (not concurrently) due to borrow constraints
 
 ### What Each Layer Adds
 
@@ -312,7 +321,7 @@ tokio::select! {
 |-------|-------------|-------------------|------------------------|
 | 1. Reconnect | Reconnecting, ReAuthenticating, Cleanup | backoff timer | Yes |
 | 2. Network | (modifies Reconnecting behavior) | `network_rx` | Requires Layer 1 |
-| 3. Sleep/wake | Disconnecting, WaitingForNetwork | `power_rx`, timing heuristic | Requires Layer 1 + 2 |
+| 3. Sleep/wake | WaitingForNetwork | `power_rx`, timing heuristic | Requires Layer 1 + 2 |
 
 ---
 
@@ -331,14 +340,14 @@ A key design choice: TUN device + routes + DNS persist across reconnects. This g
 ### Survival Conditions
 
 - Reconnect completes within TCP retransmit window (~15-120s depending on OS sysctls)
-- Same VPN IP assigned (guaranteed with same SVPNCOOKIE)
+- Same VPN IP assigned (likely with same SVPNCOOKIE, but server may assign different IP)
 - FortiGate doesn't NAT VPN traffic (common for SSL VPN — assigned IP is directly routable)
 
-### If IP Changes (Re-Auth Scenario)
+### If IP Changes (Any Reconnect)
 
-When SAML re-auth produces a new `TunnelConfig` with a different IP:
+The FortiGate may assign a different IP on any reconnect (not just re-auth). The IPCP-assigned IP is compared against the current TUN device IP after each `connect_tunnel()`. If different:
 - Remove old routes, remove old DNS config
-- Reconfigure TUN device with new IP
+- Destroy old TUN device, create new one with new IP
 - Install new routes and DNS
 - All existing TCP connections break (different source IP)
 
