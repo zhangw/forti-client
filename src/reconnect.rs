@@ -96,8 +96,8 @@ pub enum ConnectionState {
     Connecting,
     /// Tunnel is up and forwarding traffic.
     Connected,
-    /// Attempting to reconnect (with attempt counter for logging).
-    Reconnecting { attempt: u32 },
+    /// Attempting to reconnect.
+    Reconnecting,
     /// Cookie expired — running full re-authentication.
     ReAuthenticating,
     /// Waiting for network to return after sleep/wake (Layer 3).
@@ -263,30 +263,14 @@ impl ReconnectController {
                     self.state = ConnectionState::Cleanup;
                     break;
                 }
-                ReconnectAction::RetryWithCookie => {
+                ReconnectAction::RetryWithCookie | ReconnectAction::ReAuthenticate => {
                     let delay = self.backoff.current();
-                    self.state = ConnectionState::Reconnecting { attempt: 1 };
+                    self.state = ConnectionState::Reconnecting;
                     info!("Reconnecting in {:?}...", delay);
                     self.backoff.next();
 
                     if self.wait_for_retry(delay, &mut network_rx).await {
                         break;
-                    }
-                }
-                ReconnectAction::ReAuthenticate => {
-                    self.state = ConnectionState::ReAuthenticating;
-                    match self.re_authenticate().await {
-                        Ok(()) => {
-                            info!("Re-authentication successful");
-                        }
-                        Err(e) => {
-                            error!("Re-authentication failed: {}", e);
-                            let delay = self.backoff.current();
-                            self.backoff.next();
-                            if self.wait_for_retry(delay, &mut network_rx).await {
-                                break;
-                            }
-                        }
                     }
                 }
             }
@@ -337,10 +321,9 @@ impl ReconnectController {
 
         self.svpn_cookie = auth_result.svpn_cookie;
 
-        // If IP changed, log a warning
         if auth_result.tunnel_config.ip_address != self.tunnel_config.ip_address {
-            warn!(
-                "Server assigned new IP {} (was {}). TUN reconfiguration not yet implemented — routes may be stale.",
+            info!(
+                "Re-auth assigned new IP {} (was {}) — TUN will be recreated on next connect",
                 auth_result.tunnel_config.ip_address,
                 self.tunnel_config.ip_address,
             );
@@ -373,8 +356,8 @@ impl ReconnectController {
                         false
                     }
                     Some(NetworkEvent::Unreachable) => {
-                        info!("Network unreachable — resetting backoff");
-                        self.backoff.reset();
+                        debug!("Network unreachable during backoff — will retry when reachable");
+                        // Don't reset backoff — network is down, no point reconnecting faster
                         false
                     }
                     None => {

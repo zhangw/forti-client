@@ -113,7 +113,7 @@ fn test_state_transitions() {
     let states = vec![
         ConnectionState::Connecting,
         ConnectionState::Connected,
-        ConnectionState::Reconnecting { attempt: 1 },
+        ConnectionState::Reconnecting,
         ConnectionState::ReAuthenticating,
         ConnectionState::WaitingForNetwork,
         ConnectionState::Cleanup,
@@ -125,14 +125,4 @@ fn test_state_transitions() {
 fn test_waiting_for_network_state() {
     let state = ConnectionState::WaitingForNetwork;
     assert!(matches!(state, ConnectionState::WaitingForNetwork));
-}
-
-#[test]
-fn test_reconnecting_tracks_attempt_number() {
-    let state = ConnectionState::Reconnecting { attempt: 3 };
-    if let ConnectionState::Reconnecting { attempt } = state {
-        assert_eq!(attempt, 3);
-    } else {
-        panic!("expected Reconnecting");
-    }
 }
