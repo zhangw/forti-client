@@ -132,4 +132,4 @@ TLS (rustls) → Fortinet Wire Frame (0x5050 magic)
 
 ## License
 
-TBD
+Apache-2.0
