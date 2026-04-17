@@ -1,11 +1,8 @@
-use forti_client::ppp::lcp::{LcpPacket, LcpCode, LcpOption, LcpState};
+use forti_client::ppp::lcp::{LcpCode, LcpOption, LcpPacket, LcpState};
 
 #[test]
 fn test_encode_configure_request_mru_magic() {
-    let options = vec![
-        LcpOption::Mru(1500),
-        LcpOption::MagicNumber(0xDEADBEEF),
-    ];
+    let options = vec![LcpOption::Mru(1500), LcpOption::MagicNumber(0xDEADBEEF)];
     let pkt = LcpPacket::new(LcpCode::ConfigureRequest, 1, options);
     let encoded = pkt.encode();
 
@@ -21,9 +18,7 @@ fn test_encode_configure_request_mru_magic() {
 #[test]
 fn test_decode_configure_request() {
     let data = vec![
-        0x01, 0x42, 0x00, 0x0E,
-        0x01, 0x04, 0x05, 0xDC,
-        0x05, 0x06, 0x12, 0x34, 0x56, 0x78,
+        0x01, 0x42, 0x00, 0x0E, 0x01, 0x04, 0x05, 0xDC, 0x05, 0x06, 0x12, 0x34, 0x56, 0x78,
     ];
     let pkt = LcpPacket::decode(&data).unwrap();
     assert_eq!(pkt.code(), LcpCode::ConfigureRequest);
@@ -36,10 +31,7 @@ fn test_decode_configure_request() {
 #[test]
 fn test_decode_configure_request_with_pfcomp_accomp() {
     let data = vec![
-        0x01, 0x01, 0x00, 0x0C,
-        0x01, 0x04, 0x05, 0xDC,
-        0x07, 0x02,
-        0x08, 0x02,
+        0x01, 0x01, 0x00, 0x0C, 0x01, 0x04, 0x05, 0xDC, 0x07, 0x02, 0x08, 0x02,
     ];
     let pkt = LcpPacket::decode(&data).unwrap();
     assert_eq!(pkt.options().len(), 3);
@@ -51,10 +43,8 @@ fn test_decode_configure_request_with_pfcomp_accomp() {
 fn test_lcp_state_handle_server_config_request() {
     let mut state = LcpState::new(1500);
     let server_req = vec![
-        0x01, 0x01, 0x00, 0x10,
-        0x01, 0x04, 0x05, 0xDC,
-        0x05, 0x06, 0xAA, 0xBB, 0xCC, 0xDD,
-        0x07, 0x02,
+        0x01, 0x01, 0x00, 0x10, 0x01, 0x04, 0x05, 0xDC, 0x05, 0x06, 0xAA, 0xBB, 0xCC, 0xDD, 0x07,
+        0x02,
     ];
     let responses = state.handle_packet(&server_req);
     assert!(!responses.is_empty());
@@ -69,9 +59,7 @@ fn test_lcp_state_handle_server_config_request() {
 fn test_lcp_state_handle_server_config_request_all_acceptable() {
     let mut state = LcpState::new(1500);
     let server_req = vec![
-        0x01, 0x01, 0x00, 0x0E,
-        0x01, 0x04, 0x05, 0xDC,
-        0x05, 0x06, 0xAA, 0xBB, 0xCC, 0xDD,
+        0x01, 0x01, 0x00, 0x0E, 0x01, 0x04, 0x05, 0xDC, 0x05, 0x06, 0xAA, 0xBB, 0xCC, 0xDD,
     ];
     let responses = state.handle_packet(&server_req);
     assert_eq!(responses.len(), 1);
@@ -84,10 +72,7 @@ fn test_lcp_state_handle_server_config_request_all_acceptable() {
 fn test_lcp_echo_request_produces_reply() {
     let mut state = LcpState::new(1500);
     state.set_peer_magic(0x12345678);
-    let echo_req = vec![
-        0x09, 0x05, 0x00, 0x08,
-        0x12, 0x34, 0x56, 0x78,
-    ];
+    let echo_req = vec![0x09, 0x05, 0x00, 0x08, 0x12, 0x34, 0x56, 0x78];
     let responses = state.handle_packet(&echo_req);
     assert_eq!(responses.len(), 1);
     let reply = &responses[0];
@@ -101,11 +86,17 @@ fn test_lcp_build_initial_config_request() {
     let req = state.build_configure_request();
     let pkt = LcpPacket::decode(&req).unwrap();
     assert_eq!(pkt.code(), LcpCode::ConfigureRequest);
-    let mru = pkt.options().iter().find(|o| matches!(o, LcpOption::Mru(_)));
+    let mru = pkt
+        .options()
+        .iter()
+        .find(|o| matches!(o, LcpOption::Mru(_)));
     assert!(mru.is_some());
     if let Some(LcpOption::Mru(val)) = mru {
         assert_eq!(*val, 1400);
     }
-    let magic = pkt.options().iter().find(|o| matches!(o, LcpOption::MagicNumber(_)));
+    let magic = pkt
+        .options()
+        .iter()
+        .find(|o| matches!(o, LcpOption::MagicNumber(_)));
     assert!(magic.is_some());
 }

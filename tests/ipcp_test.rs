@@ -32,14 +32,8 @@ fn test_decode_configure_nak_with_assigned_addresses() {
     let opts = pkt.options();
     assert_eq!(opts[0], IpcpOption::IpAddress(Ipv4Addr::new(10, 0, 0, 5)));
     assert_eq!(opts[1], IpcpOption::PrimaryDns(Ipv4Addr::new(10, 0, 0, 1)));
-    assert_eq!(
-        opts[2],
-        IpcpOption::SecondaryDns(Ipv4Addr::new(8, 8, 8, 8))
-    );
-    assert_eq!(
-        opts[3],
-        IpcpOption::PrimaryNbns(Ipv4Addr::new(10, 0, 0, 2))
-    );
+    assert_eq!(opts[2], IpcpOption::SecondaryDns(Ipv4Addr::new(8, 8, 8, 8)));
+    assert_eq!(opts[3], IpcpOption::PrimaryNbns(Ipv4Addr::new(10, 0, 0, 2)));
     assert_eq!(
         opts[4],
         IpcpOption::SecondaryNbns(Ipv4Addr::new(10, 0, 0, 3))

@@ -95,8 +95,7 @@ impl NetworkMonitor {
 
         // SAFETY: kCFRunLoopCommonModes is a valid Apple-provided run loop mode
         if unsafe {
-            reachability
-                .schedule_with_runloop(&CFRunLoop::get_current(), kCFRunLoopCommonModes)
+            reachability.schedule_with_runloop(&CFRunLoop::get_current(), kCFRunLoopCommonModes)
         }
         .is_err()
         {

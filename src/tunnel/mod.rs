@@ -49,7 +49,8 @@ impl TlsTunnel {
         );
 
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let redacted_req = http_req.lines()
+            let redacted_req = http_req
+                .lines()
                 .map(|line| {
                     if line.trim_start().starts_with("Cookie: SVPNCOOKIE=") {
                         "Cookie: SVPNCOOKIE=<redacted>"
@@ -74,9 +75,13 @@ impl TlsTunnel {
         let n = match tokio::time::timeout(
             std::time::Duration::from_secs(2),
             tls.read(&mut response_buf),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(0)) => {
-                return Err(FortiError::TunnelError("connection closed after tunnel request".into()));
+                return Err(FortiError::TunnelError(
+                    "connection closed after tunnel request".into(),
+                ));
             }
             Ok(Ok(n)) => {
                 // Got immediate data — check if it's an HTTP error

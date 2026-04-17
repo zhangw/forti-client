@@ -45,14 +45,9 @@ mod ffi {
 
         pub fn IODeregisterForSystemPower(notifier: *mut IOObject) -> IOReturn;
 
-        pub fn IOAllowPowerChange(
-            kernel_port: IOObject,
-            notification_id: isize,
-        ) -> IOReturn;
+        pub fn IOAllowPowerChange(kernel_port: IOObject, notification_id: isize) -> IOReturn;
 
-        pub fn IONotificationPortGetRunLoopSource(
-            notify: IONotificationPortRef,
-        ) -> *const c_void; // CFRunLoopSourceRef
+        pub fn IONotificationPortGetRunLoopSource(notify: IONotificationPortRef) -> *const c_void; // CFRunLoopSourceRef
 
         pub fn IONotificationPortDestroy(notify: IONotificationPortRef);
     }
@@ -60,11 +55,7 @@ mod ffi {
     // CoreFoundation run loop bindings
     extern "C" {
         pub fn CFRunLoopGetCurrent() -> *const c_void;
-        pub fn CFRunLoopAddSource(
-            rl: *const c_void,
-            source: *const c_void,
-            mode: *const c_void,
-        );
+        pub fn CFRunLoopAddSource(rl: *const c_void, source: *const c_void, mode: *const c_void);
         pub fn CFRunLoopRun();
         pub fn CFRunLoopStop(rl: *const c_void);
     }

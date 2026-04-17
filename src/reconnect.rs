@@ -56,7 +56,9 @@ impl Default for Backoff {
 
 impl Backoff {
     pub fn new() -> Self {
-        Self { current: BACKOFF_INITIAL }
+        Self {
+            current: BACKOFF_INITIAL,
+        }
     }
 
     /// Return the current backoff duration.
@@ -75,13 +77,13 @@ impl Backoff {
     }
 }
 
-use secrecy::{SecretString, ExposeSecret};
+use secrecy::{ExposeSecret, SecretString};
 
-use crate::auth::AuthClient;
 use crate::auth::xml::TunnelConfig;
+use crate::auth::AuthClient;
 use crate::error::{FortiError, Result};
 use crate::network_monitor::{NetworkEvent, NetworkMonitor};
-use crate::power_monitor::{PowerMonitor, PowerEvent};
+use crate::power_monitor::{PowerEvent, PowerMonitor};
 use crate::ppp::codec::{PppFrame, PppProtocol};
 use crate::ppp::PppEngine;
 use crate::tunnel::TlsTunnel;
@@ -89,7 +91,7 @@ use crate::vpn;
 
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
 /// Current state of the reconnect controller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,11 +132,7 @@ pub struct ReconnectController {
 }
 
 impl ReconnectController {
-    pub fn new(
-        auth_params: AuthParams,
-        svpn_cookie: String,
-        tunnel_config: TunnelConfig,
-    ) -> Self {
+    pub fn new(auth_params: AuthParams, svpn_cookie: String, tunnel_config: TunnelConfig) -> Self {
         Self {
             auth_params,
             svpn_cookie,
@@ -172,7 +170,10 @@ impl ReconnectController {
                     self.backoff.reset();
                     // If server assigned a different IP, recreate TUN device + routes
                     if new_ip != current_ip {
-                        warn!("IP changed: {} → {} — recreating TUN device", current_ip, new_ip);
+                        warn!(
+                            "IP changed: {} → {} — recreating TUN device",
+                            current_ip, new_ip
+                        );
                         vpn::cleanup_tun(&self.tunnel_config, &iface_name);
                         self.tunnel_config.ip_address = new_ip;
                         let (new_tun, new_iface) = vpn::setup_tun(&self.tunnel_config)?;
@@ -237,15 +238,12 @@ impl ReconnectController {
                 self.state = ConnectionState::WaitingForNetwork;
                 loop {
                     tokio::select! {
-                        Some(power_event) = power_rx.recv() => {
-                            if matches!(power_event, PowerEvent::HasPoweredOn) {
-                                info!("System woke up — waiting for network");
+                        event = power_rx.recv() => {
+                            if matches!(event, Some(PowerEvent::HasPoweredOn)) {
+                                info!("System woke up — reconnecting");
+                                self.backoff.reset();
+                                break;
                             }
-                        }
-                        Some(NetworkEvent::Reachable) = network_rx.recv() => {
-                            info!("Network reachable after wake — reconnecting");
-                            self.backoff.reset();
-                            break;
                         }
                         _ = tokio::signal::ctrl_c() => {
                             info!("Ctrl+C during wake");
@@ -255,6 +253,11 @@ impl ReconnectController {
                             return Ok(());
                         }
                     }
+                }
+                // Drain any stale network events queued during sleep so wait_for_retry
+                // doesn't act on stale state on its first iteration.
+                while let Ok(event) = network_rx.try_recv() {
+                    debug!("Draining stale network event after wake: {:?}", event);
                 }
                 continue; // Go back to top of loop to reconnect
             }
@@ -288,13 +291,16 @@ impl ReconnectController {
     /// Connect the TLS tunnel and run PPP negotiation.
     /// Uses the cookie fast path: skip resource reservation and XML fetch.
     /// Returns the tunnel, LCP state, and the IPCP-assigned IP address.
-    async fn connect_tunnel(&self) -> Result<(TlsTunnel, crate::ppp::lcp::LcpState, std::net::Ipv4Addr)> {
+    async fn connect_tunnel(
+        &self,
+    ) -> Result<(TlsTunnel, crate::ppp::lcp::LcpState, std::net::Ipv4Addr)> {
         let mut tunnel = TlsTunnel::connect(
             &self.auth_params.server,
             self.auth_params.port,
             &self.svpn_cookie,
             self.auth_params.tls_config.clone(),
-        ).await?;
+        )
+        .await?;
 
         let mut ppp = PppEngine::new(1500);
         let ipcp_config = ppp.negotiate(&mut tunnel).await?;
@@ -315,12 +321,24 @@ impl ReconnectController {
             info!("Re-authenticating via SAML...");
             auth_client.login_saml().await?
         } else {
-            let username = self.auth_params.username.as_deref()
+            let username = self
+                .auth_params
+                .username
+                .as_deref()
                 .ok_or_else(|| FortiError::AuthFailed("no username for re-auth".into()))?;
-            let password = self.auth_params.password.as_ref()
+            let password = self
+                .auth_params
+                .password
+                .as_ref()
                 .ok_or_else(|| FortiError::AuthFailed("no password for re-auth".into()))?;
             info!("Re-authenticating with credentials...");
-            auth_client.login(username, password.expose_secret(), self.auth_params.realm.as_deref()).await?
+            auth_client
+                .login(
+                    username,
+                    password.expose_secret(),
+                    self.auth_params.realm.as_deref(),
+                )
+                .await?
         };
 
         self.svpn_cookie = auth_result.svpn_cookie;
@@ -328,8 +346,7 @@ impl ReconnectController {
         if auth_result.tunnel_config.ip_address != self.tunnel_config.ip_address {
             info!(
                 "Re-auth assigned new IP {} (was {}) — TUN will be recreated on next connect",
-                auth_result.tunnel_config.ip_address,
-                self.tunnel_config.ip_address,
+                auth_result.tunnel_config.ip_address, self.tunnel_config.ip_address,
             );
         }
         self.tunnel_config = auth_result.tunnel_config;
@@ -338,7 +355,10 @@ impl ReconnectController {
     }
 
     /// Try to send LCP Terminate-Request before closing tunnel.
-    async fn send_terminate(tunnel: &mut TlsTunnel, lcp: &mut crate::ppp::lcp::LcpState) -> Result<()> {
+    async fn send_terminate(
+        tunnel: &mut TlsTunnel,
+        lcp: &mut crate::ppp::lcp::LcpState,
+    ) -> Result<()> {
         let frame = PppFrame::new(PppProtocol::Lcp, lcp.build_terminate_request());
         tunnel.send_frame(frame.encode()).await
     }

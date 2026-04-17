@@ -1,13 +1,13 @@
 pub mod codec;
-pub mod lcp;
 pub mod ipcp;
+pub mod lcp;
 
 use crate::error::{FortiError, Result};
 use crate::tunnel::TlsTunnel;
 use codec::{PppFrame, PppProtocol};
 use ipcp::IpcpConfig;
-use tracing::{debug, info};
 use std::time::Duration;
+use tracing::{debug, info};
 
 /// PPP engine that drives LCP and IPCP negotiation over a TLS tunnel.
 pub struct PppEngine {
@@ -44,8 +44,7 @@ impl PppEngine {
 
             let frame = tokio::time::timeout(Duration::from_secs(10), tunnel.recv_frame())
                 .await
-                .map_err(|_| FortiError::PppError("timeout waiting for LCP response".into()))?
-                ?;
+                .map_err(|_| FortiError::PppError("timeout waiting for LCP response".into()))??;
 
             let ppp = PppFrame::decode(frame.payload())?;
 
@@ -53,16 +52,19 @@ impl PppEngine {
                 PppProtocol::Lcp => {
                     let responses = self.lcp.handle_packet(ppp.data());
                     for resp in &responses {
-                        self.send_ppp(tunnel, PppProtocol::Lcp, resp.clone()).await?;
+                        self.send_ppp(tunnel, PppProtocol::Lcp, resp.clone())
+                            .await?;
                     }
 
                     let code = ppp.data().first().copied().unwrap_or(0);
                     match code {
-                        2 => { // Configure-Ack for our request
+                        2 => {
+                            // Configure-Ack for our request
                             debug!("LCP: our Configure-Request accepted");
                             our_lcp_acked = true;
                         }
-                        1 => { // Configure-Request from peer (we sent Ack or Reject)
+                        1 => {
+                            // Configure-Request from peer (we sent Ack or Reject)
                             if responses.iter().any(|r| r.first() == Some(&2)) {
                                 debug!("LCP: peer Configure-Request accepted");
                                 peer_lcp_acked = true;
@@ -74,10 +76,7 @@ impl PppEngine {
                 PppProtocol::Ccp => {
                     // Reject CCP (compression) — send Protocol-Reject via LCP
                     debug!("Rejecting CCP Configure-Request");
-                    let ccp_reject = build_protocol_reject(
-                        PppProtocol::Ccp.to_u16(),
-                        ppp.data(),
-                    );
+                    let ccp_reject = build_protocol_reject(PppProtocol::Ccp.to_u16(), ppp.data());
                     self.send_ppp(tunnel, PppProtocol::Lcp, ccp_reject).await?;
                 }
                 other => {
@@ -104,8 +103,7 @@ impl PppEngine {
 
             let frame = tokio::time::timeout(Duration::from_secs(10), tunnel.recv_frame())
                 .await
-                .map_err(|_| FortiError::PppError("timeout waiting for IPCP response".into()))?
-                ?;
+                .map_err(|_| FortiError::PppError("timeout waiting for IPCP response".into()))??;
 
             let ppp = PppFrame::decode(frame.payload())?;
 
@@ -113,7 +111,8 @@ impl PppEngine {
                 PppProtocol::Ipcp => {
                     let responses = self.ipcp.handle_packet(ppp.data());
                     for resp in &responses {
-                        self.send_ppp(tunnel, PppProtocol::Ipcp, resp.clone()).await?;
+                        self.send_ppp(tunnel, PppProtocol::Ipcp, resp.clone())
+                            .await?;
                     }
 
                     if let Some(config) = self.ipcp.config() {
@@ -125,7 +124,8 @@ impl PppEngine {
                     // Handle LCP packets during IPCP phase (keepalive, etc.)
                     let responses = self.lcp.handle_packet(ppp.data());
                     for resp in &responses {
-                        self.send_ppp(tunnel, PppProtocol::Lcp, resp.clone()).await?;
+                        self.send_ppp(tunnel, PppProtocol::Lcp, resp.clone())
+                            .await?;
                     }
                 }
                 other => {

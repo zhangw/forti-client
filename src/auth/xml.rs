@@ -30,16 +30,22 @@ impl TunnelConfig {
         // Collect all <dns ip="..."/> entries
         for attrs in find_all_tag_attrs(xml, "dns") {
             if let Some(ip_str) = attrs.get("ip") {
-                if let Ok(addr) = ip_str.parse() { dns_servers.push(addr); }
+                if let Ok(addr) = ip_str.parse() {
+                    dns_servers.push(addr);
+                }
             }
         }
         // Fallback: text format <dns>x.x.x.x</dns>
         if dns_servers.is_empty() {
             if let Some(dns1) = extract_text(xml, "dns") {
-                if let Ok(addr) = dns1.parse() { dns_servers.push(addr); }
+                if let Ok(addr) = dns1.parse() {
+                    dns_servers.push(addr);
+                }
             }
             if let Some(dns2) = extract_text(xml, "dns2") {
-                if let Ok(addr) = dns2.parse() { dns_servers.push(addr); }
+                if let Ok(addr) = dns2.parse() {
+                    dns_servers.push(addr);
+                }
             }
         }
 
@@ -62,10 +68,19 @@ impl TunnelConfig {
             .and_then(|s| extract_text(&s, "port"))
             .and_then(|s| s.parse().ok());
         let fos_version = extract_text(xml, "fos");
-        let tunnel_method = extract_tag_attr(xml, "tunnel-method", "value")
-            .unwrap_or_else(|| "ppp".to_string());
+        let tunnel_method =
+            extract_tag_attr(xml, "tunnel-method", "value").unwrap_or_else(|| "ppp".to_string());
 
-        Ok(Self { ip_address, dns_servers, routes, idle_timeout, auth_timeout, dtls_port, fos_version, tunnel_method })
+        Ok(Self {
+            ip_address,
+            dns_servers,
+            routes,
+            idle_timeout,
+            auth_timeout,
+            dtls_port,
+            fos_version,
+            tunnel_method,
+        })
     }
 }
 
@@ -134,9 +149,13 @@ fn find_all_tag_attrs(xml: &str, tag: &str) -> Vec<std::collections::HashMap<Str
         if let Some(tag_end) = after_open.find('>') {
             let tag_content = &after_open[..tag_end];
             let attrs = parse_all_attrs(tag_content);
-            if !attrs.is_empty() { results.push(attrs); }
+            if !attrs.is_empty() {
+                results.push(attrs);
+            }
             search_from = abs_pos + open.len() + tag_end;
-        } else { break; }
+        } else {
+            break;
+        }
     }
     results
 }
@@ -176,7 +195,8 @@ fn parse_all_attrs(tag_content: &str) -> std::collections::HashMap<String, Strin
 
         // Extract attribute name (word before =)
         let before_eq = &remaining[..eq_pos];
-        let attr_name = before_eq.rsplit_once(char::is_whitespace)
+        let attr_name = before_eq
+            .rsplit_once(char::is_whitespace)
             .map(|(_, name)| name)
             .unwrap_or(before_eq)
             .trim();
@@ -185,7 +205,10 @@ fn parse_all_attrs(tag_content: &str) -> std::collections::HashMap<String, Strin
         let after_eq = &remaining[eq_pos + 1..];
         let quote_char = match after_eq.chars().next() {
             Some(c @ '"') | Some(c @ '\'') => c,
-            _ => { remaining = &remaining[eq_pos + 1..]; continue; }
+            _ => {
+                remaining = &remaining[eq_pos + 1..];
+                continue;
+            }
         };
 
         let value_start = 1; // skip the opening quote

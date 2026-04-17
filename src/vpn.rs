@@ -3,8 +3,8 @@ use crate::error::{FortiError, Result};
 use crate::ppp::codec::{PppFrame, PppProtocol};
 use crate::ppp::lcp::{LcpCode, LcpState};
 use crate::reconnect::DisconnectReason;
-use crate::tunnel::TlsTunnel;
 use crate::tun;
+use crate::tunnel::TlsTunnel;
 
 use std::time::Duration;
 use tracing::{debug, error, info};

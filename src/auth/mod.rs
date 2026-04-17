@@ -3,7 +3,7 @@ pub mod xml;
 use crate::error::{FortiError, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug)]
 pub struct AuthResult {
@@ -38,7 +38,9 @@ impl AuthClient {
     }
 
     /// Create a new TLS+HTTP connection to the server.
-    async fn new_http_connection(&self) -> Result<(
+    async fn new_http_connection(
+        &self,
+    ) -> Result<(
         hyper::client::conn::http1::SendRequest<http_body_util::Full<bytes::Bytes>>,
         tokio_rustls::TlsConnector,
         rustls::pki_types::ServerName<'static>,
@@ -48,30 +50,41 @@ impl AuthClient {
             .map_err(|e| FortiError::TunnelError(format!("invalid server name: {}", e)))?;
 
         let tcp = tokio::net::TcpStream::connect(format!("{}:{}", self.server, self.port)).await?;
-        let tls = connector.connect(server_name.clone(), tcp).await
+        let tls = connector
+            .connect(server_name.clone(), tcp)
+            .await
             .map_err(|e| FortiError::TunnelError(format!("TLS connect failed: {}", e)))?;
 
         let io = hyper_util::rt::TokioIo::new(tls);
-        let (sender, conn) = hyper::client::conn::http1::handshake(io).await
+        let (sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
             .map_err(|e| FortiError::TunnelError(format!("HTTP handshake failed: {}", e)))?;
 
         tokio::spawn(conn);
         Ok((sender, connector, server_name))
     }
 
-    pub async fn login(&self, username: &str, password: &str, realm: Option<&str>) -> Result<AuthResult> {
+    pub async fn login(
+        &self,
+        username: &str,
+        password: &str,
+        realm: Option<&str>,
+    ) -> Result<AuthResult> {
         // Step 1: POST /remote/logincheck
         let (mut sender, _connector, _server_name) = self.new_http_connection().await?;
 
         let body = if let Some(realm) = realm {
             format!(
                 "ajax=1&username={}&credential={}&realm={}&just_logged_in=1",
-                urlencoded(username), urlencoded(password), urlencoded(realm),
+                urlencoded(username),
+                urlencoded(password),
+                urlencoded(realm),
             )
         } else {
             format!(
                 "ajax=1&username={}&credential={}&just_logged_in=1",
-                urlencoded(username), urlencoded(password),
+                urlencoded(username),
+                urlencoded(password),
             )
         };
 
@@ -86,7 +99,9 @@ impl AuthClient {
             .map_err(FortiError::Http)?;
 
         info!("Sending login request");
-        let resp = sender.send_request(req).await
+        let resp = sender
+            .send_request(req)
+            .await
             .map_err(|e| FortiError::TunnelError(format!("login request failed: {}", e)))?;
 
         let status = resp.status();
@@ -96,7 +111,8 @@ impl AuthClient {
         let svpn_cookie = extract_svpncookie(&resp);
 
         // Read the response body for 2FA detection
-        let resp_body = http_body_util::BodyExt::collect(resp.into_body()).await
+        let resp_body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
             .map_err(|e| FortiError::TunnelError(format!("failed to read login body: {}", e)))?;
         let resp_text = String::from_utf8_lossy(&resp_body.to_bytes()).to_string();
 
@@ -106,7 +122,8 @@ impl AuthClient {
             // Some FortiGates return a partial cookie that requires 2FA completion
             if resp_text.contains("tokeninfo=") || resp_text.contains("2fa") {
                 debug!("Got SVPNCOOKIE but 2FA appears required, proceeding with 2FA");
-                self.handle_2fa_tokeninfo(username, &resp_text, Some(&cookie)).await?
+                self.handle_2fa_tokeninfo(username, &resp_text, Some(&cookie))
+                    .await?
             } else {
                 info!("Authentication successful, got SVPNCOOKIE");
                 cookie
@@ -118,28 +135,44 @@ impl AuthClient {
         } else if resp_text.contains("ret=") && resp_text.contains("tokeninfo=") {
             // Tokeninfo-based 2FA (200 OK, no cookie)
             debug!("Tokeninfo 2FA challenge detected");
-            self.handle_2fa_tokeninfo(username, &resp_text, None).await?
+            self.handle_2fa_tokeninfo(username, &resp_text, None)
+                .await?
         } else if status.as_u16() == 405 {
             return Err(FortiError::AuthFailed("invalid credentials (405)".into()));
         } else {
             return Err(FortiError::AuthFailed(format!(
-                "login failed: status={}", status
+                "login failed: status={}",
+                status
             )));
         };
 
         // Fetch tunnel config
         let tunnel_config = self.fetch_tunnel_config(&svpn_cookie).await?;
 
-        Ok(AuthResult { svpn_cookie, tunnel_config })
+        Ok(AuthResult {
+            svpn_cookie,
+            tunnel_config,
+        })
     }
 
     /// Handle tokeninfo-based 2FA (most common).
     /// Response body format: ret=<status>,tokeninfo=<type>,chal_msg=<prompt>,reqid=<id>,polid=<id>,grp=<group>,portal=<portal>,peer=<peer>,magic=<value>
-    async fn handle_2fa_tokeninfo(&self, username: &str, resp_text: &str, _existing_cookie: Option<&str>) -> Result<String> {
+    async fn handle_2fa_tokeninfo(
+        &self,
+        username: &str,
+        resp_text: &str,
+        _existing_cookie: Option<&str>,
+    ) -> Result<String> {
         // Parse the tokeninfo fields
         let fields = parse_tokeninfo_fields(resp_text);
-        let tokeninfo = fields.get("tokeninfo").map(|s| s.as_str()).unwrap_or("unknown");
-        let chal_msg = fields.get("chal_msg").map(|s| s.as_str()).unwrap_or("Enter verification code");
+        let tokeninfo = fields
+            .get("tokeninfo")
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+        let chal_msg = fields
+            .get("chal_msg")
+            .map(|s| s.as_str())
+            .unwrap_or("Enter verification code");
         let reqid = fields.get("reqid").map(|s| s.as_str()).unwrap_or("");
         let polid = fields.get("polid").map(|s| s.as_str()).unwrap_or("");
         let grp = fields.get("grp").map(|s| s.as_str()).unwrap_or("");
@@ -155,8 +188,12 @@ impl AuthClient {
             // For push, send with empty code and ftmpush=1
             let body = format!(
                 "username={}&code=&reqid={}&polid={}&grp={}&portal={}&peer={}&ftmpush=1",
-                urlencoded(username), urlencoded(reqid), urlencoded(polid),
-                urlencoded(grp), urlencoded(portal), urlencoded(peer),
+                urlencoded(username),
+                urlencoded(reqid),
+                urlencoded(polid),
+                urlencoded(grp),
+                urlencoded(portal),
+                urlencoded(peer),
             );
             return self.send_2fa_code(&body).await;
         }
@@ -170,9 +207,14 @@ impl AuthClient {
 
         let body = format!(
             "username={}&code={}&reqid={}&polid={}&grp={}&portal={}&peer={}&magic={}",
-            urlencoded(username), urlencoded(code), urlencoded(reqid),
-            urlencoded(polid), urlencoded(grp), urlencoded(portal),
-            urlencoded(peer), urlencoded(magic),
+            urlencoded(username),
+            urlencoded(code),
+            urlencoded(reqid),
+            urlencoded(polid),
+            urlencoded(grp),
+            urlencoded(portal),
+            urlencoded(peer),
+            urlencoded(magic),
         );
 
         self.send_2fa_code(&body).await
@@ -194,8 +236,11 @@ impl AuthClient {
 
         let body = format!(
             "username={}&code={}&reqid={}&grpid={}&magic={}",
-            urlencoded(username), urlencoded(code),
-            urlencoded(&reqid), urlencoded(&grpid), urlencoded(&magic),
+            urlencoded(username),
+            urlencoded(code),
+            urlencoded(&reqid),
+            urlencoded(&grpid),
+            urlencoded(&magic),
         );
 
         self.send_2fa_code(&body).await
@@ -212,17 +257,22 @@ impl AuthClient {
             .header("User-Agent", "Mozilla/5.0 SV1")
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Content-Length", body.len())
-            .body(http_body_util::Full::new(bytes::Bytes::from(body.to_string())))
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
             .map_err(FortiError::Http)?;
 
         debug!("Sending 2FA verification");
-        let resp = sender.send_request(req).await
+        let resp = sender
+            .send_request(req)
+            .await
             .map_err(|e| FortiError::TunnelError(format!("2FA request failed: {}", e)))?;
 
         debug!("2FA response status: {}", resp.status());
 
-        let cookie = extract_svpncookie(&resp)
-            .ok_or_else(|| FortiError::AuthFailed("2FA verification failed — no SVPNCOOKIE in response".into()))?;
+        let cookie = extract_svpncookie(&resp).ok_or_else(|| {
+            FortiError::AuthFailed("2FA verification failed — no SVPNCOOKIE in response".into())
+        })?;
 
         info!("2FA verification successful");
         Ok(cookie)
@@ -233,11 +283,14 @@ impl AuthClient {
         let saml_port: u16 = 8020;
 
         // Step 1: Start local HTTP server to receive the SAML callback
-        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", saml_port)).await
-            .map_err(|e| FortiError::AuthFailed(format!(
-                "failed to bind SAML callback on port {}: {} (is another VPN client running?)",
-                saml_port, e
-            )))?;
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", saml_port))
+            .await
+            .map_err(|e| {
+                FortiError::AuthFailed(format!(
+                    "failed to bind SAML callback on port {}: {} (is another VPN client running?)",
+                    saml_port, e
+                ))
+            })?;
 
         info!("SAML callback server listening on 127.0.0.1:{}", saml_port);
 
@@ -273,28 +326,37 @@ impl AuthClient {
 
         let req = hyper::Request::builder()
             .method("GET")
-            .uri(format!("/remote/saml/auth_id?id={}", urlencoded(&session_id)))
+            .uri(format!(
+                "/remote/saml/auth_id?id={}",
+                urlencoded(&session_id)
+            ))
             .header("Host", &self.server)
             .header("User-Agent", "Mozilla/5.0 SV1")
             .body(http_body_util::Full::new(bytes::Bytes::new()))
             .map_err(FortiError::Http)?;
 
         debug!("Exchanging SAML session ID for SVPNCOOKIE");
-        let resp = sender.send_request(req).await
+        let resp = sender
+            .send_request(req)
+            .await
             .map_err(|e| FortiError::TunnelError(format!("SAML auth_id request failed: {}", e)))?;
 
         debug!("SAML auth_id response status: {}", resp.status());
         log_set_cookie_headers(&resp);
 
-        let svpn_cookie = extract_svpncookie(&resp)
-            .ok_or_else(|| FortiError::AuthFailed("SAML auth failed — no SVPNCOOKIE in response".into()))?;
+        let svpn_cookie = extract_svpncookie(&resp).ok_or_else(|| {
+            FortiError::AuthFailed("SAML auth failed — no SVPNCOOKIE in response".into())
+        })?;
 
         info!("SAML authentication successful");
 
         // Step 5: Fetch tunnel configuration (same as credential flow)
         let tunnel_config = self.fetch_tunnel_config(&svpn_cookie).await?;
 
-        Ok(AuthResult { svpn_cookie, tunnel_config })
+        Ok(AuthResult {
+            svpn_cookie,
+            tunnel_config,
+        })
     }
 
     /// Fetch tunnel config: GET /remote/fortisslvpn then GET /remote/fortisslvpn_xml
@@ -312,7 +374,9 @@ impl AuthClient {
             .map_err(FortiError::Http)?;
 
         debug!("Reserving tunnel resources");
-        let resp = sender.send_request(req).await
+        let resp = sender
+            .send_request(req)
+            .await
             .map_err(|e| FortiError::TunnelError(format!("resource reservation failed: {}", e)))?;
         debug!("Resource reservation status: {}", resp.status());
         let _ = http_body_util::BodyExt::collect(resp.into_body()).await;
@@ -341,48 +405,56 @@ impl AuthClient {
                     .header("Cookie", format!("SVPNCOOKIE={}", svpn_cookie))
                     .body(http_body_util::Full::new(bytes::Bytes::new()))
                     .map_err(FortiError::Http)?;
-                sender2.send_request(req).await
-                    .map_err(|e| FortiError::TunnelError(format!("XML config request failed: {}", e)))?
+                sender2.send_request(req).await.map_err(|e| {
+                    FortiError::TunnelError(format!("XML config request failed: {}", e))
+                })?
             }
         };
 
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
             .map_err(|e| FortiError::TunnelError(format!("failed to read XML body: {}", e)))?;
         let body_bytes = body.to_bytes();
         let xml_text = String::from_utf8_lossy(&body_bytes);
         debug!("Received XML config ({} bytes)", xml_text.len());
 
         let tunnel_config = xml::TunnelConfig::parse(&xml_text)?;
-        info!("Tunnel config: IP={}, DNS={:?}", tunnel_config.ip_address, tunnel_config.dns_servers);
+        info!(
+            "Tunnel config: IP={}, DNS={:?}",
+            tunnel_config.ip_address, tunnel_config.dns_servers
+        );
 
         Ok(tunnel_config)
     }
 
-    pub fn server(&self) -> &str { &self.server }
-    pub fn port(&self) -> u16 { self.port }
-    pub fn tls_config(&self) -> Arc<rustls::ClientConfig> { self.tls_config.clone() }
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+    pub fn tls_config(&self) -> Arc<rustls::ClientConfig> {
+        self.tls_config.clone()
+    }
 }
 
 /// Extract SVPNCOOKIE from response headers.
 fn extract_svpncookie<T>(resp: &hyper::Response<T>) -> Option<String> {
-    resp.headers()
-        .get_all("set-cookie")
-        .iter()
-        .find_map(|v| {
-            let s = v.to_str().ok()?;
-            if s.starts_with("SVPNCOOKIE=") {
-                let val = s.split(';').next()?;
-                let cookie = val.trim_start_matches("SVPNCOOKIE=").to_string();
-                // Some FortiGates set an empty cookie — treat as absent
-                if cookie.is_empty() || cookie == "0" {
-                    None
-                } else {
-                    Some(cookie)
-                }
-            } else {
+    resp.headers().get_all("set-cookie").iter().find_map(|v| {
+        let s = v.to_str().ok()?;
+        if s.starts_with("SVPNCOOKIE=") {
+            let val = s.split(';').next()?;
+            let cookie = val.trim_start_matches("SVPNCOOKIE=").to_string();
+            // Some FortiGates set an empty cookie — treat as absent
+            if cookie.is_empty() || cookie == "0" {
                 None
+            } else {
+                Some(cookie)
             }
-        })
+        } else {
+            None
+        }
+    })
 }
 
 /// Parse tokeninfo response fields: "ret=1,tokeninfo=ftm,chal_msg=Enter code,reqid=123,..."
@@ -420,10 +492,12 @@ async fn wait_for_saml_callback(listener: tokio::net::TcpListener) -> Result<Str
     match tokio::time::timeout(
         std::time::Duration::from_secs(300),
         wait_for_saml_callback_inner(listener),
-    ).await {
+    )
+    .await
+    {
         Ok(inner) => inner,
         Err(_) => Err(FortiError::AuthFailed(
-            "SAML authentication timed out after 5 minutes. Please retry.".into()
+            "SAML authentication timed out after 5 minutes. Please retry.".into(),
         )),
     }
 }
@@ -433,17 +507,17 @@ async fn wait_for_saml_callback(listener: tokio::net::TcpListener) -> Result<Str
 /// callback is received. The outer 5-minute timeout controls the overall budget.
 async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Result<String> {
     loop {
-        let (mut stream, addr) = listener.accept().await
-            .map_err(|e| FortiError::AuthFailed(format!("failed to accept SAML callback: {}", e)))?;
+        let (mut stream, addr) = listener.accept().await.map_err(|e| {
+            FortiError::AuthFailed(format!("failed to accept SAML callback: {}", e))
+        })?;
 
         debug!("SAML callback connection from {}", addr);
 
         // Read the HTTP request with a per-connection timeout to prevent slowloris DoS
         let mut buf = vec![0u8; 4096];
-        let n = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            stream.read(&mut buf),
-        ).await {
+        let n = match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+            .await
+        {
             Ok(Ok(n)) if n > 0 => n,
             Ok(Ok(_)) => {
                 debug!("SAML callback: connection closed without data");
@@ -470,25 +544,23 @@ async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Resu
         }
 
         // Validate: must be GET with ?id= parameter
-        let session_id = request.lines()
-            .next()
-            .and_then(|line| {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                // Must be "GET <path> HTTP/1.x"
-                if parts.len() < 2 || parts[0] != "GET" {
-                    return None;
-                }
-                let path = parts[1];
-                let query = path.split('?').nth(1)?;
-                for param in query.split('&') {
-                    if let Some(value) = param.strip_prefix("id=") {
-                        if !value.is_empty() {
-                            return Some(value.to_string());
-                        }
+        let session_id = request.lines().next().and_then(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            // Must be "GET <path> HTTP/1.x"
+            if parts.len() < 2 || parts[0] != "GET" {
+                return None;
+            }
+            let path = parts[1];
+            let query = path.split('?').nth(1)?;
+            for param in query.split('&') {
+                if let Some(value) = param.strip_prefix("id=") {
+                    if !value.is_empty() {
+                        return Some(value.to_string());
                     }
                 }
-                None
-            });
+            }
+            None
+        });
 
         match session_id {
             Some(id) => {
@@ -512,7 +584,9 @@ async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Resu
             }
             None => {
                 // Invalid request — reject and continue listening
-                warn!("Rejected invalid SAML callback (no valid id parameter), continuing to listen");
+                warn!(
+                    "Rejected invalid SAML callback (no valid id parameter), continuing to listen"
+                );
                 let response = "HTTP/1.1 400 Bad Request\r\n\
                     Content-Type: text/plain\r\n\
                     Connection: close\r\n\
@@ -550,7 +624,9 @@ fn urlencoded(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 result.push(b as char);
             }
-            _ => { result.push_str(&format!("%{:02X}", b)); }
+            _ => {
+                result.push_str(&format!("%{:02X}", b));
+            }
         }
     }
     result

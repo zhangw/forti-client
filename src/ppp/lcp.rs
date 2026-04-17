@@ -371,11 +371,7 @@ impl LcpState {
             }
             LcpCode::EchoRequest => self.handle_echo_request(&pkt),
             LcpCode::TerminateRequest => {
-                let reply = LcpPacket::new_raw(
-                    LcpCode::TerminateAck,
-                    pkt.identifier(),
-                    Vec::new(),
-                );
+                let reply = LcpPacket::new_raw(LcpCode::TerminateAck, pkt.identifier(), Vec::new());
                 vec![reply.encode()]
             }
             _ => Vec::new(),
@@ -402,18 +398,10 @@ impl LcpState {
         }
 
         if !rejected.is_empty() {
-            let reject = LcpPacket::new(
-                LcpCode::ConfigureReject,
-                pkt.identifier(),
-                rejected,
-            );
+            let reject = LcpPacket::new(LcpCode::ConfigureReject, pkt.identifier(), rejected);
             vec![reject.encode()]
         } else {
-            let ack = LcpPacket::new(
-                LcpCode::ConfigureAck,
-                pkt.identifier(),
-                acceptable,
-            );
+            let ack = LcpPacket::new(LcpCode::ConfigureAck, pkt.identifier(), acceptable);
             vec![ack.encode()]
         }
     }

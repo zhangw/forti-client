@@ -1,7 +1,7 @@
 use crate::error::{FortiError, Result};
 use std::net::Ipv4Addr;
 use std::process::{Command, Output, Stdio};
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 const SCUTIL_SERVICE: &str = "State:/Network/Service/forti-client/DNS";
 
@@ -26,7 +26,8 @@ pub fn configure_dns(servers: &[Ipv4Addr]) -> Result<()> {
         return Ok(());
     }
 
-    let servers_joined: String = servers.iter()
+    let servers_joined: String = servers
+        .iter()
         .map(|s| s.to_string())
         .collect::<Vec<_>>()
         .join(" ");
@@ -42,7 +43,10 @@ pub fn configure_dns(servers: &[Ipv4Addr]) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(FortiError::TunnelError(format!("scutil failed: {}", stderr.trim())));
+        return Err(FortiError::TunnelError(format!(
+            "scutil failed: {}",
+            stderr.trim()
+        )));
     }
 
     info!("Configured DNS servers: {}", servers_joined);

@@ -1,5 +1,5 @@
-pub mod routes;
 pub mod dns;
+pub mod routes;
 
 use crate::error::{FortiError, Result};
 use std::net::Ipv4Addr;
@@ -14,7 +14,8 @@ pub fn create_tun(ip: Ipv4Addr) -> Result<(tun_rs::AsyncDevice, String)> {
         .build_async()
         .map_err(|e| FortiError::TunnelError(format!("failed to create TUN device: {}", e)))?;
 
-    let name = dev.name()
+    let name = dev
+        .name()
         .map_err(|e| FortiError::TunnelError(format!("failed to get TUN name: {}", e)))?;
 
     info!("Created TUN device {} with IP {}/32", name, ip);

@@ -1,9 +1,9 @@
-pub mod error;
-pub mod ppp;
 pub mod auth;
-pub mod tunnel;
-pub mod tun;
-pub mod vpn;
-pub mod reconnect;
+pub mod error;
 pub mod network_monitor;
 pub mod power_monitor;
+pub mod ppp;
+pub mod reconnect;
+pub mod tun;
+pub mod tunnel;
+pub mod vpn;

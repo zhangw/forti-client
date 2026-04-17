@@ -274,10 +274,14 @@ impl IpcpState {
         }
         // Request DNS only if not rejected
         if !self.rejected_option_types.contains(&0x81) {
-            options.push(IpcpOption::PrimaryDns(self.primary_dns.unwrap_or(Ipv4Addr::UNSPECIFIED)));
+            options.push(IpcpOption::PrimaryDns(
+                self.primary_dns.unwrap_or(Ipv4Addr::UNSPECIFIED),
+            ));
         }
         if !self.rejected_option_types.contains(&0x82) {
-            options.push(IpcpOption::SecondaryDns(self.secondary_dns.unwrap_or(Ipv4Addr::UNSPECIFIED)));
+            options.push(IpcpOption::SecondaryDns(
+                self.secondary_dns.unwrap_or(Ipv4Addr::UNSPECIFIED),
+            ));
         }
 
         let pkt = IpcpPacket::new(IpcpCode::ConfigureRequest, self.next_identifier, options);

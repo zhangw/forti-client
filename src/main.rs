@@ -1,9 +1,9 @@
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
 use forti_client::auth::AuthClient;
 use forti_client::reconnect::{AuthParams, ReconnectController};
-use secrecy::{SecretString, ExposeSecret};
+use secrecy::{ExposeSecret, SecretString};
 use std::io::Write;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "forti-client", about = "FortiGate SSL VPN client")]
@@ -41,8 +41,7 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -58,11 +57,15 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Parent directory must exist and be writable
-        let parent = keylog_path.parent()
+        let parent = keylog_path
+            .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(std::path::Path::new("."));
         if !parent.is_dir() {
-            anyhow::bail!("--tls-keylog-file: parent directory '{}' does not exist", parent.display());
+            anyhow::bail!(
+                "--tls-keylog-file: parent directory '{}' does not exist",
+                parent.display()
+            );
         }
 
         // Reject world-writable parent directories (e.g. /tmp) —
@@ -74,7 +77,8 @@ async fn main() -> anyhow::Result<()> {
             if mode & 0o002 != 0 {
                 anyhow::bail!(
                     "--tls-keylog-file: parent directory '{}' is world-writable (mode {:o})",
-                    parent.display(), mode & 0o777,
+                    parent.display(),
+                    mode & 0o777,
                 );
             }
         }
@@ -107,15 +111,23 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let auth_result = if cli.saml {
-        tracing::info!("Starting SAML authentication to {}:{}", cli.server, cli.port);
+        tracing::info!(
+            "Starting SAML authentication to {}:{}",
+            cli.server,
+            cli.port
+        );
         auth_client.login_saml().await?
     } else {
-        let username = cli.username.as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--username is required for credential auth (use --saml for SSO)"))?;
-        let pw = password.as_ref()
+        let username = cli.username.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--username is required for credential auth (use --saml for SSO)")
+        })?;
+        let pw = password
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("password required"))?;
         tracing::info!("Authenticating to {}:{}", cli.server, cli.port);
-        auth_client.login(username, pw.expose_secret(), cli.realm.as_deref()).await?
+        auth_client
+            .login(username, pw.expose_secret(), cli.realm.as_deref())
+            .await?
     };
 
     tracing::info!(
