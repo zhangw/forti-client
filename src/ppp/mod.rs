@@ -63,13 +63,12 @@ impl PppEngine {
                             debug!("LCP: our Configure-Request accepted");
                             our_lcp_acked = true;
                         }
-                        1 => {
-                            // Configure-Request from peer (we sent Ack or Reject)
-                            if responses.iter().any(|r| r.first() == Some(&2)) {
-                                debug!("LCP: peer Configure-Request accepted");
-                                peer_lcp_acked = true;
-                            }
+                        1 if responses.iter().any(|r| r.first() == Some(&2)) => {
+                            // Configure-Request from peer and we sent an Ack.
+                            debug!("LCP: peer Configure-Request accepted");
+                            peer_lcp_acked = true;
                         }
+                        1 => {}
                         _ => {}
                     }
                 }

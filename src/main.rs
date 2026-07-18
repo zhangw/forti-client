@@ -1,6 +1,7 @@
 use clap::Parser;
 use forti_client::auth::AuthClient;
 use forti_client::reconnect::{AuthParams, ReconnectController};
+use forti_client::shutdown::Shutdown;
 use secrecy::{ExposeSecret, SecretString};
 use std::io::Write;
 use tracing_subscriber::EnvFilter;
@@ -110,24 +111,48 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let auth_result = if cli.saml {
-        tracing::info!(
-            "Starting SAML authentication to {}:{}",
-            cli.server,
-            cli.port
-        );
-        auth_client.login_saml().await?
-    } else {
-        let username = cli.username.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("--username is required for credential auth (use --saml for SSO)")
-        })?;
-        let pw = password
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("password required"))?;
-        tracing::info!("Authenticating to {}:{}", cli.server, cli.port);
-        auth_client
-            .login(username, pw.expose_secret(), cli.realm.as_deref())
-            .await?
+    // Install one process-wide Ctrl+C listener after the synchronous password
+    // prompt. The level-triggered token remembers cancellation across states.
+    let shutdown = Shutdown::new();
+    let signal_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("Ctrl+C received");
+            signal_shutdown.cancel();
+        }
+    });
+
+    let auth_future = async {
+        if cli.saml {
+            tracing::info!(
+                "Starting SAML authentication to {}:{}",
+                cli.server,
+                cli.port
+            );
+            auth_client.login_saml().await
+        } else {
+            let username = cli.username.as_deref().ok_or_else(|| {
+                forti_client::error::FortiError::AuthFailed(
+                    "--username is required for credential auth (use --saml for SSO)".into(),
+                )
+            })?;
+            let pw = password.as_ref().ok_or_else(|| {
+                forti_client::error::FortiError::AuthFailed("password required".into())
+            })?;
+            tracing::info!("Authenticating to {}:{}", cli.server, cli.port);
+            auth_client
+                .login(username, pw.expose_secret(), cli.realm.as_deref())
+                .await
+        }
+    };
+
+    let auth_result = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            tracing::info!("Authentication cancelled.");
+            return Ok(());
+        }
+        result = auth_future => result?,
     };
 
     tracing::info!(
@@ -152,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
         auth_params,
         auth_result.svpn_cookie,
         auth_result.tunnel_config,
+        shutdown,
     );
 
     controller.run().await?;

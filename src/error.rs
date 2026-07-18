@@ -5,6 +5,9 @@ pub enum FortiError {
     #[error("authentication failed: {0}")]
     AuthFailed(String),
 
+    #[error("VPN cookie rejected by server (HTTP {0})")]
+    CookieRejected(u16),
+
     #[error("tunnel error: {0}")]
     TunnelError(String),
 

@@ -4,6 +4,7 @@ pub mod network_monitor;
 pub mod power_monitor;
 pub mod ppp;
 pub mod reconnect;
+pub mod shutdown;
 pub mod tun;
 pub mod tunnel;
 pub mod vpn;

@@ -67,7 +67,7 @@ mod ffi {
 }
 
 struct PowerCallbackContext {
-    tx: mpsc::Sender<PowerEvent>,
+    tx: mpsc::UnboundedSender<PowerEvent>,
     root_port: ffi::IOObject,
 }
 
@@ -86,7 +86,7 @@ extern "C" fn power_callback(
             unsafe {
                 ffi::IOAllowPowerChange(ctx.root_port, message_argument as isize);
             }
-            let _ = ctx.tx.blocking_send(PowerEvent::WillSleep);
+            let _ = ctx.tx.send(PowerEvent::WillSleep);
         }
         ffi::kIOMessageCanSystemSleep => {
             // Allow system to sleep (don't veto)
@@ -96,7 +96,7 @@ extern "C" fn power_callback(
         }
         ffi::kIOMessageSystemHasPoweredOn => {
             debug!("IOKit: HasPoweredOn");
-            let _ = ctx.tx.blocking_send(PowerEvent::HasPoweredOn);
+            let _ = ctx.tx.send(PowerEvent::HasPoweredOn);
         }
         _ => {
             debug!("IOKit: unknown power message 0x{:08x}", message_type);
@@ -107,8 +107,8 @@ extern "C" fn power_callback(
 impl PowerMonitor {
     /// Start monitoring power state changes.
     /// Returns the monitor handle and a receiver for power events.
-    pub fn start() -> Result<(Self, mpsc::Receiver<PowerEvent>), String> {
-        let (tx, rx) = mpsc::channel(8);
+    pub fn start() -> Result<(Self, mpsc::UnboundedReceiver<PowerEvent>), String> {
+        let (tx, rx) = mpsc::unbounded_channel();
 
         let thread = std::thread::Builder::new()
             .name("power-monitor".into())
@@ -120,7 +120,7 @@ impl PowerMonitor {
         Ok((Self { _thread: thread }, rx))
     }
 
-    fn run_power_loop(tx: mpsc::Sender<PowerEvent>) {
+    fn run_power_loop(tx: mpsc::UnboundedSender<PowerEvent>) {
         unsafe {
             let mut notify_port: ffi::IONotificationPortRef = std::ptr::null_mut();
             let mut notifier: ffi::IOObject = 0;

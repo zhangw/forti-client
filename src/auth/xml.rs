@@ -1,7 +1,7 @@
 use crate::error::Result;
 use std::net::Ipv4Addr;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelConfig {
     pub ip_address: Ipv4Addr,
     pub dns_servers: Vec<Ipv4Addr>,
@@ -13,7 +13,7 @@ pub struct TunnelConfig {
     pub tunnel_method: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
     pub ip: Ipv4Addr,
     pub mask: Ipv4Addr,

@@ -23,8 +23,10 @@ pub struct NetworkMonitor {
 impl NetworkMonitor {
     /// Start monitoring reachability to the given hostname.
     /// Returns the monitor handle and a receiver for network events.
-    pub fn start(server_host: &str) -> Result<(Self, mpsc::Receiver<NetworkEvent>), String> {
-        let (tx, rx) = mpsc::channel(16);
+    pub fn start(
+        server_host: &str,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<NetworkEvent>), String> {
+        let (tx, rx) = mpsc::unbounded_channel();
         let host = server_host.to_string();
 
         let thread = std::thread::Builder::new()
@@ -37,7 +39,7 @@ impl NetworkMonitor {
         Ok((Self { _thread: thread }, rx))
     }
 
-    fn run_reachability(host: &str, tx: mpsc::Sender<NetworkEvent>) {
+    fn run_reachability(host: &str, tx: mpsc::UnboundedSender<NetworkEvent>) {
         let c_host = match CString::new(host) {
             Ok(c) => c,
             Err(e) => {
@@ -81,7 +83,7 @@ impl NetworkMonitor {
                 } else {
                     NetworkEvent::Unreachable
                 };
-                if tx_clone.blocking_send(event).is_err() {
+                if tx_clone.send(event).is_err() {
                     debug!("Network monitor channel closed, stopping");
                     CFRunLoop::get_current().stop();
                 }

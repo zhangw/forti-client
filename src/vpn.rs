@@ -1,19 +1,33 @@
 use crate::auth::xml::TunnelConfig;
 use crate::error::{FortiError, Result};
+use crate::power_monitor::PowerEvent;
 use crate::ppp::codec::{PppFrame, PppProtocol};
 use crate::ppp::lcp::{LcpCode, LcpState};
 use crate::reconnect::DisconnectReason;
+use crate::shutdown::Shutdown;
 use crate::tun;
 use crate::tunnel::TlsTunnel;
 
+use std::future::Future;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 /// Set up TUN device, routes, and DNS. Returns the device and interface name.
-pub fn setup_tun(config: &TunnelConfig) -> Result<(tun_rs::AsyncDevice, String)> {
+pub async fn setup_tun(
+    config: &TunnelConfig,
+    shutdown: &Shutdown,
+) -> Result<(tun_rs::AsyncDevice, String)> {
     let (tun_dev, iface_name) = tun::create_tun(config.ip_address)?;
-    tun::routes::install_routes(&config.routes, &iface_name)?;
-    tun::dns::configure_dns(&config.dns_servers)?;
+    if let Err(error) = tun::routes::install_routes(&config.routes, &iface_name, shutdown).await {
+        tun::routes::remove_routes(&config.routes, &iface_name).await;
+        return Err(error);
+    }
+    if let Err(error) = tun::dns::configure_dns(&config.dns_servers, shutdown).await {
+        tun::routes::remove_routes(&config.routes, &iface_name).await;
+        tun::dns::remove_dns().await;
+        return Err(error);
+    }
 
     info!(
         "VPN active on {} — IP={}, {} routes, {} DNS servers",
@@ -27,22 +41,50 @@ pub fn setup_tun(config: &TunnelConfig) -> Result<(tun_rs::AsyncDevice, String)>
 }
 
 /// Remove routes and DNS configuration.
-pub fn cleanup_tun(config: &TunnelConfig, iface_name: &str) {
+pub async fn cleanup_tun(config: &TunnelConfig, iface_name: &str) {
     info!("Cleaning up routes and DNS...");
-    tun::routes::remove_routes(&config.routes, iface_name);
-    tun::dns::remove_dns();
+    tun::routes::remove_routes(&config.routes, iface_name).await;
+    tun::dns::remove_dns().await;
+}
+
+async fn next_power_event(rx: &mut mpsc::UnboundedReceiver<PowerEvent>) -> PowerEvent {
+    match rx.recv().await {
+        Some(event) => event,
+        None => std::future::pending().await,
+    }
+}
+
+/// Await an operation while retaining immediate shutdown and sleep handling.
+async fn interruptible<T>(
+    operation: impl Future<Output = T>,
+    shutdown: &Shutdown,
+    power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+) -> std::result::Result<T, DisconnectReason> {
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Err(DisconnectReason::UserQuit),
+            event = next_power_event(power_rx) => {
+                if event == PowerEvent::WillSleep {
+                    return Err(DisconnectReason::SystemSleep);
+                }
+            }
+            result = &mut operation => return Ok(result),
+        }
+    }
 }
 
 /// Run the VPN data plane event loop.
 ///
-/// Forwards packets between the TUN device and the TLS tunnel, handles LCP
-/// keepalive, and listens for Ctrl+C.
-///
-/// Returns a `DisconnectReason` indicating why the loop exited.
+/// Every potentially blocking I/O operation remains interruptible by the
+/// process-wide shutdown signal and by a system sleep notification.
 pub async fn event_loop(
     tunnel: &mut TlsTunnel,
     lcp: &mut LcpState,
     tun_dev: &tun_rs::AsyncDevice,
+    shutdown: &Shutdown,
+    power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
 ) -> DisconnectReason {
     let mut keepalive = tokio::time::interval(Duration::from_secs(10));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -53,24 +95,33 @@ pub async fn event_loop(
 
     loop {
         tokio::select! {
-            // TUN → Tunnel (outbound: app sends packet through VPN)
+            biased;
+            _ = shutdown.cancelled() => {
+                info!("Shutdown requested");
+                return DisconnectReason::UserQuit;
+            }
+            event = next_power_event(power_rx) => {
+                if event == PowerEvent::WillSleep {
+                    info!("System sleep requested");
+                    return DisconnectReason::SystemSleep;
+                }
+            }
+
+            // TUN → Tunnel
             result = tun_dev.recv(&mut tun_buf) => {
                 let n = match result {
                     Ok(n) => n,
                     Err(e) => return DisconnectReason::IoError(format!("TUN read error: {}", e)),
                 };
-                if n == 0 {
-                    continue;
-                }
+                if n == 0 { continue; }
 
-                let version = tun_buf[0] >> 4;
-                let protocol = match version {
+                let protocol = match tun_buf[0] >> 4 {
                     4 => PppProtocol::Ipv4,
                     6 => {
                         debug!("TUN: ignoring outbound IPv6 packet");
                         continue;
                     }
-                    _ => {
+                    version => {
                         debug!("TUN: unknown IP version {}, skipping", version);
                         continue;
                     }
@@ -80,12 +131,18 @@ pub async fn event_loop(
                 if pkt_count <= 5 {
                     debug!("TUN → tunnel: {} bytes IPv4", n);
                 }
-                if let Err(e) = send_ppp(tunnel, protocol, tun_buf[..n].to_vec()).await {
-                    return DisconnectReason::IoError(format!("tunnel send error: {}", e));
+                match interruptible(
+                    send_ppp(tunnel, protocol, tun_buf[..n].to_vec()),
+                    shutdown,
+                    power_rx,
+                ).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return DisconnectReason::IoError(format!("tunnel send error: {}", e)),
+                    Err(reason) => return reason,
                 }
             }
 
-            // Tunnel → TUN (inbound: FortiGate sends packet to us)
+            // Tunnel → TUN
             result = tunnel.recv_frame() => {
                 let frame = match result {
                     Ok(f) => f,
@@ -108,16 +165,24 @@ pub async fn event_loop(
                         if pkt_count <= 10 {
                             debug!("Tunnel → TUN: {} bytes IPv4", ppp.data().len());
                         }
-                        if let Err(e) = tun_dev.send(ppp.data()).await {
-                            return DisconnectReason::IoError(format!("TUN write error: {}", e));
+                        match interruptible(tun_dev.send(ppp.data()), shutdown, power_rx).await {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => return DisconnectReason::IoError(format!("TUN write error: {}", e)),
+                            Err(reason) => return reason,
                         }
                     }
                     PppProtocol::Lcp => {
                         let code = LcpCode::from_u8(ppp.data().first().copied().unwrap_or(0));
                         let responses = lcp.handle_packet(ppp.data());
                         for resp in responses {
-                            if let Err(e) = send_ppp(tunnel, PppProtocol::Lcp, resp).await {
-                                return DisconnectReason::IoError(format!("LCP send error: {}", e));
+                            match interruptible(
+                                send_ppp(tunnel, PppProtocol::Lcp, resp),
+                                shutdown,
+                                power_rx,
+                            ).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => return DisconnectReason::IoError(format!("LCP send error: {}", e)),
+                                Err(reason) => return reason,
                             }
                         }
                         if code == LcpCode::EchoReply {
@@ -128,18 +193,12 @@ pub async fn event_loop(
                             return DisconnectReason::ServerTerminated;
                         }
                     }
-                    PppProtocol::Ipv6 => {
-                        debug!("Ignoring inbound IPv6 packet");
-                    }
-                    other => {
-                        debug!("Ignoring PPP protocol {:?}", other);
-                    }
+                    PppProtocol::Ipv6 => debug!("Ignoring inbound IPv6 packet"),
+                    other => debug!("Ignoring PPP protocol {:?}", other),
                 }
             }
 
-            // Keepalive timer
             _ = keepalive.tick() => {
-                // Timing gap heuristic: detect possible sleep/wake
                 if crate::reconnect::detect_sleep_gap(last_tick, Duration::from_secs(10)) {
                     info!("Timing gap detected ({}s since last tick) — possible sleep/wake",
                         last_tick.elapsed().as_secs());
@@ -147,20 +206,20 @@ pub async fn event_loop(
                 }
                 last_tick = std::time::Instant::now();
 
-                if let Err(e) = send_ppp(tunnel, PppProtocol::Lcp, lcp.build_echo_request()).await {
-                    return DisconnectReason::IoError(format!("keepalive send error: {}", e));
+                match interruptible(
+                    send_ppp(tunnel, PppProtocol::Lcp, lcp.build_echo_request()),
+                    shutdown,
+                    power_rx,
+                ).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return DisconnectReason::IoError(format!("keepalive send error: {}", e)),
+                    Err(reason) => return reason,
                 }
                 missed_echoes += 1;
                 if missed_echoes > 3 {
                     error!("Dead peer detected ({} missed echoes)", missed_echoes);
                     return DisconnectReason::DeadPeer;
                 }
-            }
-
-            // Ctrl+C
-            _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl+C received");
-                return DisconnectReason::UserQuit;
             }
         }
     }

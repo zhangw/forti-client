@@ -1,30 +1,40 @@
+use std::future::Future;
+use std::time::{Duration, Instant};
+
+use secrecy::{ExposeSecret, SecretString};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+
+use crate::auth::xml::TunnelConfig;
+use crate::auth::AuthClient;
+use crate::error::{FortiError, Result};
+use crate::network_monitor::{NetworkEvent, NetworkMonitor};
+use crate::power_monitor::{PowerEvent, PowerMonitor};
+use crate::ppp::codec::{PppFrame, PppProtocol};
+use crate::ppp::PppEngine;
+use crate::shutdown::Shutdown;
+use crate::tunnel::TlsTunnel;
+use crate::vpn;
+
 /// Reason the VPN event loop exited.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisconnectReason {
-    /// 3+ missed LCP echo replies.
     DeadPeer,
-    /// Peer sent EOF (TCP close).
     TunnelClosed,
-    /// Server sent LCP Terminate-Request.
     ServerTerminated,
-    /// TUN or TLS I/O failure.
     IoError(String),
-    /// User pressed Ctrl+C.
+    SystemSleep,
     UserQuit,
 }
 
-/// What the reconnect controller should do next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconnectAction {
-    /// Attempt reconnect reusing the existing SVPNCOOKIE.
     RetryWithCookie,
-    /// Cookie expired or rejected — full re-authentication needed.
     ReAuthenticate,
-    /// User requested exit — clean up and terminate.
     Exit,
 }
 
-/// Classify a disconnect reason into a reconnect action.
 pub fn classify_disconnect(reason: &DisconnectReason) -> ReconnectAction {
     match reason {
         DisconnectReason::UserQuit => ReconnectAction::Exit,
@@ -32,18 +42,25 @@ pub fn classify_disconnect(reason: &DisconnectReason) -> ReconnectAction {
     }
 }
 
-use std::time::{Duration, Instant};
-
-/// Detect if the system likely slept by checking if elapsed time since the last
-/// keepalive tick is much larger than expected (> 3x the interval).
+/// Detect a likely sleep gap from a delayed keepalive tick.
 pub fn detect_sleep_gap(last_tick: Instant, expected_interval: Duration) -> bool {
     last_tick.elapsed() > expected_interval * 3
 }
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+const REAUTH_AFTER_CONNECT_FAILURES: u32 = 3;
+const TERMINATE_TIMEOUT: Duration = Duration::from_secs(2);
+const MONITOR_FALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Exponential backoff timer: 1s, 2s, 4s, 8s, ..., capped at 60s.
+/// A typed rejection re-authenticates immediately. Repeated failures are a
+/// compatibility fallback for FortiGates that report an expired cookie as EOF,
+/// PPP timeout, or another non-HTTP failure.
+pub fn should_reauthenticate(error: &FortiError, consecutive_failures: u32) -> bool {
+    matches!(error, FortiError::CookieRejected(_))
+        || consecutive_failures >= REAUTH_AFTER_CONNECT_FAILURES
+}
+
 pub struct Backoff {
     current: Duration,
 }
@@ -61,56 +78,29 @@ impl Backoff {
         }
     }
 
-    /// Return the current backoff duration.
     pub fn current(&self) -> Duration {
         self.current
     }
 
-    /// Advance to the next backoff interval.
     pub fn next(&mut self) {
         self.current = (self.current * 2).min(BACKOFF_MAX);
     }
 
-    /// Reset backoff to initial value (after successful reconnect).
     pub fn reset(&mut self) {
         self.current = BACKOFF_INITIAL;
     }
 }
 
-use secrecy::{ExposeSecret, SecretString};
-
-use crate::auth::xml::TunnelConfig;
-use crate::auth::AuthClient;
-use crate::error::{FortiError, Result};
-use crate::network_monitor::{NetworkEvent, NetworkMonitor};
-use crate::power_monitor::{PowerEvent, PowerMonitor};
-use crate::ppp::codec::{PppFrame, PppProtocol};
-use crate::ppp::PppEngine;
-use crate::tunnel::TlsTunnel;
-use crate::vpn;
-
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
-
-/// Current state of the reconnect controller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
-    /// Initial connection in progress.
     Connecting,
-    /// Tunnel is up and forwarding traffic.
     Connected,
-    /// Attempting to reconnect.
     Reconnecting,
-    /// Cookie expired — running full re-authentication.
     ReAuthenticating,
-    /// Waiting for network to return after sleep/wake (Layer 3).
     WaitingForNetwork,
-    /// Final cleanup before exit.
     Cleanup,
 }
 
-/// Parameters needed to authenticate (for re-auth on cookie expiry).
 pub struct AuthParams {
     pub server: String,
     pub port: u16,
@@ -122,175 +112,295 @@ pub struct AuthParams {
     pub enable_keylog: bool,
 }
 
-/// Reconnect controller: owns TUN/routes/DNS, drives the reconnect state machine.
 pub struct ReconnectController {
     auth_params: AuthParams,
     svpn_cookie: String,
     tunnel_config: TunnelConfig,
     backoff: Backoff,
     state: ConnectionState,
+    shutdown: Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Interrupt {
+    Shutdown,
+    Sleep,
+    NetworkDown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryOutcome {
+    Retry,
+    Shutdown,
+}
+
+async fn next_network_event(rx: &mut mpsc::UnboundedReceiver<NetworkEvent>) -> NetworkEvent {
+    match rx.recv().await {
+        Some(event) => event,
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_power_event(rx: &mut mpsc::UnboundedReceiver<PowerEvent>) -> PowerEvent {
+    match rx.recv().await {
+        Some(event) => event,
+        None => std::future::pending().await,
+    }
+}
+
+async fn interruptible<T>(
+    operation: impl Future<Output = T>,
+    shutdown: &Shutdown,
+    network_rx: &mut mpsc::UnboundedReceiver<NetworkEvent>,
+    power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+) -> std::result::Result<T, Interrupt> {
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Err(Interrupt::Shutdown),
+            power = next_power_event(power_rx) => {
+                if power == PowerEvent::WillSleep {
+                    return Err(Interrupt::Sleep);
+                }
+            }
+            network = next_network_event(network_rx) => {
+                if network == NetworkEvent::Unreachable {
+                    return Err(Interrupt::NetworkDown);
+                }
+            }
+            result = &mut operation => return Ok(result),
+        }
+    }
 }
 
 impl ReconnectController {
-    pub fn new(auth_params: AuthParams, svpn_cookie: String, tunnel_config: TunnelConfig) -> Self {
+    pub fn new(
+        auth_params: AuthParams,
+        svpn_cookie: String,
+        tunnel_config: TunnelConfig,
+        shutdown: Shutdown,
+    ) -> Self {
         Self {
             auth_params,
             svpn_cookie,
             tunnel_config,
             backoff: Backoff::new(),
             state: ConnectionState::Connecting,
+            shutdown,
         }
     }
 
-    /// Run the reconnect loop. Returns only on user quit or unrecoverable error.
+    /// Run until shutdown or an unrecoverable local setup error. Once TUN setup
+    /// succeeds, every return path passes through final route/DNS cleanup.
     pub async fn run(&mut self) -> Result<()> {
-        // Setup TUN, routes, DNS (persist across reconnects)
-        let (mut tun_dev, mut iface_name) = vpn::setup_tun(&self.tunnel_config)?;
-        let mut current_ip = self.tunnel_config.ip_address;
+        let (mut tun_dev, mut iface_name) =
+            match vpn::setup_tun(&self.tunnel_config, &self.shutdown).await {
+                Ok(setup) => setup,
+                Err(_) if self.shutdown.is_cancelled() => return Ok(()),
+                Err(error) => return Err(error),
+            };
+        let mut applied_config = self.tunnel_config.clone();
         info!("Press Ctrl+C to disconnect.");
 
-        // Start network monitor (uses hostname, not SocketAddr — supports DNS names)
-        let (_network_monitor, mut network_rx) = NetworkMonitor::start(&self.auth_params.server)
-            .map_err(|e| FortiError::TunnelError(format!("network monitor failed: {}", e)))?;
-
-        // Start power monitor
-        let (_power_monitor, mut power_rx) = PowerMonitor::start()
-            .map_err(|e| FortiError::TunnelError(format!("power monitor failed: {}", e)))?;
+        let (_network_monitor, mut network_rx) =
+            match NetworkMonitor::start(&self.auth_params.server) {
+                Ok(value) => value,
+                Err(e) => {
+                    vpn::cleanup_tun(&applied_config, &iface_name).await;
+                    return Err(FortiError::TunnelError(format!(
+                        "network monitor failed: {}",
+                        e
+                    )));
+                }
+            };
+        let (_power_monitor, mut power_rx) = match PowerMonitor::start() {
+            Ok(value) => value,
+            Err(e) => {
+                vpn::cleanup_tun(&applied_config, &iface_name).await;
+                return Err(FortiError::TunnelError(format!(
+                    "power monitor failed: {}",
+                    e
+                )));
+            }
+        };
 
         self.state = ConnectionState::Connected;
+        let shutdown = self.shutdown.clone();
+        let mut terminal_error: Option<FortiError> = None;
+        let mut consecutive_connect_failures = 0u32;
 
-        loop {
-            // Connect tunnel + PPP
-            // Known limitation: WillSleep events during connect_tunnel() are deferred
-            // until the next tokio::select! iteration. The system will still sleep after
-            // its 30s timeout, and the timing gap heuristic will catch it on wake.
-            let connect_result = self.connect_tunnel().await;
-            let (mut tunnel, mut lcp) = match connect_result {
-                Ok((tunnel, lcp, new_ip)) => {
-                    self.backoff.reset();
-                    // If server assigned a different IP, recreate TUN device + routes
-                    if new_ip != current_ip {
-                        warn!(
-                            "IP changed: {} → {} — recreating TUN device",
-                            current_ip, new_ip
-                        );
-                        vpn::cleanup_tun(&self.tunnel_config, &iface_name);
-                        self.tunnel_config.ip_address = new_ip;
-                        let (new_tun, new_iface) = vpn::setup_tun(&self.tunnel_config)?;
-                        tun_dev = new_tun;
-                        iface_name = new_iface;
-                        current_ip = new_ip;
+        'reconnect: loop {
+            let connect_result = match interruptible(
+                self.connect_tunnel(),
+                &shutdown,
+                &mut network_rx,
+                &mut power_rx,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(Interrupt::Shutdown) => break,
+                Err(Interrupt::Sleep) => {
+                    if self.wait_for_wake(&mut power_rx).await {
+                        break;
                     }
-                    info!("Tunnel established, entering data plane");
-                    (tunnel, lcp)
+                    continue;
                 }
-                Err(e) => {
-                    // Check if it's a cookie rejection (HTTP 403)
-                    let err_msg = format!("{}", e);
-                    if err_msg.contains("403") || err_msg.contains("Forbidden") {
-                        warn!("Cookie rejected, attempting re-authentication");
-                        self.state = ConnectionState::ReAuthenticating;
-                        match self.re_authenticate().await {
-                            Ok(()) => {
-                                info!("Re-authentication successful, retrying tunnel");
-                                continue;
-                            }
-                            Err(auth_err) => {
-                                error!("Re-authentication failed: {}", auth_err);
-                                // Fall through to backoff
-                            }
-                        }
-                    }
-
-                    let delay = self.backoff.current();
-                    warn!("Tunnel connect failed: {}. Retrying in {:?}", e, delay);
-                    self.backoff.next();
-
-                    if self.wait_for_retry(delay, &mut network_rx).await {
+                Err(Interrupt::NetworkDown) => {
+                    if self.wait_for_network(&mut network_rx, &mut power_rx).await {
                         break;
                     }
                     continue;
                 }
             };
 
-            // Drain stale power events before entering the event loop select.
-            // Without this, a stale HasPoweredOn would poison the pattern-matching
-            // select branch (tokio disables non-matching pattern branches).
-            while let Ok(event) = power_rx.try_recv() {
-                debug!("Draining stale power event: {:?}", event);
-            }
-
-            // Run event loop — also check for sleep events between iterations.
-            // We can't use tokio::select! with event_loop + power_rx because
-            // event_loop borrows tunnel/lcp, preventing send_terminate in sleep path.
-            // Instead, check power_rx after event_loop returns.
-            let reason = vpn::event_loop(&mut tunnel, &mut lcp, &tun_dev).await;
-
-            // Check if a WillSleep arrived while the event loop was running
-            let is_sleep = matches!(power_rx.try_recv(), Ok(PowerEvent::WillSleep));
-
-            // Send LCP terminate before closing tunnel
-            let _ = Self::send_terminate(&mut tunnel, &mut lcp).await;
-            drop(tunnel);
-
-            if is_sleep {
-                info!("System going to sleep — waiting for wake");
-                self.state = ConnectionState::WaitingForNetwork;
-                loop {
-                    tokio::select! {
-                        event = power_rx.recv() => {
-                            if matches!(event, Some(PowerEvent::HasPoweredOn)) {
-                                info!("System woke up — reconnecting");
+            let (mut tunnel, mut lcp, negotiated_ip) = match connect_result {
+                Ok(connected) => {
+                    consecutive_connect_failures = 0;
+                    self.backoff.reset();
+                    connected
+                }
+                Err(connect_error) => {
+                    consecutive_connect_failures = consecutive_connect_failures.saturating_add(1);
+                    if should_reauthenticate(&connect_error, consecutive_connect_failures) {
+                        warn!(
+                            "Tunnel authentication may be stale after {} failure(s): {}",
+                            consecutive_connect_failures, connect_error
+                        );
+                        self.state = ConnectionState::ReAuthenticating;
+                        match interruptible(
+                            self.re_authenticate(),
+                            &shutdown,
+                            &mut network_rx,
+                            &mut power_rx,
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                info!("Re-authentication successful, retrying tunnel");
+                                consecutive_connect_failures = 0;
                                 self.backoff.reset();
-                                break;
+                                continue;
+                            }
+                            Ok(Err(auth_error)) => {
+                                error!("Re-authentication failed: {}", auth_error);
+                                consecutive_connect_failures = 0;
+                            }
+                            Err(Interrupt::Shutdown) => break,
+                            Err(Interrupt::Sleep) => {
+                                if self.wait_for_wake(&mut power_rx).await {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Err(Interrupt::NetworkDown) => {
+                                if self.wait_for_network(&mut network_rx, &mut power_rx).await {
+                                    break;
+                                }
+                                continue;
                             }
                         }
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("Ctrl+C during wake");
-                            self.state = ConnectionState::Cleanup;
-                            vpn::cleanup_tun(&self.tunnel_config, &iface_name);
-                            info!("VPN disconnected.");
-                            return Ok(());
-                        }
+                    }
+
+                    let delay = self.backoff.current();
+                    warn!(
+                        "Tunnel connect failed: {}. Retrying in {:?}",
+                        connect_error, delay
+                    );
+                    self.backoff.next();
+                    if self
+                        .wait_for_retry(delay, &mut network_rx, &mut power_rx)
+                        .await
+                        == RetryOutcome::Shutdown
+                    {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            // IPCP is authoritative for the address used by this tunnel. A
+            // reconnect may assign a new IP even when no full re-auth occurred.
+            if apply_negotiated_ip(&mut self.tunnel_config, negotiated_ip) {
+                info!("IPCP assigned a new address: {}", negotiated_ip);
+            }
+
+            // Re-authentication can change routes or DNS without changing the IP.
+            // Recreate the interface for any applied network-config change so old
+            // routes are removed and final cleanup refers to the correct config.
+            if network_config_changed(&applied_config, &self.tunnel_config) {
+                warn!("VPN network configuration changed — recreating TUN device");
+                vpn::cleanup_tun(&applied_config, &iface_name).await;
+                match vpn::setup_tun(&self.tunnel_config, &shutdown).await {
+                    Ok((new_tun, new_iface)) => {
+                        tun_dev = new_tun;
+                        iface_name = new_iface;
+                        applied_config = self.tunnel_config.clone();
+                    }
+                    Err(_) if shutdown.is_cancelled() => break 'reconnect,
+                    Err(e) => {
+                        terminal_error = Some(e);
+                        break 'reconnect;
                     }
                 }
-                // Drain any stale network events queued during sleep so wait_for_retry
-                // doesn't act on stale state on its first iteration.
-                while let Ok(event) = network_rx.try_recv() {
-                    debug!("Draining stale network event after wake: {:?}", event);
-                }
-                continue; // Go back to top of loop to reconnect
             }
-            info!("Event loop exited: {:?}", reason);
 
-            let action = classify_disconnect(&reason);
-            match action {
-                ReconnectAction::Exit => {
-                    self.state = ConnectionState::Cleanup;
+            info!("Tunnel established, entering data plane");
+            self.state = ConnectionState::Connected;
+            let reason =
+                vpn::event_loop(&mut tunnel, &mut lcp, &tun_dev, &shutdown, &mut power_rx).await;
+
+            if !matches!(
+                reason,
+                DisconnectReason::UserQuit | DisconnectReason::SystemSleep
+            ) {
+                let _ = tokio::time::timeout(
+                    TERMINATE_TIMEOUT,
+                    Self::send_terminate(&mut tunnel, &mut lcp),
+                )
+                .await;
+            }
+            drop(tunnel);
+
+            if reason == DisconnectReason::SystemSleep {
+                if self.wait_for_wake(&mut power_rx).await {
                     break;
                 }
+                while let Ok(event) = network_rx.try_recv() {
+                    debug!("Draining network event after wake: {:?}", event);
+                }
+                continue;
+            }
+
+            info!("Event loop exited: {:?}", reason);
+            match classify_disconnect(&reason) {
+                ReconnectAction::Exit => break,
                 ReconnectAction::RetryWithCookie | ReconnectAction::ReAuthenticate => {
                     let delay = self.backoff.current();
                     self.state = ConnectionState::Reconnecting;
                     info!("Reconnecting in {:?}...", delay);
                     self.backoff.next();
-
-                    if self.wait_for_retry(delay, &mut network_rx).await {
+                    if self
+                        .wait_for_retry(delay, &mut network_rx, &mut power_rx)
+                        .await
+                        == RetryOutcome::Shutdown
+                    {
                         break;
                     }
                 }
             }
         }
 
-        // Final cleanup
-        vpn::cleanup_tun(&self.tunnel_config, &iface_name);
+        self.state = ConnectionState::Cleanup;
+        vpn::cleanup_tun(&applied_config, &iface_name).await;
         info!("VPN disconnected.");
-        Ok(())
+        match terminal_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
-    /// Connect the TLS tunnel and run PPP negotiation.
-    /// Uses the cookie fast path: skip resource reservation and XML fetch.
-    /// Returns the tunnel, LCP state, and the IPCP-assigned IP address.
     async fn connect_tunnel(
         &self,
     ) -> Result<(TlsTunnel, crate::ppp::lcp::LcpState, std::net::Ipv4Addr)> {
@@ -305,11 +415,9 @@ impl ReconnectController {
         let mut ppp = PppEngine::new(1500);
         let ipcp_config = ppp.negotiate(&mut tunnel).await?;
         let lcp = ppp.into_lcp();
-
         Ok((tunnel, lcp, ipcp_config.ip_address))
     }
 
-    /// Re-authenticate (SAML or credential) and update stored cookie/config.
     async fn re_authenticate(&mut self) -> Result<()> {
         let auth_client = AuthClient::new(
             &self.auth_params.server,
@@ -342,19 +450,10 @@ impl ReconnectController {
         };
 
         self.svpn_cookie = auth_result.svpn_cookie;
-
-        if auth_result.tunnel_config.ip_address != self.tunnel_config.ip_address {
-            info!(
-                "Re-auth assigned new IP {} (was {}) — TUN will be recreated on next connect",
-                auth_result.tunnel_config.ip_address, self.tunnel_config.ip_address,
-            );
-        }
         self.tunnel_config = auth_result.tunnel_config;
-
         Ok(())
     }
 
-    /// Try to send LCP Terminate-Request before closing tunnel.
     async fn send_terminate(
         tunnel: &mut TlsTunnel,
         lcp: &mut crate::ppp::lcp::LcpState,
@@ -363,38 +462,188 @@ impl ReconnectController {
         tunnel.send_frame(frame.encode()).await
     }
 
-    /// Wait for backoff timer, but cancel early if network becomes reachable.
-    /// Returns true if user pressed Ctrl+C (should exit).
-    async fn wait_for_retry(
+    /// Returns true when shutdown was requested.
+    async fn wait_for_network(
         &mut self,
-        delay: Duration,
-        network_rx: &mut mpsc::Receiver<NetworkEvent>,
+        network_rx: &mut mpsc::UnboundedReceiver<NetworkEvent>,
+        power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
     ) -> bool {
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => false,
-            event = network_rx.recv() => {
-                match event {
-                    Some(NetworkEvent::Reachable) => {
-                        info!("Network reachable — reconnecting immediately");
+        self.state = ConnectionState::WaitingForNetwork;
+        info!("Network unreachable — waiting for reachability");
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => return true,
+                _ = tokio::time::sleep(MONITOR_FALLBACK_TIMEOUT) => {
+                    warn!("No network reachability update after 15s — retrying with bounded connect timeout");
+                    return false;
+                }
+                event = next_network_event(network_rx) => {
+                    if event == NetworkEvent::Reachable {
+                        info!("Network reachable — reconnecting");
                         self.backoff.reset();
-                        false
+                        return false;
                     }
-                    Some(NetworkEvent::Unreachable) => {
-                        debug!("Network unreachable during backoff — will retry when reachable");
-                        // Don't reset backoff — network is down, no point reconnecting faster
-                        false
-                    }
-                    None => {
-                        debug!("Network monitor channel closed");
-                        false
+                }
+                event = next_power_event(power_rx) => {
+                    if event == PowerEvent::WillSleep && self.wait_for_wake(power_rx).await {
+                        return true;
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl+C during backoff");
-                self.state = ConnectionState::Cleanup;
-                true
+        }
+    }
+
+    /// Returns true when shutdown was requested.
+    async fn wait_for_wake(&mut self, power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>) -> bool {
+        self.state = ConnectionState::WaitingForNetwork;
+        info!("System going to sleep — waiting for wake");
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => return true,
+                _ = tokio::time::sleep(MONITOR_FALLBACK_TIMEOUT) => {
+                    warn!("No wake notification after 15s — retrying with bounded connect timeout");
+                    return false;
+                }
+                event = next_power_event(power_rx) => {
+                    if event == PowerEvent::HasPoweredOn {
+                        info!("System woke up — reconnecting");
+                        self.backoff.reset();
+                        return false;
+                    }
+                }
             }
         }
+    }
+
+    async fn wait_for_retry(
+        &mut self,
+        delay: Duration,
+        network_rx: &mut mpsc::UnboundedReceiver<NetworkEvent>,
+        power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+    ) -> RetryOutcome {
+        tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => RetryOutcome::Shutdown,
+            _ = tokio::time::sleep(delay) => RetryOutcome::Retry,
+            event = next_network_event(network_rx) => {
+                match event {
+                    NetworkEvent::Reachable => {
+                        info!("Network reachable — reconnecting immediately");
+                        self.backoff.reset();
+                        RetryOutcome::Retry
+                    }
+                    NetworkEvent::Unreachable => {
+                        if self.wait_for_network(network_rx, power_rx).await {
+                            RetryOutcome::Shutdown
+                        } else {
+                            RetryOutcome::Retry
+                        }
+                    }
+                }
+            }
+            event = next_power_event(power_rx) => {
+                if event == PowerEvent::WillSleep && self.wait_for_wake(power_rx).await {
+                    RetryOutcome::Shutdown
+                } else {
+                    RetryOutcome::Retry
+                }
+            }
+        }
+    }
+}
+
+fn network_config_changed(old: &TunnelConfig, new: &TunnelConfig) -> bool {
+    old.ip_address != new.ip_address
+        || old.dns_servers != new.dns_servers
+        || old.routes != new.routes
+}
+
+fn apply_negotiated_ip(config: &mut TunnelConfig, negotiated_ip: std::net::Ipv4Addr) -> bool {
+    if config.ip_address == negotiated_ip {
+        return false;
+    }
+    config.ip_address = negotiated_ip;
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_cookie_rejection_reauthenticates_immediately() {
+        assert!(should_reauthenticate(&FortiError::CookieRejected(403), 1));
+    }
+
+    #[test]
+    fn repeated_ambiguous_failures_eventually_reauthenticate() {
+        let error = FortiError::PppError("timeout".into());
+        assert!(!should_reauthenticate(&error, 2));
+        assert!(should_reauthenticate(&error, 3));
+    }
+
+    #[test]
+    fn negotiated_ip_change_marks_network_config_changed() {
+        let mut config = TunnelConfig::parse(
+            r#"<sslvpn-tunnel><assigned-addr ipv4="10.0.0.2" /></sslvpn-tunnel>"#,
+        )
+        .unwrap();
+        let applied = config.clone();
+        let new_ip = "10.0.0.3".parse().unwrap();
+
+        assert!(apply_negotiated_ip(&mut config, new_ip));
+        assert_eq!(config.ip_address, new_ip);
+        assert!(network_config_changed(&applied, &config));
+    }
+
+    #[tokio::test]
+    async fn interruptible_operation_observes_shutdown() {
+        let shutdown = Shutdown::new();
+        let trigger = shutdown.clone();
+        let (_network_tx, mut network_rx) = mpsc::unbounded_channel();
+        let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+        trigger.cancel();
+        let result = interruptible(
+            std::future::pending::<()>(),
+            &shutdown,
+            &mut network_rx,
+            &mut power_rx,
+        )
+        .await;
+        assert_eq!(result, Err(Interrupt::Shutdown));
+    }
+
+    #[tokio::test]
+    async fn interruptible_operation_observes_network_loss() {
+        let shutdown = Shutdown::new();
+        let (network_tx, mut network_rx) = mpsc::unbounded_channel();
+        let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+        network_tx.send(NetworkEvent::Unreachable).unwrap();
+        let result = interruptible(
+            std::future::pending::<()>(),
+            &shutdown,
+            &mut network_rx,
+            &mut power_rx,
+        )
+        .await;
+        assert_eq!(result, Err(Interrupt::NetworkDown));
+    }
+
+    #[tokio::test]
+    async fn interruptible_operation_observes_sleep() {
+        let shutdown = Shutdown::new();
+        let (_network_tx, mut network_rx) = mpsc::unbounded_channel();
+        let (power_tx, mut power_rx) = mpsc::unbounded_channel();
+        power_tx.send(PowerEvent::WillSleep).unwrap();
+        let result = interruptible(
+            std::future::pending::<()>(),
+            &shutdown,
+            &mut network_rx,
+            &mut power_rx,
+        )
+        .await;
+        assert_eq!(result, Err(Interrupt::Sleep));
     }
 }

@@ -2,8 +2,56 @@ pub mod xml;
 
 use crate::error::{FortiError, Result};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
+
+const HTTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_AUTH_BODY_SIZE: usize = 4 * 1024 * 1024;
+
+async fn collect_auth_body(body: hyper::body::Incoming, context: &str) -> Result<bytes::Bytes> {
+    let limited = http_body_util::Limited::new(body, MAX_AUTH_BODY_SIZE);
+    let collected = tokio::time::timeout(
+        HTTP_OPERATION_TIMEOUT,
+        http_body_util::BodyExt::collect(limited),
+    )
+    .await
+    .map_err(|_| FortiError::TunnelError(format!("{} timed out after 30s", context)))?
+    .map_err(|e| FortiError::TunnelError(format!("{}: {}", context, e)))?;
+    Ok(collected.to_bytes())
+}
+
+/// Read a line from the controlling terminal without blocking a Tokio worker.
+/// kill_on_drop makes cancellation (including Ctrl+C) terminate the reader.
+async fn prompt_terminal(prompt: &str) -> Result<String> {
+    eprint!("{}", prompt);
+    std::io::Write::flush(&mut std::io::stderr())?;
+
+    let output = tokio::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("IFS= read -r line < /dev/tty && printf '%s' \"$line\"")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| FortiError::AuthFailed(format!("failed to read verification code: {}", e)))?;
+    if !output.status.success() {
+        return Err(FortiError::AuthFailed(
+            "failed to read verification code from terminal".into(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn send_auth_request(
+    sender: &mut hyper::client::conn::http1::SendRequest<http_body_util::Full<bytes::Bytes>>,
+    request: hyper::Request<http_body_util::Full<bytes::Bytes>>,
+    context: &str,
+) -> Result<hyper::Response<hyper::body::Incoming>> {
+    tokio::time::timeout(HTTP_OPERATION_TIMEOUT, sender.send_request(request))
+        .await
+        .map_err(|_| FortiError::TunnelError(format!("{} timed out after 30s", context)))?
+        .map_err(|e| FortiError::TunnelError(format!("{}: {}", context, e)))
+}
 
 #[derive(Debug)]
 pub struct AuthResult {
@@ -45,23 +93,28 @@ impl AuthClient {
         tokio_rustls::TlsConnector,
         rustls::pki_types::ServerName<'static>,
     )> {
-        let connector = tokio_rustls::TlsConnector::from(self.tls_config.clone());
-        let server_name = rustls::pki_types::ServerName::try_from(self.server.clone())
-            .map_err(|e| FortiError::TunnelError(format!("invalid server name: {}", e)))?;
+        tokio::time::timeout(HTTP_OPERATION_TIMEOUT, async {
+            let connector = tokio_rustls::TlsConnector::from(self.tls_config.clone());
+            let server_name = rustls::pki_types::ServerName::try_from(self.server.clone())
+                .map_err(|e| FortiError::TunnelError(format!("invalid server name: {}", e)))?;
 
-        let tcp = tokio::net::TcpStream::connect(format!("{}:{}", self.server, self.port)).await?;
-        let tls = connector
-            .connect(server_name.clone(), tcp)
-            .await
-            .map_err(|e| FortiError::TunnelError(format!("TLS connect failed: {}", e)))?;
+            let tcp =
+                tokio::net::TcpStream::connect(format!("{}:{}", self.server, self.port)).await?;
+            let tls = connector
+                .connect(server_name.clone(), tcp)
+                .await
+                .map_err(|e| FortiError::TunnelError(format!("TLS connect failed: {}", e)))?;
 
-        let io = hyper_util::rt::TokioIo::new(tls);
-        let (sender, conn) = hyper::client::conn::http1::handshake(io)
-            .await
-            .map_err(|e| FortiError::TunnelError(format!("HTTP handshake failed: {}", e)))?;
+            let io = hyper_util::rt::TokioIo::new(tls);
+            let (sender, conn) = hyper::client::conn::http1::handshake(io)
+                .await
+                .map_err(|e| FortiError::TunnelError(format!("HTTP handshake failed: {}", e)))?;
 
-        tokio::spawn(conn);
-        Ok((sender, connector, server_name))
+            tokio::spawn(conn);
+            Ok((sender, connector, server_name))
+        })
+        .await
+        .map_err(|_| FortiError::TunnelError("HTTP connection timed out after 30s".into()))?
     }
 
     pub async fn login(
@@ -99,10 +152,7 @@ impl AuthClient {
             .map_err(FortiError::Http)?;
 
         info!("Sending login request");
-        let resp = sender
-            .send_request(req)
-            .await
-            .map_err(|e| FortiError::TunnelError(format!("login request failed: {}", e)))?;
+        let resp = send_auth_request(&mut sender, req, "login request failed").await?;
 
         let status = resp.status();
         debug!("Login response status: {}", status);
@@ -110,11 +160,9 @@ impl AuthClient {
         log_set_cookie_headers(&resp);
         let svpn_cookie = extract_svpncookie(&resp);
 
-        // Read the response body for 2FA detection
-        let resp_body = http_body_util::BodyExt::collect(resp.into_body())
-            .await
-            .map_err(|e| FortiError::TunnelError(format!("failed to read login body: {}", e)))?;
-        let resp_text = String::from_utf8_lossy(&resp_body.to_bytes()).to_string();
+        // Read the response body for 2FA detection, with a time and size bound.
+        let resp_body = collect_auth_body(resp.into_body(), "failed to read login body").await?;
+        let resp_text = String::from_utf8_lossy(&resp_body).to_string();
 
         // Check for 2FA requirement
         let svpn_cookie = if let Some(cookie) = svpn_cookie {
@@ -199,16 +247,12 @@ impl AuthClient {
         }
 
         // Prompt user for OTP code
-        eprint!("{}: ", chal_msg);
-        std::io::Write::flush(&mut std::io::stderr())?;
-        let mut code = String::new();
-        std::io::stdin().read_line(&mut code)?;
-        let code = code.trim();
+        let code = prompt_terminal(&format!("{}: ", chal_msg)).await?;
 
         let body = format!(
             "username={}&code={}&reqid={}&polid={}&grp={}&portal={}&peer={}&magic={}",
             urlencoded(username),
-            urlencoded(code),
+            urlencoded(&code),
             urlencoded(reqid),
             urlencoded(polid),
             urlencoded(grp),
@@ -228,16 +272,12 @@ impl AuthClient {
         let grpid = extract_html_field(html, "grpid").unwrap_or_default();
 
         info!("2FA required (HTML form)");
-        eprint!("Enter verification code: ");
-        std::io::Write::flush(&mut std::io::stderr())?;
-        let mut code = String::new();
-        std::io::stdin().read_line(&mut code)?;
-        let code = code.trim();
+        let code = prompt_terminal("Enter verification code: ").await?;
 
         let body = format!(
             "username={}&code={}&reqid={}&grpid={}&magic={}",
             urlencoded(username),
-            urlencoded(code),
+            urlencoded(&code),
             urlencoded(&reqid),
             urlencoded(&grpid),
             urlencoded(&magic),
@@ -263,10 +303,7 @@ impl AuthClient {
             .map_err(FortiError::Http)?;
 
         debug!("Sending 2FA verification");
-        let resp = sender
-            .send_request(req)
-            .await
-            .map_err(|e| FortiError::TunnelError(format!("2FA request failed: {}", e)))?;
+        let resp = send_auth_request(&mut sender, req, "2FA request failed").await?;
 
         debug!("2FA response status: {}", resp.status());
 
@@ -336,10 +373,7 @@ impl AuthClient {
             .map_err(FortiError::Http)?;
 
         debug!("Exchanging SAML session ID for SVPNCOOKIE");
-        let resp = sender
-            .send_request(req)
-            .await
-            .map_err(|e| FortiError::TunnelError(format!("SAML auth_id request failed: {}", e)))?;
+        let resp = send_auth_request(&mut sender, req, "SAML auth_id request failed").await?;
 
         debug!("SAML auth_id response status: {}", resp.status());
         log_set_cookie_headers(&resp);
@@ -374,47 +408,41 @@ impl AuthClient {
             .map_err(FortiError::Http)?;
 
         debug!("Reserving tunnel resources");
-        let resp = sender
-            .send_request(req)
-            .await
-            .map_err(|e| FortiError::TunnelError(format!("resource reservation failed: {}", e)))?;
+        let resp = send_auth_request(&mut sender, req, "resource reservation failed").await?;
         debug!("Resource reservation status: {}", resp.status());
-        let _ = http_body_util::BodyExt::collect(resp.into_body()).await;
+        if matches!(resp.status().as_u16(), 401 | 403) {
+            return Err(FortiError::CookieRejected(resp.status().as_u16()));
+        }
+        let _ = collect_auth_body(resp.into_body(), "resource reservation body").await?;
 
         // XML config
-        let req = hyper::Request::builder()
-            .method("GET")
-            .uri("/remote/fortisslvpn_xml?dual_stack=1")
-            .header("Host", &self.server)
-            .header("User-Agent", "Mozilla/5.0 SV1")
-            .header("Cookie", format!("SVPNCOOKIE={}", svpn_cookie))
-            .body(http_body_util::Full::new(bytes::Bytes::new()))
-            .map_err(FortiError::Http)?;
+        let make_xml_request = || {
+            hyper::Request::builder()
+                .method("GET")
+                .uri("/remote/fortisslvpn_xml?dual_stack=1")
+                .header("Host", &self.server)
+                .header("User-Agent", "Mozilla/5.0 SV1")
+                .header("Cookie", format!("SVPNCOOKIE={}", svpn_cookie))
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .map_err(FortiError::Http)
+        };
 
         debug!("Fetching tunnel configuration");
-        let resp = match sender.send_request(req).await {
+        let req = make_xml_request()?;
+        let resp = match send_auth_request(&mut sender, req, "XML config request failed").await {
             Ok(resp) => resp,
             Err(_) => {
                 debug!("Reopening connection for XML config fetch");
                 let (mut sender2, _, _) = self.new_http_connection().await?;
-                let req = hyper::Request::builder()
-                    .method("GET")
-                    .uri("/remote/fortisslvpn_xml?dual_stack=1")
-                    .header("Host", &self.server)
-                    .header("User-Agent", "Mozilla/5.0 SV1")
-                    .header("Cookie", format!("SVPNCOOKIE={}", svpn_cookie))
-                    .body(http_body_util::Full::new(bytes::Bytes::new()))
-                    .map_err(FortiError::Http)?;
-                sender2.send_request(req).await.map_err(|e| {
-                    FortiError::TunnelError(format!("XML config request failed: {}", e))
-                })?
+                send_auth_request(&mut sender2, make_xml_request()?, "XML config retry failed")
+                    .await?
             }
         };
+        if matches!(resp.status().as_u16(), 401 | 403) {
+            return Err(FortiError::CookieRejected(resp.status().as_u16()));
+        }
 
-        let body = http_body_util::BodyExt::collect(resp.into_body())
-            .await
-            .map_err(|e| FortiError::TunnelError(format!("failed to read XML body: {}", e)))?;
-        let body_bytes = body.to_bytes();
+        let body_bytes = collect_auth_body(resp.into_body(), "failed to read XML body").await?;
         let xml_text = String::from_utf8_lossy(&body_bytes);
         debug!("Received XML config ({} bytes)", xml_text.len());
 
@@ -513,14 +541,33 @@ async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Resu
 
         debug!("SAML callback connection from {}", addr);
 
-        // Read the HTTP request with a per-connection timeout to prevent slowloris DoS
-        let mut buf = vec![0u8; 4096];
-        let n = match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
-            .await
+        // Read through the complete HTTP header. A browser may split the
+        // request line or headers across arbitrary TCP packets.
+        let request_bytes = match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut request = Vec::with_capacity(1024);
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    return Ok::<Option<Vec<u8>>, std::io::Error>(None);
+                }
+                request.extend_from_slice(&chunk[..n]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    return Ok(Some(request));
+                }
+                if request.len() > 16 * 1024 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "SAML callback header exceeds 16 KiB",
+                    ));
+                }
+            }
+        })
+        .await
         {
-            Ok(Ok(n)) if n > 0 => n,
-            Ok(Ok(_)) => {
-                debug!("SAML callback: connection closed without data");
+            Ok(Ok(Some(request))) => request,
+            Ok(Ok(None)) => {
+                debug!("SAML callback: connection closed before complete headers");
                 let _ = stream.shutdown().await;
                 continue;
             }
@@ -535,7 +582,7 @@ async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Resu
                 continue;
             }
         };
-        let request = String::from_utf8_lossy(&buf[..n]);
+        let request = String::from_utf8_lossy(&request_bytes);
 
         // Log method only — request line contains session ID in the URL
         if let Some(request_line) = request.lines().next() {
@@ -652,5 +699,27 @@ mod tests {
     fn test_redact_empty_svpncookie() {
         let input = "SVPNCOOKIE=; path=/";
         assert_eq!(redact_set_cookie(input), "SVPNCOOKIE=<redacted>");
+    }
+
+    #[tokio::test]
+    async fn fragmented_saml_callback_is_accepted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(wait_for_saml_callback_inner(listener));
+
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(b"GET /callback?i").await.unwrap();
+        tokio::task::yield_now().await;
+        client
+            .write_all(b"d=session-123 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+
+        let session_id = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("callback must not wait for the five-minute outer timeout")
+            .unwrap()
+            .unwrap();
+        assert_eq!(session_id, "session-123");
     }
 }
