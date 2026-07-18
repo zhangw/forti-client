@@ -268,12 +268,12 @@ fn classify_tunnel_connect_error(error: &FortiError) -> ConnectFailureKind {
         FortiError::CookieRejected(_) => ConnectFailureKind::CookieRejected,
         FortiError::PostUpgradeNegotiation(_)
         | FortiError::ProtocolError(_)
+        | FortiError::PppError(_)
         | FortiError::TunnelClosed => ConnectFailureKind::PostUpgrade,
         FortiError::TransportUnavailable(_)
         | FortiError::Io(_)
         | FortiError::Tls(_)
         | FortiError::TunnelError(_)
-        | FortiError::PppError(_)
         | FortiError::AuthFailed(_)
         | FortiError::SamlCallbackTimedOut
         | FortiError::SamlCallbackInvalid(_)
@@ -287,7 +287,193 @@ struct ConnectFailure {
     source: FortiError,
 }
 
-type ConnectedTunnel = (TlsTunnel, crate::ppp::lcp::LcpState, std::net::Ipv4Addr);
+type ConnectedTunnel<Tunnel, Lcp> = (Tunnel, Lcp, std::net::Ipv4Addr);
+type DriverConnectResult<Tunnel, Lcp> =
+    std::result::Result<ConnectedTunnel<Tunnel, Lcp>, ConnectFailure>;
+type DriverFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + 'a>>;
+
+trait ControllerDriver {
+    type Tun;
+    type Tunnel;
+    type Lcp;
+
+    fn setup_tun<'a>(
+        &'a mut self,
+        config: &'a TunnelConfig,
+        shutdown: &'a Shutdown,
+    ) -> DriverFuture<'a, Result<(Self::Tun, String)>>;
+    fn cleanup_tun<'a>(
+        &'a mut self,
+        config: &'a TunnelConfig,
+        iface_name: &'a str,
+    ) -> DriverFuture<'a, ()>;
+    fn start_monitors(
+        &mut self,
+        server: &str,
+    ) -> Result<(
+        mpsc::UnboundedReceiver<NetworkEvent>,
+        mpsc::UnboundedReceiver<PowerEvent>,
+    )>;
+    fn authenticate<'a>(&'a mut self, params: &'a AuthParams) -> DriverFuture<'a, Result<String>>;
+    fn fetch_tunnel_config<'a>(
+        &'a mut self,
+        params: &'a AuthParams,
+        cookie: &'a str,
+    ) -> DriverFuture<'a, Result<TunnelConfig>>;
+    fn connect_tunnel<'a>(
+        &'a mut self,
+        params: &'a AuthParams,
+        cookie: &'a str,
+    ) -> DriverFuture<'a, DriverConnectResult<Self::Tunnel, Self::Lcp>>;
+    fn event_loop<'a>(
+        &'a mut self,
+        tunnel: &'a mut Self::Tunnel,
+        lcp: &'a mut Self::Lcp,
+        tun: &'a Self::Tun,
+        shutdown: &'a Shutdown,
+        power_rx: &'a mut mpsc::UnboundedReceiver<PowerEvent>,
+    ) -> DriverFuture<'a, DisconnectReason>;
+    fn send_terminate<'a>(
+        &'a mut self,
+        tunnel: &'a mut Self::Tunnel,
+        lcp: &'a mut Self::Lcp,
+    ) -> DriverFuture<'a, Result<()>>;
+}
+
+#[derive(Default)]
+struct ProductionDriver {
+    network_monitor: Option<NetworkMonitor>,
+    power_monitor: Option<PowerMonitor>,
+}
+
+impl ControllerDriver for ProductionDriver {
+    type Tun = tun_rs::AsyncDevice;
+    type Tunnel = TlsTunnel;
+    type Lcp = crate::ppp::lcp::LcpState;
+
+    fn setup_tun<'a>(
+        &'a mut self,
+        config: &'a TunnelConfig,
+        shutdown: &'a Shutdown,
+    ) -> DriverFuture<'a, Result<(Self::Tun, String)>> {
+        Box::pin(vpn::setup_tun(config, shutdown))
+    }
+
+    fn cleanup_tun<'a>(
+        &'a mut self,
+        config: &'a TunnelConfig,
+        iface_name: &'a str,
+    ) -> DriverFuture<'a, ()> {
+        Box::pin(vpn::cleanup_tun(config, iface_name))
+    }
+
+    fn start_monitors(
+        &mut self,
+        server: &str,
+    ) -> Result<(
+        mpsc::UnboundedReceiver<NetworkEvent>,
+        mpsc::UnboundedReceiver<PowerEvent>,
+    )> {
+        let (network_monitor, network_rx) = NetworkMonitor::start(server)
+            .map_err(|error| FortiError::TunnelError(format!("network monitor failed: {error}")))?;
+        self.network_monitor = Some(network_monitor);
+        let (power_monitor, power_rx) = PowerMonitor::start()
+            .map_err(|error| FortiError::TunnelError(format!("power monitor failed: {error}")))?;
+        self.power_monitor = Some(power_monitor);
+        Ok((network_rx, power_rx))
+    }
+
+    fn authenticate<'a>(&'a mut self, params: &'a AuthParams) -> DriverFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let auth_client = AuthClient::new(&params.server, params.port, params.enable_keylog)?;
+            if params.saml {
+                info!("Re-authenticating via SAML...");
+                auth_client.authenticate_saml().await
+            } else {
+                let username = params
+                    .username
+                    .as_deref()
+                    .ok_or_else(|| FortiError::AuthFailed("no username for re-auth".into()))?;
+                let password = params
+                    .password
+                    .as_ref()
+                    .ok_or_else(|| FortiError::AuthFailed("no password for re-auth".into()))?;
+                info!("Re-authenticating with credentials...");
+                auth_client
+                    .authenticate_credentials(
+                        username,
+                        password.expose_secret(),
+                        params.realm.as_deref(),
+                    )
+                    .await
+            }
+        })
+    }
+
+    fn fetch_tunnel_config<'a>(
+        &'a mut self,
+        params: &'a AuthParams,
+        cookie: &'a str,
+    ) -> DriverFuture<'a, Result<TunnelConfig>> {
+        Box::pin(async move {
+            AuthClient::new(&params.server, params.port, params.enable_keylog)?
+                .fetch_tunnel_config(cookie)
+                .await
+        })
+    }
+
+    fn connect_tunnel<'a>(
+        &'a mut self,
+        params: &'a AuthParams,
+        cookie: &'a str,
+    ) -> DriverFuture<'a, DriverConnectResult<Self::Tunnel, Self::Lcp>> {
+        Box::pin(async move {
+            let mut tunnel = TlsTunnel::connect(
+                &params.server,
+                params.port,
+                cookie,
+                params.tls_config.clone(),
+            )
+            .await
+            .map_err(|source| ConnectFailure {
+                kind: classify_tunnel_connect_error(&source),
+                source,
+            })?;
+
+            let mut ppp = PppEngine::new(1500);
+            let ipcp_config =
+                ppp.negotiate(&mut tunnel)
+                    .await
+                    .map_err(|source| ConnectFailure {
+                        kind: classify_tunnel_connect_error(&source),
+                        source,
+                    })?;
+            Ok((tunnel, ppp.into_lcp(), ipcp_config.ip_address))
+        })
+    }
+
+    fn event_loop<'a>(
+        &'a mut self,
+        tunnel: &'a mut Self::Tunnel,
+        lcp: &'a mut Self::Lcp,
+        tun: &'a Self::Tun,
+        shutdown: &'a Shutdown,
+        power_rx: &'a mut mpsc::UnboundedReceiver<PowerEvent>,
+    ) -> DriverFuture<'a, DisconnectReason> {
+        Box::pin(vpn::event_loop(tunnel, lcp, tun, shutdown, power_rx))
+    }
+
+    fn send_terminate<'a>(
+        &'a mut self,
+        tunnel: &'a mut Self::Tunnel,
+        lcp: &'a mut Self::Lcp,
+    ) -> DriverFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let frame = PppFrame::new(PppProtocol::Lcp, lcp.build_terminate_request());
+            tunnel.send_frame(frame.encode()).await
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Interrupt {
@@ -361,44 +547,93 @@ impl ReconnectController {
         }
     }
 
-    /// Run until shutdown or an unrecoverable local setup error. Once TUN setup
-    /// succeeds, every return path passes through final route/DNS cleanup.
+    /// Run until shutdown or an unrecoverable local setup error.
     pub async fn run(&mut self) -> Result<()> {
-        let (mut tun_dev, mut iface_name) =
-            match vpn::setup_tun(&self.tunnel_config, &self.shutdown).await {
+        self.run_with_driver(&mut ProductionDriver::default()).await
+    }
+
+    async fn run_with_driver<Driver: ControllerDriver>(
+        &mut self,
+        driver: &mut Driver,
+    ) -> Result<()> {
+        let (initial_tun, mut iface_name) =
+            match driver.setup_tun(&self.tunnel_config, &self.shutdown).await {
                 Ok(setup) => setup,
                 Err(_) if self.shutdown.is_cancelled() => return Ok(()),
                 Err(error) => return Err(error),
             };
+        let mut tun_dev = Some(initial_tun);
         let mut applied_config = self.tunnel_config.clone();
+        let mut setup_active = true;
         info!("Press Ctrl+C to disconnect.");
 
-        let (_network_monitor, mut network_rx) =
-            match NetworkMonitor::start(&self.auth_params.server) {
-                Ok(value) => value,
-                Err(e) => {
-                    vpn::cleanup_tun(&applied_config, &iface_name).await;
-                    return Err(FortiError::TunnelError(format!(
-                        "network monitor failed: {}",
-                        e
-                    )));
-                }
-            };
-        let (_power_monitor, mut power_rx) = match PowerMonitor::start() {
-            Ok(value) => value,
-            Err(e) => {
-                vpn::cleanup_tun(&applied_config, &iface_name).await;
-                return Err(FortiError::TunnelError(format!(
-                    "power monitor failed: {}",
-                    e
-                )));
+        let (mut network_rx, mut power_rx) = match driver.start_monitors(&self.auth_params.server) {
+            Ok(receivers) => receivers,
+            Err(error) => {
+                driver.cleanup_tun(&applied_config, &iface_name).await;
+                return Err(error);
             }
         };
 
         let shutdown = self.shutdown.clone();
         let mut terminal_error: Option<FortiError> = None;
+        let mut pending_config_refresh = false;
 
         'reconnect: loop {
+            if pending_config_refresh {
+                self.state = ConnectionState::Authenticating;
+                match interruptible(
+                    driver.fetch_tunnel_config(&self.auth_params, &self.svpn_cookie),
+                    &shutdown,
+                    &mut network_rx,
+                    &mut power_rx,
+                )
+                .await
+                {
+                    Ok(Ok(config)) => {
+                        self.tunnel_config = config;
+                        pending_config_refresh = false;
+                        self.policy.on_saml_success();
+                        continue;
+                    }
+                    Ok(Err(FortiError::CookieRejected(status))) => {
+                        warn!(
+                            status,
+                            "New session cookie was rejected while fetching config"
+                        );
+                        pending_config_refresh = false;
+                        self.policy
+                            .on_connect_failure(ConnectFailureKind::CookieRejected);
+                        continue;
+                    }
+                    Ok(Err(error)) => {
+                        warn!(error = %error, "Tunnel config refresh failed; retrying without authentication");
+                        let delay = self.policy.next_delay();
+                        if self
+                            .wait_for_retry(delay, &mut network_rx, &mut power_rx)
+                            .await
+                            == RetryOutcome::Shutdown
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(Interrupt::Shutdown) => break,
+                    Err(Interrupt::Sleep) => {
+                        if self.wait_for_wake(&mut power_rx).await {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(Interrupt::NetworkDown) => {
+                        if self.wait_for_network(&mut network_rx, &mut power_rx).await {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
+
             if let Some(attempt_kind) = self.policy.next_auth_attempt() {
                 self.state = ConnectionState::Authenticating;
                 info!(
@@ -408,22 +643,20 @@ impl ReconnectController {
                     attempt_kind = ?attempt_kind,
                     "Starting reconnect authentication attempt"
                 );
-
-                // A definitively rejected cookie must never be retried. An
-                // optional compatibility probe keeps the old cookie available
-                // if the SAML path itself times out.
                 prepare_cookie_for_auth(attempt_kind, &mut self.svpn_cookie);
                 match interruptible(
-                    self.re_authenticate(),
+                    driver.authenticate(&self.auth_params),
                     &shutdown,
                     &mut network_rx,
                     &mut power_rx,
                 )
                 .await
                 {
-                    Ok(Ok(())) => {
-                        info!("Re-authentication successful, retrying tunnel");
-                        self.policy.on_saml_success();
+                    Ok(Ok(cookie)) => {
+                        // Save the cookie before config I/O. A transient config
+                        // failure must retry with this cookie, not reopen SAML.
+                        self.svpn_cookie = cookie;
+                        pending_config_refresh = true;
                         continue;
                     }
                     Ok(Err(auth_error)) => {
@@ -468,7 +701,7 @@ impl ReconnectController {
 
             self.state = ConnectionState::EstablishingTunnel;
             let connect_result = match interruptible(
-                self.connect_tunnel(),
+                driver.connect_tunnel(&self.auth_params, &self.svpn_cookie),
                 &shutdown,
                 &mut network_rx,
                 &mut power_rx,
@@ -493,8 +726,6 @@ impl ReconnectController {
 
             let (mut tunnel, mut lcp, negotiated_ip) = match connect_result {
                 Ok(connected) => {
-                    // This is the sole backoff reset point: TLS and PPP both
-                    // succeeded, ending the reconnect episode.
                     self.policy.on_tunnel_established();
                     connected
                 }
@@ -512,13 +743,7 @@ impl ReconnectController {
                     if self.policy.auth_requirement() != AuthRequirement::NotRequired {
                         continue;
                     }
-
                     let delay = self.policy.next_delay();
-                    warn!(
-                        state = ?ConnectionState::WaitingToRetry,
-                        backoff_ms = delay.as_millis() as u64,
-                        "Backing off before tunnel retry"
-                    );
                     if self
                         .wait_for_retry(delay, &mut network_rx, &mut power_rx)
                         .await
@@ -530,27 +755,25 @@ impl ReconnectController {
                 }
             };
 
-            // IPCP is authoritative for the address used by this tunnel. A
-            // reconnect may assign a new IP even when no full re-auth occurred.
             if apply_negotiated_ip(&mut self.tunnel_config, negotiated_ip) {
                 info!("IPCP assigned a new address: {}", negotiated_ip);
             }
 
-            // Re-authentication can change routes or DNS without changing the IP.
-            // Recreate the interface for any applied network-config change so old
-            // routes are removed and final cleanup refers to the correct config.
             if network_config_changed(&applied_config, &self.tunnel_config) {
                 warn!("VPN network configuration changed — recreating TUN device");
-                vpn::cleanup_tun(&applied_config, &iface_name).await;
-                match vpn::setup_tun(&self.tunnel_config, &shutdown).await {
+                driver.cleanup_tun(&applied_config, &iface_name).await;
+                setup_active = false;
+                drop(tun_dev.take());
+                match driver.setup_tun(&self.tunnel_config, &shutdown).await {
                     Ok((new_tun, new_iface)) => {
-                        tun_dev = new_tun;
+                        tun_dev = Some(new_tun);
                         iface_name = new_iface;
                         applied_config = self.tunnel_config.clone();
+                        setup_active = true;
                     }
                     Err(_) if shutdown.is_cancelled() => break 'reconnect,
-                    Err(e) => {
-                        terminal_error = Some(e);
+                    Err(error) => {
+                        terminal_error = Some(error);
                         break 'reconnect;
                     }
                 }
@@ -558,13 +781,20 @@ impl ReconnectController {
 
             info!("Tunnel established, entering data plane");
             self.state = ConnectionState::Running;
-            let reason =
-                vpn::event_loop(&mut tunnel, &mut lcp, &tun_dev, &shutdown, &mut power_rx).await;
+            let reason = driver
+                .event_loop(
+                    &mut tunnel,
+                    &mut lcp,
+                    tun_dev.as_ref().expect("active setup has a TUN device"),
+                    &shutdown,
+                    &mut power_rx,
+                )
+                .await;
 
             if should_send_terminate(&reason) {
                 let _ = tokio::time::timeout(
                     TERMINATE_TIMEOUT,
-                    Self::send_terminate(&mut tunnel, &mut lcp),
+                    driver.send_terminate(&mut tunnel, &mut lcp),
                 )
                 .await;
             }
@@ -585,11 +815,6 @@ impl ReconnectController {
                 ReconnectAction::Exit => break,
                 ReconnectAction::RetryWithCookie | ReconnectAction::ReAuthenticate => {
                     let delay = self.policy.next_delay();
-                    info!(
-                        state = ?ConnectionState::WaitingToRetry,
-                        backoff_ms = delay.as_millis() as u64,
-                        "Backing off before reconnect"
-                    );
                     if self
                         .wait_for_retry(delay, &mut network_rx, &mut power_rx)
                         .await
@@ -602,85 +827,14 @@ impl ReconnectController {
         }
 
         self.state = ConnectionState::CleaningUp;
-        vpn::cleanup_tun(&applied_config, &iface_name).await;
+        if setup_active {
+            driver.cleanup_tun(&applied_config, &iface_name).await;
+        }
         info!("VPN disconnected.");
         match terminal_error {
             Some(error) => Err(error),
             None => Ok(()),
         }
-    }
-
-    async fn connect_tunnel(&self) -> std::result::Result<ConnectedTunnel, ConnectFailure> {
-        let mut tunnel = TlsTunnel::connect(
-            &self.auth_params.server,
-            self.auth_params.port,
-            &self.svpn_cookie,
-            self.auth_params.tls_config.clone(),
-        )
-        .await
-        .map_err(|source| ConnectFailure {
-            kind: classify_tunnel_connect_error(&source),
-            source,
-        })?;
-
-        let mut ppp = PppEngine::new(1500);
-        let ipcp_config = ppp
-            .negotiate(&mut tunnel)
-            .await
-            .map_err(|source| ConnectFailure {
-                kind: if matches!(source, FortiError::CookieRejected(_)) {
-                    ConnectFailureKind::CookieRejected
-                } else {
-                    ConnectFailureKind::PostUpgrade
-                },
-                source,
-            })?;
-        let lcp = ppp.into_lcp();
-        Ok((tunnel, lcp, ipcp_config.ip_address))
-    }
-
-    async fn re_authenticate(&mut self) -> Result<()> {
-        let auth_client = AuthClient::new(
-            &self.auth_params.server,
-            self.auth_params.port,
-            self.auth_params.enable_keylog,
-        )?;
-
-        let auth_result = if self.auth_params.saml {
-            info!("Re-authenticating via SAML...");
-            auth_client.login_saml().await?
-        } else {
-            let username = self
-                .auth_params
-                .username
-                .as_deref()
-                .ok_or_else(|| FortiError::AuthFailed("no username for re-auth".into()))?;
-            let password = self
-                .auth_params
-                .password
-                .as_ref()
-                .ok_or_else(|| FortiError::AuthFailed("no password for re-auth".into()))?;
-            info!("Re-authenticating with credentials...");
-            auth_client
-                .login(
-                    username,
-                    password.expose_secret(),
-                    self.auth_params.realm.as_deref(),
-                )
-                .await?
-        };
-
-        self.svpn_cookie = auth_result.svpn_cookie;
-        self.tunnel_config = auth_result.tunnel_config;
-        Ok(())
-    }
-
-    async fn send_terminate(
-        tunnel: &mut TlsTunnel,
-        lcp: &mut crate::ppp::lcp::LcpState,
-    ) -> Result<()> {
-        let frame = PppFrame::new(PppProtocol::Lcp, lcp.build_terminate_request());
-        tunnel.send_frame(frame.encode()).await
     }
 
     /// Returns true when shutdown was requested.
@@ -696,14 +850,13 @@ impl ReconnectController {
                 return true;
             }
             tokio::select! {
-                    _ = self.shutdown.cancelled() => return true,
+                _ = self.shutdown.cancelled() => return true,
                 _ = tokio::time::sleep(MONITOR_FALLBACK_TIMEOUT) => {
                     warn!("No network reachability update after 15s — retrying with bounded connect timeout");
                     return false;
                 }
                 event = next_network_event(network_rx) => {
                     if event == NetworkEvent::Reachable {
-                        info!("Network reachable — reconnecting");
                         self.policy.on_network_reachable();
                         return false;
                     }
@@ -720,20 +873,15 @@ impl ReconnectController {
     /// Returns true when shutdown was requested.
     async fn wait_for_wake(&mut self, power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>) -> bool {
         self.state = ConnectionState::WaitingForNetwork;
-        info!("System going to sleep — waiting for wake");
         loop {
             if self.shutdown.is_cancelled() {
                 return true;
             }
             tokio::select! {
-                    _ = self.shutdown.cancelled() => return true,
-                _ = tokio::time::sleep(MONITOR_FALLBACK_TIMEOUT) => {
-                    warn!("No wake notification after 15s — retrying with bounded connect timeout");
-                    return false;
-                }
+                _ = self.shutdown.cancelled() => return true,
+                _ = tokio::time::sleep(MONITOR_FALLBACK_TIMEOUT) => return false,
                 event = next_power_event(power_rx) => {
                     if event == PowerEvent::HasPoweredOn {
-                        info!("System woke up — reconnecting");
                         self.policy.on_system_wake();
                         return false;
                     }
@@ -758,7 +906,6 @@ impl ReconnectController {
             event = next_network_event(network_rx) => {
                 match event {
                     NetworkEvent::Reachable => {
-                        info!("Network reachable — reconnecting immediately");
                         self.policy.on_network_reachable();
                         RetryOutcome::Retry
                     }
@@ -924,5 +1071,543 @@ mod tests {
         )
         .await;
         assert_eq!(result, Err(Interrupt::Sleep));
+    }
+
+    use crate::auth::xml::Route;
+    use std::collections::VecDeque;
+    use std::net::Ipv4Addr;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    struct ScriptTun;
+    struct ScriptTunnel;
+    struct ScriptLcp;
+
+    enum ScriptConnect {
+        Failure(ConnectFailureKind),
+        Success(Ipv4Addr),
+        Sleep,
+    }
+
+    enum ScriptAuth {
+        Result(Result<String>),
+        NetworkDown,
+    }
+
+    struct ScriptDriver {
+        log: StdArc<Mutex<Vec<String>>>,
+        connects: VecDeque<ScriptConnect>,
+        auth: VecDeque<ScriptAuth>,
+        configs: VecDeque<Result<TunnelConfig>>,
+        events: VecDeque<DisconnectReason>,
+        network_tx: Option<mpsc::UnboundedSender<NetworkEvent>>,
+        power_tx: Option<mpsc::UnboundedSender<PowerEvent>>,
+        setup_calls: usize,
+        fail_setup_call: Option<usize>,
+    }
+
+    impl Default for ScriptDriver {
+        fn default() -> Self {
+            Self {
+                log: StdArc::new(Mutex::new(Vec::new())),
+                connects: VecDeque::new(),
+                auth: VecDeque::new(),
+                configs: VecDeque::new(),
+                events: VecDeque::new(),
+                network_tx: None,
+                power_tx: None,
+                setup_calls: 0,
+                fail_setup_call: None,
+            }
+        }
+    }
+
+    impl ScriptDriver {
+        fn record(&self, value: impl Into<String>) {
+            self.log.lock().unwrap().push(value.into());
+        }
+
+        fn snapshot(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl ControllerDriver for ScriptDriver {
+        type Tun = ScriptTun;
+        type Tunnel = ScriptTunnel;
+        type Lcp = ScriptLcp;
+
+        fn setup_tun<'a>(
+            &'a mut self,
+            config: &'a TunnelConfig,
+            _shutdown: &'a Shutdown,
+        ) -> DriverFuture<'a, Result<(Self::Tun, String)>> {
+            self.setup_calls += 1;
+            let call = self.setup_calls;
+            self.record(format!(
+                "setup:{}:{}:{}",
+                config.ip_address,
+                config
+                    .routes
+                    .first()
+                    .map(|route| route.ip)
+                    .unwrap_or(Ipv4Addr::UNSPECIFIED),
+                config
+                    .dns_servers
+                    .first()
+                    .copied()
+                    .unwrap_or(Ipv4Addr::UNSPECIFIED)
+            ));
+            let fail = self.fail_setup_call == Some(call);
+            Box::pin(async move {
+                if fail {
+                    Err(FortiError::TunnelError("scripted setup failure".into()))
+                } else {
+                    Ok((ScriptTun, format!("utun{call}")))
+                }
+            })
+        }
+
+        fn cleanup_tun<'a>(
+            &'a mut self,
+            config: &'a TunnelConfig,
+            iface_name: &'a str,
+        ) -> DriverFuture<'a, ()> {
+            self.record(format!(
+                "cleanup:{iface_name}:{}:{}:{}",
+                config.ip_address,
+                config
+                    .routes
+                    .first()
+                    .map(|route| route.ip)
+                    .unwrap_or(Ipv4Addr::UNSPECIFIED),
+                config
+                    .dns_servers
+                    .first()
+                    .copied()
+                    .unwrap_or(Ipv4Addr::UNSPECIFIED)
+            ));
+            Box::pin(async {})
+        }
+
+        fn start_monitors(
+            &mut self,
+            _server: &str,
+        ) -> Result<(
+            mpsc::UnboundedReceiver<NetworkEvent>,
+            mpsc::UnboundedReceiver<PowerEvent>,
+        )> {
+            let (network_tx, network_rx) = mpsc::unbounded_channel();
+            let (power_tx, power_rx) = mpsc::unbounded_channel();
+            self.network_tx = Some(network_tx);
+            self.power_tx = Some(power_tx);
+            Ok((network_rx, power_rx))
+        }
+
+        fn authenticate<'a>(
+            &'a mut self,
+            _params: &'a AuthParams,
+        ) -> DriverFuture<'a, Result<String>> {
+            self.record("auth");
+            match self.auth.pop_front().expect("missing scripted auth") {
+                ScriptAuth::Result(result) => Box::pin(async move { result }),
+                ScriptAuth::NetworkDown => {
+                    let tx = self.network_tx.as_ref().unwrap().clone();
+                    tx.send(NetworkEvent::Unreachable).unwrap();
+                    tx.send(NetworkEvent::Reachable).unwrap();
+                    Box::pin(std::future::pending())
+                }
+            }
+        }
+
+        fn fetch_tunnel_config<'a>(
+            &'a mut self,
+            _params: &'a AuthParams,
+            cookie: &'a str,
+        ) -> DriverFuture<'a, Result<TunnelConfig>> {
+            self.record(format!("config:{cookie}"));
+            let result = self.configs.pop_front().expect("missing scripted config");
+            Box::pin(async move { result })
+        }
+
+        fn connect_tunnel<'a>(
+            &'a mut self,
+            _params: &'a AuthParams,
+            cookie: &'a str,
+        ) -> DriverFuture<'a, DriverConnectResult<Self::Tunnel, Self::Lcp>> {
+            self.record(format!("connect:{cookie}"));
+            match self.connects.pop_front().expect("missing scripted connect") {
+                ScriptConnect::Failure(kind) => Box::pin(async move {
+                    let source = match kind {
+                        ConnectFailureKind::CookieRejected => FortiError::CookieRejected(403),
+                        ConnectFailureKind::PostUpgrade => {
+                            FortiError::PostUpgradeNegotiation("scripted".into())
+                        }
+                        _ => FortiError::TransportUnavailable(
+                            "scripted HTTP 503/transport failure".into(),
+                        ),
+                    };
+                    Err(ConnectFailure { kind, source })
+                }),
+                ScriptConnect::Success(ip) => {
+                    Box::pin(async move { Ok((ScriptTunnel, ScriptLcp, ip)) })
+                }
+                ScriptConnect::Sleep => {
+                    let tx = self.power_tx.as_ref().unwrap().clone();
+                    tx.send(PowerEvent::WillSleep).unwrap();
+                    tx.send(PowerEvent::HasPoweredOn).unwrap();
+                    Box::pin(std::future::pending())
+                }
+            }
+        }
+
+        fn event_loop<'a>(
+            &'a mut self,
+            _tunnel: &'a mut Self::Tunnel,
+            _lcp: &'a mut Self::Lcp,
+            _tun: &'a Self::Tun,
+            _shutdown: &'a Shutdown,
+            _power_rx: &'a mut mpsc::UnboundedReceiver<PowerEvent>,
+        ) -> DriverFuture<'a, DisconnectReason> {
+            self.record("event_loop");
+            let reason = self.events.pop_front().expect("missing scripted event");
+            Box::pin(async move { reason })
+        }
+
+        fn send_terminate<'a>(
+            &'a mut self,
+            _tunnel: &'a mut Self::Tunnel,
+            _lcp: &'a mut Self::Lcp,
+        ) -> DriverFuture<'a, Result<()>> {
+            self.record("terminate");
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn config(ip: [u8; 4], route: [u8; 4], dns: [u8; 4]) -> TunnelConfig {
+        TunnelConfig {
+            ip_address: Ipv4Addr::from(ip),
+            dns_servers: vec![Ipv4Addr::from(dns)],
+            routes: vec![Route {
+                ip: Ipv4Addr::from(route),
+                mask: Ipv4Addr::new(255, 255, 255, 0),
+            }],
+            idle_timeout: None,
+            auth_timeout: None,
+            dtls_port: None,
+            fos_version: None,
+            tunnel_method: "ppp".into(),
+        }
+    }
+
+    fn controller(initial: TunnelConfig, shutdown: Shutdown) -> ReconnectController {
+        let auth_client = AuthClient::new("vpn.example", 443, false).unwrap();
+        ReconnectController::new(
+            AuthParams {
+                server: "vpn.example".into(),
+                port: 443,
+                saml: true,
+                username: None,
+                password: None,
+                realm: None,
+                tls_config: auth_client.tls_config(),
+                enable_keylog: false,
+            },
+            "old-cookie".into(),
+            initial,
+            shutdown,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_transport_and_http_5xx_failures_never_open_saml() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let shutdown = Shutdown::new();
+        let mut controller = controller(initial, shutdown);
+        let mut driver = ScriptDriver::default();
+        driver.connects.extend([
+            ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
+            ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
+            ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
+            ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
+            ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+        ]);
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 0);
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.starts_with("connect:"))
+                .count(),
+            6
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_old_cookie_and_saml_timeout_never_reuses_old_cookie() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let shutdown = Shutdown::new();
+        let trigger = shutdown.clone();
+        let mut controller = controller(initial, shutdown);
+        let mut driver = ScriptDriver::default();
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Err(FortiError::SamlCallbackTimedOut)));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Err(FortiError::SamlCallbackTimedOut)));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            trigger.cancel();
+        });
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let connects: Vec<_> = driver
+            .snapshot()
+            .into_iter()
+            .filter(|entry| entry.starts_with("connect:"))
+            .collect();
+        assert_eq!(connects, ["connect:old-cookie"]);
+        assert!(controller.svpn_cookie.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_cookie_survives_config_timeout_and_config_only_retry() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("new-cookie".into())));
+        driver
+            .configs
+            .push_back(Err(FortiError::TransportUnavailable(
+                "config timed out".into(),
+            )));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 1);
+        assert_eq!(
+            log.iter()
+                .filter(|entry| *entry == "config:new-cookie")
+                .count(),
+            2
+        );
+        assert!(log.contains(&"connect:new-cookie".to_string()));
+        assert_eq!(controller.svpn_cookie, "new-cookie");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn compatibility_probe_runs_once_per_reconnect_episode() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        for _ in 0..5 {
+            driver
+                .connects
+                .push_back(ScriptConnect::Failure(ConnectFailureKind::PostUpgrade));
+        }
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Err(FortiError::SamlCallbackTimedOut)));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        assert_eq!(
+            driver
+                .snapshot()
+                .iter()
+                .filter(|entry| *entry == "auth")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sleep_during_connect_and_network_loss_during_auth_are_interruptible() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        driver.connects.extend([
+            ScriptConnect::Sleep,
+            ScriptConnect::Failure(ConnectFailureKind::CookieRejected),
+        ]);
+        driver.auth.push_back(ScriptAuth::NetworkDown);
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("new-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 2);
+        assert!(log.contains(&"connect:new-cookie".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_backoff_runs_final_cleanup() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let shutdown = Shutdown::new();
+        let trigger = shutdown.clone();
+        let mut controller = controller(initial, shutdown);
+        let mut driver = ScriptDriver::default();
+        driver.connects.push_back(ScriptConnect::Failure(
+            ConnectFailureKind::TransportUnavailable,
+        ));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            trigger.cancel();
+        });
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        assert_eq!(
+            driver
+                .snapshot()
+                .iter()
+                .filter(|entry| entry.starts_with("cleanup:"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_network_config_component_change_rebuilds_and_cleans_new_setup() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let cases = [
+            (
+                "ip",
+                config([10, 9, 0, 8], [10, 1, 0, 0], [10, 0, 0, 53]),
+                Ipv4Addr::new(10, 9, 0, 8),
+            ),
+            (
+                "route",
+                config([10, 0, 0, 2], [172, 16, 0, 0], [10, 0, 0, 53]),
+                Ipv4Addr::new(10, 0, 0, 2),
+            ),
+            (
+                "dns",
+                config([10, 0, 0, 2], [10, 1, 0, 0], [10, 9, 0, 53]),
+                Ipv4Addr::new(10, 0, 0, 2),
+            ),
+        ];
+
+        for (component, changed, negotiated_ip) in cases {
+            let mut controller = controller(initial.clone(), Shutdown::new());
+            let mut driver = ScriptDriver::default();
+            driver
+                .connects
+                .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+            driver
+                .auth
+                .push_back(ScriptAuth::Result(Ok("new-cookie".into())));
+            driver.configs.push_back(Ok(changed.clone()));
+            driver
+                .connects
+                .push_back(ScriptConnect::Success(negotiated_ip));
+            driver.events.push_back(DisconnectReason::UserQuit);
+
+            controller.run_with_driver(&mut driver).await.unwrap();
+            let log = driver.snapshot();
+            assert_eq!(
+                log.iter()
+                    .filter(|entry| entry.starts_with("setup:"))
+                    .count(),
+                2,
+                "{component} change must rebuild the setup"
+            );
+            let cleanups: Vec<_> = log
+                .iter()
+                .filter(|entry| entry.starts_with("cleanup:"))
+                .collect();
+            assert_eq!(
+                cleanups.len(),
+                2,
+                "{component} change must clean old and replacement setups"
+            );
+            assert!(cleanups[0].contains("10.0.0.2"));
+            assert!(cleanups[1].contains(&changed.ip_address.to_string()));
+            assert!(cleanups[1].contains(&changed.routes[0].ip.to_string()));
+            assert!(cleanups[1].contains(&changed.dns_servers[0].to_string()));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn config_cookie_rejection_returns_to_fresh_authentication() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("first-new-cookie".into())));
+        driver
+            .configs
+            .push_back(Err(FortiError::CookieRejected(403)));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("second-new-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 2);
+        assert!(log.contains(&"config:first-new-cookie".to_string()));
+        assert!(log.contains(&"config:second-new-cookie".to_string()));
+        assert_eq!(controller.svpn_cookie, "second-new-cookie");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_setup_failure_does_not_double_cleanup_old_setup() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver {
+            fail_setup_call: Some(2),
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 9)));
+
+        assert!(controller.run_with_driver(&mut driver).await.is_err());
+        let log = driver.snapshot();
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.starts_with("setup:"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.starts_with("cleanup:"))
+                .count(),
+            1
+        );
     }
 }

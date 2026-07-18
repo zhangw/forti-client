@@ -6,6 +6,7 @@ use crate::ppp::lcp::{LcpCode, LcpState};
 use crate::reconnect::DisconnectReason;
 use crate::shutdown::Shutdown;
 use crate::tun;
+use crate::tunnel::codec::FortinetFrame;
 use crate::tunnel::TlsTunnel;
 
 use std::future::Future;
@@ -13,20 +14,51 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
+async fn finish_tun_setup<
+    RouteSetup,
+    DnsSetup,
+    Cleanup,
+    RouteFuture,
+    DnsFuture,
+    CleanupFuture,
+    RouteOutput,
+    DnsOutput,
+>(
+    route_setup: RouteSetup,
+    dns_setup: DnsSetup,
+    cleanup: Cleanup,
+) -> Result<()>
+where
+    RouteSetup: FnOnce() -> RouteFuture,
+    DnsSetup: FnOnce() -> DnsFuture,
+    Cleanup: FnOnce() -> CleanupFuture,
+    RouteFuture: Future<Output = Result<RouteOutput>>,
+    DnsFuture: Future<Output = Result<DnsOutput>>,
+    CleanupFuture: Future<Output = ()>,
+{
+    if let Err(error) = route_setup().await {
+        cleanup().await;
+        return Err(error);
+    }
+    if let Err(error) = dns_setup().await {
+        cleanup().await;
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Set up TUN device, routes, and DNS. Returns the device and interface name.
 pub async fn setup_tun(
     config: &TunnelConfig,
     shutdown: &Shutdown,
 ) -> Result<(tun_rs::AsyncDevice, String)> {
     let (tun_dev, iface_name) = tun::create_tun(config.ip_address)?;
-    if let Err(error) = tun::routes::install_routes(&config.routes, &iface_name, shutdown).await {
-        cleanup_tun(config, &iface_name).await;
-        return Err(error);
-    }
-    if let Err(error) = tun::dns::configure_dns(&config.dns_servers, shutdown).await {
-        cleanup_tun(config, &iface_name).await;
-        return Err(error);
-    }
+    finish_tun_setup(
+        || tun::routes::install_routes(&config.routes, &iface_name, shutdown),
+        || tun::dns::configure_dns(&config.dns_servers, shutdown),
+        || cleanup_tun(config, &iface_name),
+    )
+    .await?;
 
     info!(
         "VPN active on {} — IP={}, {} routes, {} DNS servers",
@@ -115,6 +147,36 @@ async fn interruptible<T>(
     }
 }
 
+trait TunIo {
+    async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<usize>;
+    async fn send(&self, packet: &[u8]) -> std::io::Result<usize>;
+}
+
+impl TunIo for tun_rs::AsyncDevice {
+    async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        tun_rs::AsyncDevice::recv(self, buffer).await
+    }
+
+    async fn send(&self, packet: &[u8]) -> std::io::Result<usize> {
+        tun_rs::AsyncDevice::send(self, packet).await
+    }
+}
+
+trait TunnelIo {
+    async fn recv_frame(&mut self) -> Result<FortinetFrame>;
+    async fn send_frame(&mut self, payload: Vec<u8>) -> Result<()>;
+}
+
+impl TunnelIo for TlsTunnel {
+    async fn recv_frame(&mut self) -> Result<FortinetFrame> {
+        TlsTunnel::recv_frame(self).await
+    }
+
+    async fn send_frame(&mut self, payload: Vec<u8>) -> Result<()> {
+        TlsTunnel::send_frame(self, payload).await
+    }
+}
+
 /// Run the VPN data plane event loop.
 ///
 /// Every potentially blocking I/O operation remains interruptible by the
@@ -126,6 +188,20 @@ pub async fn event_loop(
     shutdown: &Shutdown,
     power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
 ) -> DisconnectReason {
+    event_loop_with_io(tunnel, lcp, tun_dev, shutdown, power_rx).await
+}
+
+async fn event_loop_with_io<Tunnel, Tun>(
+    tunnel: &mut Tunnel,
+    lcp: &mut LcpState,
+    tun_dev: &Tun,
+    shutdown: &Shutdown,
+    power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+) -> DisconnectReason
+where
+    Tunnel: TunnelIo,
+    Tun: TunIo,
+{
     let mut keepalive = tokio::time::interval(Duration::from_secs(10));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut missed_echoes: u32 = 0;
@@ -268,7 +344,11 @@ pub async fn event_loop(
     }
 }
 
-async fn send_ppp(tunnel: &mut TlsTunnel, protocol: PppProtocol, data: Vec<u8>) -> Result<()> {
+async fn send_ppp<Tunnel: TunnelIo>(
+    tunnel: &mut Tunnel,
+    protocol: PppProtocol,
+    data: Vec<u8>,
+) -> Result<()> {
     let frame = PppFrame::new(protocol, data);
     tunnel.send_frame(frame.encode()).await
 }
@@ -297,27 +377,143 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbiased_ready_sources_all_make_progress() {
-        let mut tun_reads = 0;
-        let mut tunnel_reads = 0;
-        let mut keepalives = 0;
+    async fn dns_setup_failure_runs_shared_cleanup() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = finish_tun_setup(
+            {
+                let calls = calls.clone();
+                move || async move {
+                    calls.lock().unwrap().push("routes");
+                    Ok(())
+                }
+            },
+            {
+                let calls = calls.clone();
+                move || async move {
+                    calls.lock().unwrap().push("dns");
+                    Err::<(), _>(FortiError::TunnelError("dns failed".into()))
+                }
+            },
+            {
+                let calls = calls.clone();
+                move || async move { calls.lock().unwrap().push("cleanup") }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), ["routes", "dns", "cleanup"]);
+    }
 
-        for _ in 0..256 {
-            tokio::select! {
-                _ = std::future::ready(()) => tun_reads += 1,
-                _ = std::future::ready(()) => tunnel_reads += 1,
-                _ = std::future::ready(()) => keepalives += 1,
-            }
+    #[tokio::test]
+    async fn route_setup_failure_skips_dns_and_runs_shared_cleanup() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = finish_tun_setup(
+            {
+                let calls = calls.clone();
+                move || async move {
+                    calls.lock().unwrap().push("routes");
+                    Err::<(), _>(FortiError::TunnelError("routes failed".into()))
+                }
+            },
+            {
+                let calls = calls.clone();
+                move || async move {
+                    calls.lock().unwrap().push("dns");
+                    Ok(())
+                }
+            },
+            {
+                let calls = calls.clone();
+                move || async move { calls.lock().unwrap().push("cleanup") }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), ["routes", "cleanup"]);
+    }
+
+    #[derive(Default)]
+    struct Progress {
+        tun_reads: usize,
+        tun_writes: usize,
+        tunnel_reads: usize,
+        tunnel_writes: usize,
+        keepalives: usize,
+    }
+
+    struct FakeTun {
+        progress: std::sync::Arc<std::sync::Mutex<Progress>>,
+    }
+
+    impl TunIo for FakeTun {
+        async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.progress.lock().unwrap().tun_reads += 1;
+            buffer[..4].copy_from_slice(&[0x45, 0, 0, 0]);
+            Ok(4)
         }
 
-        assert!(tun_reads > 0, "continuously-ready TUN must make progress");
-        assert!(
-            tunnel_reads > 0,
-            "continuously-ready tunnel receive must not be starved"
-        );
-        assert!(
-            keepalives > 0,
-            "keepalive must not be starved by ready packet I/O"
-        );
+        async fn send(&self, packet: &[u8]) -> std::io::Result<usize> {
+            self.progress.lock().unwrap().tun_writes += 1;
+            Ok(packet.len())
+        }
+    }
+
+    struct FakeTunnel {
+        progress: std::sync::Arc<std::sync::Mutex<Progress>>,
+    }
+
+    impl TunnelIo for FakeTunnel {
+        async fn recv_frame(&mut self) -> Result<FortinetFrame> {
+            let mut progress = self.progress.lock().unwrap();
+            if progress.tun_reads > 0
+                && progress.tun_writes > 0
+                && progress.tunnel_reads > 0
+                && progress.tunnel_writes > 0
+                && progress.keepalives > 0
+            {
+                return Err(FortiError::TunnelClosed);
+            }
+            progress.tunnel_reads += 1;
+            drop(progress);
+            Ok(FortinetFrame::new(
+                PppFrame::new(PppProtocol::Ipv4, vec![0x45, 0, 0, 0]).encode(),
+            ))
+        }
+
+        async fn send_frame(&mut self, payload: Vec<u8>) -> Result<()> {
+            if let Ok(frame) = PppFrame::decode(&payload) {
+                let mut progress = self.progress.lock().unwrap();
+                match frame.protocol() {
+                    PppProtocol::Lcp => progress.keepalives += 1,
+                    PppProtocol::Ipv4 => progress.tunnel_writes += 1,
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn actual_event_loop_kernel_gives_all_ready_sources_progress() {
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(Progress::default()));
+        let mut tunnel = FakeTunnel {
+            progress: progress.clone(),
+        };
+        let tun = FakeTun {
+            progress: progress.clone(),
+        };
+        let mut lcp = LcpState::new(1500);
+        let shutdown = Shutdown::new();
+        let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+
+        let reason =
+            event_loop_with_io(&mut tunnel, &mut lcp, &tun, &shutdown, &mut power_rx).await;
+        assert_eq!(reason, DisconnectReason::TunnelClosed);
+        let progress = progress.lock().unwrap();
+        assert!(progress.tun_reads > 0);
+        assert!(progress.tun_writes > 0);
+        assert!(progress.tunnel_reads > 0);
+        assert!(progress.tunnel_writes > 0);
+        assert!(progress.keepalives > 0);
     }
 }

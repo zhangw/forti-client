@@ -176,6 +176,23 @@ impl AuthClient {
         password: &str,
         realm: Option<&str>,
     ) -> Result<AuthResult> {
+        let svpn_cookie = self
+            .authenticate_credentials(username, password, realm)
+            .await?;
+        let tunnel_config = self.fetch_tunnel_config(&svpn_cookie).await?;
+        Ok(AuthResult {
+            svpn_cookie,
+            tunnel_config,
+        })
+    }
+
+    /// Authenticate with credentials and return only the session cookie.
+    pub async fn authenticate_credentials(
+        &self,
+        username: &str,
+        password: &str,
+        realm: Option<&str>,
+    ) -> Result<String> {
         // Step 1: POST /remote/logincheck
         let (mut sender, _connector, _server_name) = self.new_http_connection().await?;
 
@@ -247,13 +264,7 @@ impl AuthClient {
             )));
         };
 
-        // Fetch tunnel config
-        let tunnel_config = self.fetch_tunnel_config(&svpn_cookie).await?;
-
-        Ok(AuthResult {
-            svpn_cookie,
-            tunnel_config,
-        })
+        Ok(svpn_cookie)
     }
 
     /// Handle tokeninfo-based 2FA (most common).
@@ -368,8 +379,18 @@ impl AuthClient {
         Ok(cookie)
     }
 
-    /// Authenticate via SAML/SSO: open browser, wait for IdP callback, exchange for SVPNCOOKIE.
+    /// Authenticate via SAML/SSO and fetch tunnel configuration.
     pub async fn login_saml(&self) -> Result<AuthResult> {
+        let svpn_cookie = self.authenticate_saml().await?;
+        let tunnel_config = self.fetch_tunnel_config(&svpn_cookie).await?;
+        Ok(AuthResult {
+            svpn_cookie,
+            tunnel_config,
+        })
+    }
+
+    /// Authenticate via SAML/SSO and return only the session cookie.
+    pub async fn authenticate_saml(&self) -> Result<String> {
         let saml_port: u16 = 8020;
 
         // Step 1: Start local HTTP server to receive the SAML callback
@@ -429,18 +450,11 @@ impl AuthClient {
         })?;
 
         info!("SAML authentication successful");
-
-        // Step 5: Fetch tunnel configuration (same as credential flow)
-        let tunnel_config = self.fetch_tunnel_config(&svpn_cookie).await?;
-
-        Ok(AuthResult {
-            svpn_cookie,
-            tunnel_config,
-        })
+        Ok(svpn_cookie)
     }
 
-    /// Fetch tunnel config: GET /remote/fortisslvpn then GET /remote/fortisslvpn_xml
-    async fn fetch_tunnel_config(&self, svpn_cookie: &str) -> Result<xml::TunnelConfig> {
+    /// Fetch tunnel config for an already authenticated session cookie.
+    pub async fn fetch_tunnel_config(&self, svpn_cookie: &str) -> Result<xml::TunnelConfig> {
         // Resource reservation
         let (mut sender, _, _) = self.new_http_connection().await?;
 

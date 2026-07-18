@@ -11,7 +11,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn post_upgrade_error(error: FortiError) -> FortiError {
     match error {
-        FortiError::CookieRejected(_) | FortiError::PostUpgradeNegotiation(_) => error,
+        FortiError::CookieRejected(_)
+        | FortiError::TransportUnavailable(_)
+        | FortiError::PostUpgradeNegotiation(_) => error,
         other => FortiError::PostUpgradeNegotiation(other.to_string()),
     }
 }
@@ -181,6 +183,43 @@ impl TlsTunnel {
 
 /// Inspect and, when complete, remove an HTTP tunnel-upgrade response.
 /// Returns true while more bytes are needed to decide.
+fn header_points_to_auth(header: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(header);
+    text.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        if !name.trim().eq_ignore_ascii_case("location") {
+            return false;
+        }
+
+        let location = value.trim();
+        let path = if location.starts_with('/') && !location.starts_with("//") {
+            location
+        } else if let Some(scheme) = location.find("://") {
+            let authority = &location[scheme + 3..];
+            authority
+                .find('/')
+                .map(|slash| &authority[slash..])
+                .unwrap_or("/")
+        } else if let Some(authority) = location.strip_prefix("//") {
+            authority
+                .find('/')
+                .map(|slash| &authority[slash..])
+                .unwrap_or("/")
+        } else {
+            return false;
+        };
+
+        ["/remote/login", "/remote/saml"].iter().any(|prefix| {
+            path == *prefix
+                || path.strip_prefix(prefix).is_some_and(|rest| {
+                    rest.starts_with('/') || rest.starts_with('?') || rest.starts_with('#')
+                })
+        })
+    })
+}
+
 fn process_upgrade_response(buf: &mut Vec<u8>) -> Result<bool> {
     if buf.is_empty() {
         return Ok(true);
@@ -220,11 +259,12 @@ fn process_upgrade_response(buf: &mut Vec<u8>) -> Result<bool> {
         .and_then(|value| value.parse::<u16>().ok())
         .ok_or_else(|| FortiError::ProtocolError("invalid tunnel HTTP status".into()))?;
 
-    if status == 401 || status == 403 || (300..400).contains(&status) {
+    let auth_redirect = (300..400).contains(&status) && header_points_to_auth(&buf[..header_len]);
+    if status == 401 || status == 403 || auth_redirect {
         return Err(FortiError::CookieRejected(status));
     }
     if !(200..300).contains(&status) {
-        return Err(FortiError::TunnelError(format!(
+        return Err(FortiError::TransportUnavailable(format!(
             "tunnel upgrade failed with HTTP {}",
             status
         )));
@@ -281,12 +321,52 @@ mod tests {
     }
 
     #[test]
-    fn redirect_upgrade_is_typed_cookie_rejection() {
-        let mut buf = b"HTTP/1.1 302 Found\r\nLocation: /remote/login\r\n\r\n".to_vec();
+    fn auth_redirects_are_typed_cookie_rejections() {
+        for location in [
+            "/remote/login",
+            "/remote/login?lang=en",
+            "https://vpn.example/remote/saml/start?redirect=1",
+        ] {
+            let mut buf =
+                format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\n\r\n").into_bytes();
+            assert!(matches!(
+                process_upgrade_response(&mut buf),
+                Err(FortiError::CookieRejected(302))
+            ));
+        }
+    }
+
+    #[test]
+    fn non_auth_redirect_is_transport_unavailable() {
+        let mut buf = b"HTTP/1.1 302 Found\r\nLocation: /maintenance\r\n\r\n".to_vec();
         assert!(matches!(
             process_upgrade_response(&mut buf),
-            Err(FortiError::CookieRejected(302))
+            Err(FortiError::TransportUnavailable(_))
         ));
+    }
+
+    #[test]
+    fn lookalike_login_redirect_is_not_cookie_rejection() {
+        let mut buf =
+            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /remote/logincheck\r\n\r\n".to_vec();
+        assert!(matches!(
+            process_upgrade_response(&mut buf),
+            Err(FortiError::TransportUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn throttling_and_server_failures_remain_transport_unavailable() {
+        for status in [400, 429, 500, 502, 503] {
+            let mut buf =
+                format!("HTTP/1.1 {status} Failure\r\nContent-Length: 0\r\n\r\n").into_bytes();
+            let error = process_upgrade_response(&mut buf).unwrap_err();
+            assert!(matches!(error, FortiError::TransportUnavailable(_)));
+            assert!(matches!(
+                post_upgrade_error(error),
+                FortiError::TransportUnavailable(_)
+            ));
+        }
     }
 
     #[test]
