@@ -27,11 +27,11 @@ TLS Connection (rustls/tokio-rustls)
   - `mod.rs` — TUN device creation via `tun-rs` (utun)
   - `routes.rs` — Split-tunnel route install/remove via `/sbin/route`
   - `dns.rs` — DNS configuration via `scutil` (supplemental resolver)
-- **`vpn.rs`** — Data plane event loop: `tokio::select!` multiplexing TUN reads, tunnel reads, LCP keepalive timer, timing gap heuristic, and Ctrl+C. Provides `setup_tun()`, `cleanup_tun()`, and `event_loop()` (returns `DisconnectReason`).
-- **`reconnect.rs`** — `ReconnectController` state machine wrapping the event loop. Owns TUN/routes/DNS lifetime (persist across reconnects). Handles `DisconnectReason`/`ReconnectAction` classification, `Backoff` (exponential, 1s-60s cap), cookie reuse fast path, automatic SAML re-auth, `WaitingForNetwork` state for sleep/wake, and `detect_sleep_gap` timing heuristic.
-- **`network_monitor.rs`** — `NetworkMonitor` using `system-configuration` crate for SCNetworkReachability callbacks. Dedicated thread with CFRunLoop, sends `NetworkEvent::Reachable`/`Unreachable` via tokio channel. Cancels backoff on network return.
+- **`vpn.rs`** — Fair (unbiased) data plane `tokio::select!` over TUN reads, tunnel reads, LCP keepalive, power events, and the level-triggered shutdown token. Nested writes remain shutdown/sleep interruptible. Route and DNS cleanup share one 10-second deadline.
+- **`reconnect.rs`** — `ReconnectController` plus a pure `ReconnectPolicy`. Transport failures only back off; HTTP 401/403/auth redirects require sticky reauthentication; three consecutive post-upgrade/PPP failures permit one compatibility SAML probe per episode. Backoff is exponential (1s to 60s) and resets only after TLS + PPP succeeds. Network and power events interrupt waits without resetting failure history.
+- **`network_monitor.rs`** — `NetworkMonitor` using `system-configuration` crate for SCNetworkReachability callbacks. Dedicated thread with CFRunLoop, sends `NetworkEvent::Reachable`/`Unreachable` via tokio channel. Reachability can interrupt the current wait but does not reset reconnect backoff.
 - **`power_monitor.rs`** — `PowerMonitor` using IOKit FFI for macOS sleep/wake notifications (`WillSleep`, `HasPoweredOn`). Dedicated thread with CFRunLoop, sends `PowerEvent` via tokio channel. Acknowledges sleep via `IOAllowPowerChange`.
-- **`main.rs`** — CLI entry point with `--saml` flag for SSO, `--username`/`--password` for credential auth, `--tls-keylog-file` for opt-in TLS key logging (with path validation). Password stored as `SecretString` (zeroized on drop). Delegates to `ReconnectController` after initial authentication.
+- **`main.rs`** — CLI entry point with `--saml` flag for SSO, `--username`/`--password` for credential auth, and `--tls-keylog-file` for opt-in TLS key logging. Installs one process-wide two-stage SIGINT handler: first signal starts graceful shutdown, second force-exits with status 130. Passwords use `SecretString`.
 - **`error.rs`** — Error types via thiserror
 
 ## Key Protocol Details (learned from real-server testing)

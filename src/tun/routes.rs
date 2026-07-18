@@ -71,8 +71,12 @@ pub async fn install_routes(routes: &[Route], iface: &str, shutdown: &Shutdown) 
         Ok::<usize, FortiError>(installed)
     };
 
+    if shutdown.is_cancelled() {
+        return Err(FortiError::TunnelError(
+            "route installation cancelled".into(),
+        ));
+    }
     let installed = tokio::select! {
-        biased;
         _ = shutdown.cancelled() => {
             return Err(FortiError::TunnelError("route installation cancelled".into()));
         }

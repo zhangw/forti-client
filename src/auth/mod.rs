@@ -7,6 +7,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 const HTTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const SAML_INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const SAML_CALLBACK_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SAML_CALLBACK_HEADER: usize = 16 * 1024;
 const MAX_AUTH_BODY_SIZE: usize = 4 * 1024 * 1024;
 
 async fn collect_auth_body(body: hyper::body::Incoming, context: &str) -> Result<bytes::Bytes> {
@@ -53,10 +57,59 @@ async fn send_auth_request(
         .map_err(|e| FortiError::TunnelError(format!("{}: {}", context, e)))
 }
 
-#[derive(Debug)]
+fn saml_browser_command(url: &str) -> tokio::process::Command {
+    #[cfg(debug_assertions)]
+    if let Some(program) = std::env::var_os("FORTI_CLIENT_TEST_BROWSER_LAUNCHER") {
+        let mut command = tokio::process::Command::new(program);
+        command.arg(url);
+        return command;
+    }
+
+    if let Ok(user) = std::env::var("SUDO_USER") {
+        let mut command = tokio::process::Command::new("sudo");
+        command.args(["-u", &user, "open", url]);
+        command
+    } else {
+        let mut command = tokio::process::Command::new("open");
+        command.arg(url);
+        command
+    }
+}
+
+async fn launch_saml_browser(url: &str) -> std::io::Result<()> {
+    let mut command = saml_browser_command(url);
+    command.kill_on_drop(true);
+    let mut child = command.spawn()?;
+    match tokio::time::timeout(BROWSER_LAUNCH_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(std::io::Error::other(format!(
+            "browser launcher exited with status {status}"
+        ))),
+        Ok(Err(error)) => Err(error),
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "browser launcher did not exit within 5 seconds",
+            ))
+        }
+    }
+}
+
 pub struct AuthResult {
     pub svpn_cookie: String,
     pub tunnel_config: xml::TunnelConfig,
+}
+
+impl std::fmt::Debug for AuthResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthResult")
+            .field("svpn_cookie", &"<redacted>")
+            .field("tunnel_config", &self.tunnel_config)
+            .finish()
+    }
 }
 
 pub struct AuthClient {
@@ -323,8 +376,8 @@ impl AuthClient {
         let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", saml_port))
             .await
             .map_err(|e| {
-                FortiError::AuthFailed(format!(
-                    "failed to bind SAML callback on port {}: {} (is another VPN client running?)",
+                FortiError::SamlTerminalConfiguration(format!(
+                    "failed to bind callback port {}: {} (is another VPN client running?)",
                     saml_port, e
                 ))
             })?;
@@ -339,17 +392,8 @@ impl AuthClient {
         info!("Opening browser for SAML authentication...");
         info!("If browser doesn't open, navigate to: {}", saml_url);
 
-        // When running as root (sudo), `open` uses root's default browser.
-        // Use SUDO_USER to open the real user's preferred browser instead.
-        let open_result = if let Ok(user) = std::env::var("SUDO_USER") {
-            std::process::Command::new("sudo")
-                .args(["-u", &user, "open", &saml_url])
-                .spawn()
-        } else {
-            std::process::Command::new("open").arg(&saml_url).spawn()
-        };
-        if let Err(e) = open_result {
-            debug!("Failed to open browser: {}", e);
+        if let Err(error) = launch_saml_browser(&saml_url).await {
+            debug!("Browser launcher failed: {}", error);
             eprintln!("\nPlease open this URL in your browser:\n  {}\n", saml_url);
         }
 
@@ -379,7 +423,9 @@ impl AuthClient {
         log_set_cookie_headers(&resp);
 
         let svpn_cookie = extract_svpncookie(&resp).ok_or_else(|| {
-            FortiError::AuthFailed("SAML auth failed — no SVPNCOOKIE in response".into())
+            FortiError::SamlCallbackInvalid(
+                "gateway returned no SVPNCOOKIE after callback exchange".into(),
+            )
         })?;
 
         info!("SAML authentication successful");
@@ -517,17 +563,44 @@ fn extract_html_field(html: &str, field_name: &str) -> Option<String> {
 /// Wait for the SAML IdP to redirect the browser to our local callback server.
 /// Enforces a 5-minute overall timeout for the entire callback phase.
 async fn wait_for_saml_callback(listener: tokio::net::TcpListener) -> Result<String> {
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        wait_for_saml_callback_inner(listener),
-    )
-    .await
-    {
+    wait_for_saml_callback_with_timeout(listener, SAML_INTERACTIVE_TIMEOUT).await
+}
+
+async fn wait_for_saml_callback_with_timeout(
+    listener: tokio::net::TcpListener,
+    deadline: Duration,
+) -> Result<String> {
+    match tokio::time::timeout(deadline, wait_for_saml_callback_inner(listener)).await {
         Ok(inner) => inner,
-        Err(_) => Err(FortiError::AuthFailed(
-            "SAML authentication timed out after 5 minutes. Please retry.".into(),
-        )),
+        Err(_) => Err(FortiError::SamlCallbackTimedOut),
     }
+}
+
+fn parse_saml_session_id(request_bytes: &[u8]) -> Option<String> {
+    let request = std::str::from_utf8(request_bytes).ok()?;
+    let request_line = request.lines().next()?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let version = parts.next()?;
+    if method != "GET" || !matches!(version, "HTTP/1.0" | "HTTP/1.1") || parts.next().is_some() {
+        return None;
+    }
+
+    let (_, query) = target.split_once('?')?;
+    let mut session_id = None;
+    for parameter in query.split('&') {
+        let Some((name, value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if name == "id" {
+            if value.is_empty() || session_id.is_some() {
+                return None;
+            }
+            session_id = Some(value.to_string());
+        }
+    }
+    session_id
 }
 
 /// Inner accept loop: extracts the `id` parameter from the browser callback URL.
@@ -536,14 +609,14 @@ async fn wait_for_saml_callback(listener: tokio::net::TcpListener) -> Result<Str
 async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Result<String> {
     loop {
         let (mut stream, addr) = listener.accept().await.map_err(|e| {
-            FortiError::AuthFailed(format!("failed to accept SAML callback: {}", e))
+            FortiError::SamlCallbackInvalid(format!("failed to accept callback: {}", e))
         })?;
 
         debug!("SAML callback connection from {}", addr);
 
         // Read through the complete HTTP header. A browser may split the
         // request line or headers across arbitrary TCP packets.
-        let request_bytes = match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let request_bytes = match tokio::time::timeout(SAML_CALLBACK_IO_TIMEOUT, async {
             let mut request = Vec::with_capacity(1024);
             let mut chunk = [0u8; 1024];
             loop {
@@ -552,10 +625,20 @@ async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Resu
                     return Ok::<Option<Vec<u8>>, std::io::Error>(None);
                 }
                 request.extend_from_slice(&chunk[..n]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let header_len = header_end + 4;
+                    if header_len > MAX_SAML_CALLBACK_HEADER {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "SAML callback header exceeds 16 KiB",
+                        ));
+                    }
+                    request.truncate(header_len);
                     return Ok(Some(request));
                 }
-                if request.len() > 16 * 1024 {
+                if request.len() > MAX_SAML_CALLBACK_HEADER {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "SAML callback header exceeds 16 KiB",
@@ -590,24 +673,8 @@ async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Resu
             debug!("SAML callback: received {} request", method);
         }
 
-        // Validate: must be GET with ?id= parameter
-        let session_id = request.lines().next().and_then(|line| {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            // Must be "GET <path> HTTP/1.x"
-            if parts.len() < 2 || parts[0] != "GET" {
-                return None;
-            }
-            let path = parts[1];
-            let query = path.split('?').nth(1)?;
-            for param in query.split('&') {
-                if let Some(value) = param.strip_prefix("id=") {
-                    if !value.is_empty() {
-                        return Some(value.to_string());
-                    }
-                }
-            }
-            None
-        });
+        // Validate without logging the target because it contains the session ID.
+        let session_id = parse_saml_session_id(&request_bytes);
 
         match session_id {
             Some(id) => {
@@ -625,8 +692,11 @@ async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Resu
                     <noscript><p>You may close this browser tab and return to the terminal.</p></noscript>\
                     </body></html>";
 
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
+                let _ = tokio::time::timeout(SAML_CALLBACK_IO_TIMEOUT, async {
+                    stream.write_all(response.as_bytes()).await?;
+                    stream.shutdown().await
+                })
+                .await;
                 return Ok(id);
             }
             None => {
@@ -639,8 +709,11 @@ async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Resu
                     Connection: close\r\n\
                     \r\n\
                     Invalid callback request";
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
+                let _ = tokio::time::timeout(SAML_CALLBACK_IO_TIMEOUT, async {
+                    stream.write_all(response.as_bytes()).await?;
+                    stream.shutdown().await
+                })
+                .await;
                 continue;
             }
         }
@@ -648,11 +721,11 @@ async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Resu
 }
 
 fn redact_set_cookie(header: &str) -> String {
-    if header.starts_with("SVPNCOOKIE=") {
-        "SVPNCOOKIE=<redacted>".to_string()
-    } else {
-        header.to_string()
-    }
+    let name = header
+        .split_once('=')
+        .map(|(name, _)| name)
+        .unwrap_or("cookie");
+    format!("{}=<redacted>", name.trim())
 }
 
 /// Log Set-Cookie headers with SVPNCOOKIE values redacted.
@@ -690,9 +763,9 @@ mod tests {
     }
 
     #[test]
-    fn test_no_redact_other_cookie() {
+    fn test_redact_other_cookie() {
         let input = "OTHERCOOKIE=value123; path=/";
-        assert_eq!(redact_set_cookie(input), "OTHERCOOKIE=value123; path=/");
+        assert_eq!(redact_set_cookie(input), "OTHERCOOKIE=<redacted>");
     }
 
     #[test]
@@ -702,24 +775,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fragmented_saml_callback_is_accepted() {
+    async fn fragmented_saml_callback_is_accepted_at_every_split() {
+        let request =
+            b"GET /callback?next=portal&id=session-123 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        for split in 1..request.len() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(wait_for_saml_callback_inner(listener));
+
+            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            client.write_all(&request[..split]).await.unwrap();
+            tokio::task::yield_now().await;
+            client.write_all(&request[split..]).await.unwrap();
+
+            let session_id = tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .expect("fragmented callback must complete")
+                .unwrap()
+                .unwrap();
+            assert_eq!(session_id, "session-123", "split position {split}");
+        }
+    }
+
+    #[test]
+    fn saml_request_parser_rejects_invalid_and_duplicate_ids() {
+        assert_eq!(
+            parse_saml_session_id(b"POST /callback?id=x HTTP/1.1\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            parse_saml_session_id(b"GET /callback?id= HTTP/1.1\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            parse_saml_session_id(b"GET /callback?id=one&id=two HTTP/1.1\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            parse_saml_session_id(
+                b"GET /callback?state=ready&id=session-123&source=idp HTTP/1.1\r\n\r\n"
+            ),
+            Some("session-123".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_and_oversized_callbacks_are_rejected_before_valid_one() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(wait_for_saml_callback_inner(listener));
 
-        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
-        client.write_all(b"GET /callback?i").await.unwrap();
-        tokio::task::yield_now().await;
-        client
-            .write_all(b"d=session-123 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        let mut incomplete = tokio::net::TcpStream::connect(address).await.unwrap();
+        incomplete
+            .write_all(b"GET /callback?id=incomplete HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        drop(incomplete);
+
+        let mut oversized = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut large_request = b"GET /callback?id=oversized HTTP/1.1\r\nX-Fill: ".to_vec();
+        large_request.extend(std::iter::repeat_n(b'a', MAX_SAML_CALLBACK_HEADER));
+        large_request.extend_from_slice(b"\r\n\r\n");
+        oversized.write_all(&large_request).await.unwrap();
+        drop(oversized);
+
+        let mut valid = tokio::net::TcpStream::connect(address).await.unwrap();
+        valid
+            .write_all(b"GET /callback?id=valid HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .await
             .unwrap();
 
         let session_id = tokio::time::timeout(Duration::from_secs(1), server)
             .await
-            .expect("callback must not wait for the five-minute outer timeout")
+            .expect("server must continue after invalid connections")
             .unwrap()
             .unwrap();
-        assert_eq!(session_id, "session-123");
+        assert_eq!(session_id, "valid");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn saml_callback_deadline_is_typed_and_uses_tokio_time() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waiter = tokio::spawn(wait_for_saml_callback_with_timeout(
+            listener,
+            Duration::from_secs(300),
+        ));
+        tokio::time::advance(Duration::from_secs(300)).await;
+        let error = waiter.await.unwrap().unwrap_err();
+        assert!(matches!(error, FortiError::SamlCallbackTimedOut));
+    }
+
+    #[test]
+    fn auth_result_debug_redacts_cookie() {
+        let result = AuthResult {
+            svpn_cookie: "secret-cookie".into(),
+            tunnel_config: xml::TunnelConfig::parse(
+                r#"<sslvpn-tunnel><assigned-addr ipv4="10.0.0.2" /></sslvpn-tunnel>"#,
+            )
+            .unwrap(),
+        };
+        let debug = format!("{result:?}");
+        assert!(!debug.contains("secret-cookie"));
+        assert!(debug.contains("<redacted>"));
     }
 }

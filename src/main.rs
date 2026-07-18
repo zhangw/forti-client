@@ -38,6 +38,22 @@ struct Cli {
     tls_keylog_file: Option<String>,
 }
 
+const FORCED_SIGINT_EXIT_CODE: i32 = 130;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownSignalAction {
+    Graceful,
+    ForceExit,
+}
+
+fn shutdown_signal_action(signal_number: u8) -> ShutdownSignalAction {
+    if signal_number <= 1 {
+        ShutdownSignalAction::Graceful
+    } else {
+        ShutdownSignalAction::ForceExit
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -111,14 +127,34 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Install one process-wide Ctrl+C listener after the synchronous password
-    // prompt. The level-triggered token remembers cancellation across states.
+    // Tokio keeps the SIGINT handler installed for the process lifetime. The
+    // first signal starts bounded graceful shutdown; a second is an explicit
+    // user override if protocol or system cleanup is stuck.
     let shutdown = Shutdown::new();
     let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("Ctrl+C received");
-            signal_shutdown.cancel();
+        let mut signal_number = 0u8;
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            signal_number = signal_number.saturating_add(1);
+            match shutdown_signal_action(signal_number) {
+                ShutdownSignalAction::Graceful => {
+                    tracing::info!(
+                        shutdown_phase = "graceful",
+                        "Ctrl+C received; disconnecting"
+                    );
+                    signal_shutdown.cancel();
+                }
+                ShutdownSignalAction::ForceExit => {
+                    tracing::warn!(
+                        shutdown_phase = "forced",
+                        "Second Ctrl+C received; forcing exit and possibly leaving routes or DNS behind"
+                    );
+                    std::process::exit(FORCED_SIGINT_EXIT_CODE);
+                }
+            }
         }
     });
 
@@ -146,10 +182,17 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    if shutdown.is_cancelled() {
+        tracing::info!("Authentication cancelled.");
+        return Ok(());
+    }
     let auth_result = tokio::select! {
-        biased;
         _ = shutdown.cancelled() => {
             tracing::info!("Authentication cancelled.");
+            #[cfg(debug_assertions)]
+            if std::env::var_os("FORTI_CLIENT_TEST_STALL_ON_SHUTDOWN").is_some() {
+                std::future::pending::<()>().await;
+            }
             return Ok(());
         }
         result = auth_future => result?,
@@ -183,4 +226,17 @@ async fn main() -> anyhow::Result<()> {
     controller.run().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_sigint_is_graceful_and_second_forces_130() {
+        assert_eq!(shutdown_signal_action(1), ShutdownSignalAction::Graceful);
+        assert_eq!(shutdown_signal_action(2), ShutdownSignalAction::ForceExit);
+        assert_eq!(shutdown_signal_action(3), ShutdownSignalAction::ForceExit);
+        assert_eq!(FORCED_SIGINT_EXIT_CODE, 130);
+    }
 }

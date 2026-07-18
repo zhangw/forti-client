@@ -20,12 +20,11 @@ pub async fn setup_tun(
 ) -> Result<(tun_rs::AsyncDevice, String)> {
     let (tun_dev, iface_name) = tun::create_tun(config.ip_address)?;
     if let Err(error) = tun::routes::install_routes(&config.routes, &iface_name, shutdown).await {
-        tun::routes::remove_routes(&config.routes, &iface_name).await;
+        cleanup_tun(config, &iface_name).await;
         return Err(error);
     }
     if let Err(error) = tun::dns::configure_dns(&config.dns_servers, shutdown).await {
-        tun::routes::remove_routes(&config.routes, &iface_name).await;
-        tun::dns::remove_dns().await;
+        cleanup_tun(config, &iface_name).await;
         return Err(error);
     }
 
@@ -40,11 +39,50 @@ pub async fn setup_tun(
     Ok((tun_dev, iface_name))
 }
 
-/// Remove routes and DNS configuration.
+async fn cleanup_with_deadline<RouteCleanup, DnsCleanup>(
+    route_cleanup: RouteCleanup,
+    dns_cleanup: DnsCleanup,
+    deadline: Duration,
+) -> bool
+where
+    RouteCleanup: Future<Output = ()>,
+    DnsCleanup: Future<Output = ()>,
+{
+    tokio::time::timeout(deadline, async {
+        route_cleanup.await;
+        dns_cleanup.await;
+    })
+    .await
+    .is_ok()
+}
+
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Remove routes and DNS configuration under one global deadline.
 pub async fn cleanup_tun(config: &TunnelConfig, iface_name: &str) {
-    info!("Cleaning up routes and DNS...");
-    tun::routes::remove_routes(&config.routes, iface_name).await;
-    tun::dns::remove_dns().await;
+    info!("Starting bounded VPN route/DNS cleanup");
+    let cleanup_phase = std::sync::atomic::AtomicU8::new(0);
+    let completed = cleanup_with_deadline(
+        async {
+            info!("Removing VPN routes");
+            tun::routes::remove_routes(&config.routes, iface_name).await;
+        },
+        async {
+            cleanup_phase.store(1, std::sync::atomic::Ordering::Relaxed);
+            info!("Removing VPN DNS configuration");
+            tun::dns::remove_dns().await;
+        },
+        CLEANUP_TIMEOUT,
+    )
+    .await;
+
+    if !completed {
+        if cleanup_phase.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            error!("Route cleanup exceeded the global 10s deadline; DNS cleanup was skipped");
+        } else {
+            error!("DNS cleanup exceeded the remaining global 10s deadline");
+        }
+    }
 }
 
 async fn next_power_event(rx: &mut mpsc::UnboundedReceiver<PowerEvent>) -> PowerEvent {
@@ -62,8 +100,10 @@ async fn interruptible<T>(
 ) -> std::result::Result<T, DisconnectReason> {
     tokio::pin!(operation);
     loop {
+        if shutdown.is_cancelled() {
+            return Err(DisconnectReason::UserQuit);
+        }
         tokio::select! {
-            biased;
             _ = shutdown.cancelled() => return Err(DisconnectReason::UserQuit),
             event = next_power_event(power_rx) => {
                 if event == PowerEvent::WillSleep {
@@ -94,8 +134,11 @@ pub async fn event_loop(
     let mut last_tick = std::time::Instant::now();
 
     loop {
+        if shutdown.is_cancelled() {
+            info!("Shutdown requested");
+            return DisconnectReason::UserQuit;
+        }
         tokio::select! {
-            biased;
             _ = shutdown.cancelled() => {
                 info!("Shutdown requested");
                 return DisconnectReason::UserQuit;
@@ -146,7 +189,7 @@ pub async fn event_loop(
             result = tunnel.recv_frame() => {
                 let frame = match result {
                     Ok(f) => f,
-                    Err(FortiError::TunnelError(msg)) if msg.contains("tunnel closed") => {
+                    Err(FortiError::TunnelClosed) => {
                         return DisconnectReason::TunnelClosed;
                     }
                     Err(e) => return DisconnectReason::IoError(format!("tunnel recv error: {}", e)),
@@ -228,4 +271,53 @@ pub async fn event_loop(
 async fn send_ppp(tunnel: &mut TlsTunnel, protocol: PppProtocol, data: Vec<u8>) -> Result<()> {
     let frame = PppFrame::new(protocol, data);
     tunnel.send_frame(frame.encode()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_deadline_covers_routes_and_dns_as_one_budget() {
+        let cleanup = cleanup_with_deadline(
+            async { tokio::time::sleep(Duration::from_secs(8)).await },
+            async { tokio::time::sleep(Duration::from_secs(8)).await },
+            Duration::from_secs(10),
+        );
+        assert!(!cleanup.await);
+    }
+
+    #[tokio::test]
+    async fn interruptible_observes_already_cancelled_shutdown() {
+        let shutdown = Shutdown::new();
+        shutdown.cancel();
+        let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+        let result = interruptible(std::future::pending::<()>(), &shutdown, &mut power_rx).await;
+        assert_eq!(result, Err(DisconnectReason::UserQuit));
+    }
+
+    #[tokio::test]
+    async fn unbiased_ready_sources_all_make_progress() {
+        let mut tun_reads = 0;
+        let mut tunnel_reads = 0;
+        let mut keepalives = 0;
+
+        for _ in 0..256 {
+            tokio::select! {
+                _ = std::future::ready(()) => tun_reads += 1,
+                _ = std::future::ready(()) => tunnel_reads += 1,
+                _ = std::future::ready(()) => keepalives += 1,
+            }
+        }
+
+        assert!(tun_reads > 0, "continuously-ready TUN must make progress");
+        assert!(
+            tunnel_reads > 0,
+            "continuously-ready tunnel receive must not be starved"
+        );
+        assert!(
+            keepalives > 0,
+            "keepalive must not be starved by ready packet I/O"
+        );
+    }
 }

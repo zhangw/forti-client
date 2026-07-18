@@ -47,8 +47,12 @@ pub async fn configure_dns(servers: &[Ipv4Addr], shutdown: &Shutdown) -> Result<
     );
 
     debug!("Configuring DNS via scutil:\n{}", scutil_input.trim());
+    if shutdown.is_cancelled() {
+        return Err(FortiError::TunnelError(
+            "DNS configuration cancelled".into(),
+        ));
+    }
     let output = tokio::select! {
-        biased;
         _ = shutdown.cancelled() => {
             return Err(FortiError::TunnelError("DNS configuration cancelled".into()));
         }

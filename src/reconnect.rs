@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::auth::xml::TunnelConfig;
 use crate::auth::AuthClient;
-use crate::error::{FortiError, Result};
+use crate::error::{AuthRequirement, ConnectFailureKind, FortiError, Result, SamlFailureKind};
 use crate::network_monitor::{NetworkEvent, NetworkMonitor};
 use crate::power_monitor::{PowerEvent, PowerMonitor};
 use crate::ppp::codec::{PppFrame, PppProtocol};
@@ -42,6 +42,20 @@ pub fn classify_disconnect(reason: &DisconnectReason) -> ReconnectAction {
     }
 }
 
+fn should_send_terminate(reason: &DisconnectReason) -> bool {
+    *reason != DisconnectReason::SystemSleep
+}
+
+fn auth_failure_is_terminal(attempt: AuthAttemptKind, failure: SamlFailureKind) -> bool {
+    attempt == AuthAttemptKind::Required && failure == SamlFailureKind::TerminalConfiguration
+}
+
+fn prepare_cookie_for_auth(attempt: AuthAttemptKind, cookie: &mut String) {
+    if attempt == AuthAttemptKind::Required {
+        cookie.clear();
+    }
+}
+
 /// Detect a likely sleep gap from a delayed keepalive tick.
 pub fn detect_sleep_gap(last_tick: Instant, expected_interval: Duration) -> bool {
     last_tick.elapsed() > expected_interval * 3
@@ -49,17 +63,9 @@ pub fn detect_sleep_gap(last_tick: Instant, expected_interval: Duration) -> bool
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
-const REAUTH_AFTER_CONNECT_FAILURES: u32 = 3;
+const POST_UPGRADE_FAILURES_BEFORE_PROBE: u32 = 3;
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(2);
 const MONITOR_FALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// A typed rejection re-authenticates immediately. Repeated failures are a
-/// compatibility fallback for FortiGates that report an expired cookie as EOF,
-/// PPP timeout, or another non-HTTP failure.
-pub fn should_reauthenticate(error: &FortiError, consecutive_failures: u32) -> bool {
-    matches!(error, FortiError::CookieRejected(_))
-        || consecutive_failures >= REAUTH_AFTER_CONNECT_FAILURES
-}
 
 pub struct Backoff {
     current: Duration,
@@ -91,14 +97,150 @@ impl Backoff {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthAttemptKind {
+    Required,
+    CompatibilityProbe,
+}
+
+/// Pure reconnect decision state. An episode ends only after both TLS and PPP
+/// negotiation succeed.
+pub struct ReconnectPolicy {
+    backoff: Backoff,
+    auth_requirement: AuthRequirement,
+    transport_attempts: u32,
+    post_upgrade_failures: u32,
+    compatibility_probe_used: bool,
+    saml_attempts: u32,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReconnectPolicy {
+    pub fn new() -> Self {
+        Self {
+            backoff: Backoff::new(),
+            auth_requirement: AuthRequirement::NotRequired,
+            transport_attempts: 0,
+            post_upgrade_failures: 0,
+            compatibility_probe_used: false,
+            saml_attempts: 0,
+        }
+    }
+
+    pub fn auth_requirement(&self) -> AuthRequirement {
+        self.auth_requirement
+    }
+
+    /// Return the only operation permitted by the authentication gate. A
+    /// compatibility probe is marked used before it starts, so a timeout cannot
+    /// launch another browser in the same reconnect episode.
+    pub fn next_auth_attempt(&mut self) -> Option<AuthAttemptKind> {
+        let attempt = match self.auth_requirement {
+            AuthRequirement::NotRequired => return None,
+            AuthRequirement::Required => AuthAttemptKind::Required,
+            AuthRequirement::CompatibilityProbeAllowed => {
+                self.auth_requirement = AuthRequirement::NotRequired;
+                AuthAttemptKind::CompatibilityProbe
+            }
+        };
+        self.saml_attempts = self.saml_attempts.saturating_add(1);
+        Some(attempt)
+    }
+
+    pub fn on_connect_failure(&mut self, kind: ConnectFailureKind) {
+        match kind {
+            ConnectFailureKind::TransportUnavailable => {
+                self.transport_attempts = self.transport_attempts.saturating_add(1);
+                self.post_upgrade_failures = 0;
+            }
+            ConnectFailureKind::CookieRejected => {
+                // A definitive rejection begins a new required-auth episode.
+                self.transport_attempts = 0;
+                self.post_upgrade_failures = 0;
+                self.compatibility_probe_used = false;
+                self.auth_requirement = AuthRequirement::Required;
+            }
+            ConnectFailureKind::PostUpgrade => {
+                self.post_upgrade_failures = self.post_upgrade_failures.saturating_add(1);
+                if self.post_upgrade_failures >= POST_UPGRADE_FAILURES_BEFORE_PROBE
+                    && !self.compatibility_probe_used
+                {
+                    self.compatibility_probe_used = true;
+                    self.auth_requirement = AuthRequirement::CompatibilityProbeAllowed;
+                }
+            }
+            ConnectFailureKind::LocalSetup | ConnectFailureKind::Cancelled => {}
+        }
+    }
+
+    pub fn on_saml_failure(&mut self, attempt: AuthAttemptKind, _kind: SamlFailureKind) {
+        self.auth_requirement = match attempt {
+            // A rejected cookie remains unusable until a new cookie is obtained.
+            AuthAttemptKind::Required => AuthRequirement::Required,
+            // A compatibility probe is optional. Its failure returns to cookie
+            // retries without permitting another probe in this episode.
+            AuthAttemptKind::CompatibilityProbe => AuthRequirement::NotRequired,
+        };
+    }
+
+    pub fn on_saml_success(&mut self) {
+        self.auth_requirement = AuthRequirement::NotRequired;
+        // Deliberately do not reset backoff or the current reconnect episode.
+    }
+
+    pub fn on_network_reachable(&mut self) {
+        // Reachability only changes when the next attempt can run.
+    }
+
+    pub fn on_system_wake(&mut self) {
+        // Wake only changes when the next attempt can run.
+    }
+
+    pub fn on_tunnel_established(&mut self) {
+        self.backoff.reset();
+        self.auth_requirement = AuthRequirement::NotRequired;
+        self.transport_attempts = 0;
+        self.post_upgrade_failures = 0;
+        self.compatibility_probe_used = false;
+        self.saml_attempts = 0;
+    }
+
+    pub fn current_delay(&self) -> Duration {
+        self.backoff.current()
+    }
+
+    pub fn next_delay(&mut self) -> Duration {
+        let delay = self.backoff.current();
+        self.backoff.next();
+        delay
+    }
+
+    pub fn transport_attempts(&self) -> u32 {
+        self.transport_attempts
+    }
+
+    pub fn negotiation_failures(&self) -> u32 {
+        self.post_upgrade_failures
+    }
+
+    pub fn saml_attempts(&self) -> u32 {
+        self.saml_attempts
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
-    Connecting,
-    Connected,
-    Reconnecting,
-    ReAuthenticating,
+    EstablishingTunnel,
+    Authenticating,
+    Running,
+    WaitingToRetry,
     WaitingForNetwork,
-    Cleanup,
+    CleaningUp,
 }
 
 pub struct AuthParams {
@@ -116,10 +258,36 @@ pub struct ReconnectController {
     auth_params: AuthParams,
     svpn_cookie: String,
     tunnel_config: TunnelConfig,
-    backoff: Backoff,
+    policy: ReconnectPolicy,
     state: ConnectionState,
     shutdown: Shutdown,
 }
+
+fn classify_tunnel_connect_error(error: &FortiError) -> ConnectFailureKind {
+    match error {
+        FortiError::CookieRejected(_) => ConnectFailureKind::CookieRejected,
+        FortiError::PostUpgradeNegotiation(_)
+        | FortiError::ProtocolError(_)
+        | FortiError::TunnelClosed => ConnectFailureKind::PostUpgrade,
+        FortiError::TransportUnavailable(_)
+        | FortiError::Io(_)
+        | FortiError::Tls(_)
+        | FortiError::TunnelError(_)
+        | FortiError::PppError(_)
+        | FortiError::AuthFailed(_)
+        | FortiError::SamlCallbackTimedOut
+        | FortiError::SamlCallbackInvalid(_)
+        | FortiError::SamlTerminalConfiguration(_)
+        | FortiError::Http(_) => ConnectFailureKind::TransportUnavailable,
+    }
+}
+
+struct ConnectFailure {
+    kind: ConnectFailureKind,
+    source: FortiError,
+}
+
+type ConnectedTunnel = (TlsTunnel, crate::ppp::lcp::LcpState, std::net::Ipv4Addr);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Interrupt {
@@ -156,8 +324,10 @@ async fn interruptible<T>(
 ) -> std::result::Result<T, Interrupt> {
     tokio::pin!(operation);
     loop {
+        if shutdown.is_cancelled() {
+            return Err(Interrupt::Shutdown);
+        }
         tokio::select! {
-            biased;
             _ = shutdown.cancelled() => return Err(Interrupt::Shutdown),
             power = next_power_event(power_rx) => {
                 if power == PowerEvent::WillSleep {
@@ -185,8 +355,8 @@ impl ReconnectController {
             auth_params,
             svpn_cookie,
             tunnel_config,
-            backoff: Backoff::new(),
-            state: ConnectionState::Connecting,
+            policy: ReconnectPolicy::new(),
+            state: ConnectionState::EstablishingTunnel,
             shutdown,
         }
     }
@@ -225,12 +395,78 @@ impl ReconnectController {
             }
         };
 
-        self.state = ConnectionState::Connected;
         let shutdown = self.shutdown.clone();
         let mut terminal_error: Option<FortiError> = None;
-        let mut consecutive_connect_failures = 0u32;
 
         'reconnect: loop {
+            if let Some(attempt_kind) = self.policy.next_auth_attempt() {
+                self.state = ConnectionState::Authenticating;
+                info!(
+                    state = ?self.state,
+                    auth_requirement = ?self.policy.auth_requirement(),
+                    saml_attempt = self.policy.saml_attempts(),
+                    attempt_kind = ?attempt_kind,
+                    "Starting reconnect authentication attempt"
+                );
+
+                // A definitively rejected cookie must never be retried. An
+                // optional compatibility probe keeps the old cookie available
+                // if the SAML path itself times out.
+                prepare_cookie_for_auth(attempt_kind, &mut self.svpn_cookie);
+                match interruptible(
+                    self.re_authenticate(),
+                    &shutdown,
+                    &mut network_rx,
+                    &mut power_rx,
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        info!("Re-authentication successful, retrying tunnel");
+                        self.policy.on_saml_success();
+                        continue;
+                    }
+                    Ok(Err(auth_error)) => {
+                        let failure_kind = SamlFailureKind::classify(&auth_error);
+                        error!(
+                            state = ?self.state,
+                            failure_class = ?failure_kind,
+                            auth_requirement = ?self.policy.auth_requirement(),
+                            error = %auth_error,
+                            "Re-authentication failed"
+                        );
+                        if auth_failure_is_terminal(attempt_kind, failure_kind) {
+                            terminal_error = Some(auth_error);
+                            break 'reconnect;
+                        }
+                        self.policy.on_saml_failure(attempt_kind, failure_kind);
+                        let delay = self.policy.next_delay();
+                        if self
+                            .wait_for_retry(delay, &mut network_rx, &mut power_rx)
+                            .await
+                            == RetryOutcome::Shutdown
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(Interrupt::Shutdown) => break,
+                    Err(Interrupt::Sleep) => {
+                        if self.wait_for_wake(&mut power_rx).await {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(Interrupt::NetworkDown) => {
+                        if self.wait_for_network(&mut network_rx, &mut power_rx).await {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            self.state = ConnectionState::EstablishingTunnel;
             let connect_result = match interruptible(
                 self.connect_tunnel(),
                 &shutdown,
@@ -257,58 +493,32 @@ impl ReconnectController {
 
             let (mut tunnel, mut lcp, negotiated_ip) = match connect_result {
                 Ok(connected) => {
-                    consecutive_connect_failures = 0;
-                    self.backoff.reset();
+                    // This is the sole backoff reset point: TLS and PPP both
+                    // succeeded, ending the reconnect episode.
+                    self.policy.on_tunnel_established();
                     connected
                 }
-                Err(connect_error) => {
-                    consecutive_connect_failures = consecutive_connect_failures.saturating_add(1);
-                    if should_reauthenticate(&connect_error, consecutive_connect_failures) {
-                        warn!(
-                            "Tunnel authentication may be stale after {} failure(s): {}",
-                            consecutive_connect_failures, connect_error
-                        );
-                        self.state = ConnectionState::ReAuthenticating;
-                        match interruptible(
-                            self.re_authenticate(),
-                            &shutdown,
-                            &mut network_rx,
-                            &mut power_rx,
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {
-                                info!("Re-authentication successful, retrying tunnel");
-                                consecutive_connect_failures = 0;
-                                self.backoff.reset();
-                                continue;
-                            }
-                            Ok(Err(auth_error)) => {
-                                error!("Re-authentication failed: {}", auth_error);
-                                consecutive_connect_failures = 0;
-                            }
-                            Err(Interrupt::Shutdown) => break,
-                            Err(Interrupt::Sleep) => {
-                                if self.wait_for_wake(&mut power_rx).await {
-                                    break;
-                                }
-                                continue;
-                            }
-                            Err(Interrupt::NetworkDown) => {
-                                if self.wait_for_network(&mut network_rx, &mut power_rx).await {
-                                    break;
-                                }
-                                continue;
-                            }
-                        }
+                Err(connect_failure) => {
+                    self.policy.on_connect_failure(connect_failure.kind);
+                    warn!(
+                        state = ?self.state,
+                        failure_class = ?connect_failure.kind,
+                        connect_attempt = self.policy.transport_attempts(),
+                        negotiation_failure_count = self.policy.negotiation_failures(),
+                        auth_requirement = ?self.policy.auth_requirement(),
+                        error = %connect_failure.source,
+                        "Tunnel connection attempt failed"
+                    );
+                    if self.policy.auth_requirement() != AuthRequirement::NotRequired {
+                        continue;
                     }
 
-                    let delay = self.backoff.current();
+                    let delay = self.policy.next_delay();
                     warn!(
-                        "Tunnel connect failed: {}. Retrying in {:?}",
-                        connect_error, delay
+                        state = ?ConnectionState::WaitingToRetry,
+                        backoff_ms = delay.as_millis() as u64,
+                        "Backing off before tunnel retry"
                     );
-                    self.backoff.next();
                     if self
                         .wait_for_retry(delay, &mut network_rx, &mut power_rx)
                         .await
@@ -347,14 +557,11 @@ impl ReconnectController {
             }
 
             info!("Tunnel established, entering data plane");
-            self.state = ConnectionState::Connected;
+            self.state = ConnectionState::Running;
             let reason =
                 vpn::event_loop(&mut tunnel, &mut lcp, &tun_dev, &shutdown, &mut power_rx).await;
 
-            if !matches!(
-                reason,
-                DisconnectReason::UserQuit | DisconnectReason::SystemSleep
-            ) {
+            if should_send_terminate(&reason) {
                 let _ = tokio::time::timeout(
                     TERMINATE_TIMEOUT,
                     Self::send_terminate(&mut tunnel, &mut lcp),
@@ -377,10 +584,12 @@ impl ReconnectController {
             match classify_disconnect(&reason) {
                 ReconnectAction::Exit => break,
                 ReconnectAction::RetryWithCookie | ReconnectAction::ReAuthenticate => {
-                    let delay = self.backoff.current();
-                    self.state = ConnectionState::Reconnecting;
-                    info!("Reconnecting in {:?}...", delay);
-                    self.backoff.next();
+                    let delay = self.policy.next_delay();
+                    info!(
+                        state = ?ConnectionState::WaitingToRetry,
+                        backoff_ms = delay.as_millis() as u64,
+                        "Backing off before reconnect"
+                    );
                     if self
                         .wait_for_retry(delay, &mut network_rx, &mut power_rx)
                         .await
@@ -392,7 +601,7 @@ impl ReconnectController {
             }
         }
 
-        self.state = ConnectionState::Cleanup;
+        self.state = ConnectionState::CleaningUp;
         vpn::cleanup_tun(&applied_config, &iface_name).await;
         info!("VPN disconnected.");
         match terminal_error {
@@ -401,19 +610,31 @@ impl ReconnectController {
         }
     }
 
-    async fn connect_tunnel(
-        &self,
-    ) -> Result<(TlsTunnel, crate::ppp::lcp::LcpState, std::net::Ipv4Addr)> {
+    async fn connect_tunnel(&self) -> std::result::Result<ConnectedTunnel, ConnectFailure> {
         let mut tunnel = TlsTunnel::connect(
             &self.auth_params.server,
             self.auth_params.port,
             &self.svpn_cookie,
             self.auth_params.tls_config.clone(),
         )
-        .await?;
+        .await
+        .map_err(|source| ConnectFailure {
+            kind: classify_tunnel_connect_error(&source),
+            source,
+        })?;
 
         let mut ppp = PppEngine::new(1500);
-        let ipcp_config = ppp.negotiate(&mut tunnel).await?;
+        let ipcp_config = ppp
+            .negotiate(&mut tunnel)
+            .await
+            .map_err(|source| ConnectFailure {
+                kind: if matches!(source, FortiError::CookieRejected(_)) {
+                    ConnectFailureKind::CookieRejected
+                } else {
+                    ConnectFailureKind::PostUpgrade
+                },
+                source,
+            })?;
         let lcp = ppp.into_lcp();
         Ok((tunnel, lcp, ipcp_config.ip_address))
     }
@@ -471,9 +692,11 @@ impl ReconnectController {
         self.state = ConnectionState::WaitingForNetwork;
         info!("Network unreachable — waiting for reachability");
         loop {
+            if self.shutdown.is_cancelled() {
+                return true;
+            }
             tokio::select! {
-                biased;
-                _ = self.shutdown.cancelled() => return true,
+                    _ = self.shutdown.cancelled() => return true,
                 _ = tokio::time::sleep(MONITOR_FALLBACK_TIMEOUT) => {
                     warn!("No network reachability update after 15s — retrying with bounded connect timeout");
                     return false;
@@ -481,7 +704,7 @@ impl ReconnectController {
                 event = next_network_event(network_rx) => {
                     if event == NetworkEvent::Reachable {
                         info!("Network reachable — reconnecting");
-                        self.backoff.reset();
+                        self.policy.on_network_reachable();
                         return false;
                     }
                 }
@@ -499,9 +722,11 @@ impl ReconnectController {
         self.state = ConnectionState::WaitingForNetwork;
         info!("System going to sleep — waiting for wake");
         loop {
+            if self.shutdown.is_cancelled() {
+                return true;
+            }
             tokio::select! {
-                biased;
-                _ = self.shutdown.cancelled() => return true,
+                    _ = self.shutdown.cancelled() => return true,
                 _ = tokio::time::sleep(MONITOR_FALLBACK_TIMEOUT) => {
                     warn!("No wake notification after 15s — retrying with bounded connect timeout");
                     return false;
@@ -509,7 +734,7 @@ impl ReconnectController {
                 event = next_power_event(power_rx) => {
                     if event == PowerEvent::HasPoweredOn {
                         info!("System woke up — reconnecting");
-                        self.backoff.reset();
+                        self.policy.on_system_wake();
                         return false;
                     }
                 }
@@ -523,15 +748,18 @@ impl ReconnectController {
         network_rx: &mut mpsc::UnboundedReceiver<NetworkEvent>,
         power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
     ) -> RetryOutcome {
+        self.state = ConnectionState::WaitingToRetry;
+        if self.shutdown.is_cancelled() {
+            return RetryOutcome::Shutdown;
+        }
         tokio::select! {
-            biased;
             _ = self.shutdown.cancelled() => RetryOutcome::Shutdown,
             _ = tokio::time::sleep(delay) => RetryOutcome::Retry,
             event = next_network_event(network_rx) => {
                 match event {
                     NetworkEvent::Reachable => {
                         info!("Network reachable — reconnecting immediately");
-                        self.backoff.reset();
+                        self.policy.on_network_reachable();
                         RetryOutcome::Retry
                     }
                     NetworkEvent::Unreachable => {
@@ -573,15 +801,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn typed_cookie_rejection_reauthenticates_immediately() {
-        assert!(should_reauthenticate(&FortiError::CookieRejected(403), 1));
-    }
-
-    #[test]
-    fn repeated_ambiguous_failures_eventually_reauthenticate() {
-        let error = FortiError::PppError("timeout".into());
-        assert!(!should_reauthenticate(&error, 2));
-        assert!(should_reauthenticate(&error, 3));
+    fn connect_errors_are_classified_by_phase() {
+        assert_eq!(
+            classify_tunnel_connect_error(&FortiError::TransportUnavailable(
+                "TLS tunnel connect timed out after 30s".into()
+            )),
+            ConnectFailureKind::TransportUnavailable
+        );
+        assert_eq!(
+            classify_tunnel_connect_error(&FortiError::PostUpgradeNegotiation(
+                "connection closed after tunnel request".into()
+            )),
+            ConnectFailureKind::PostUpgrade
+        );
+        assert_eq!(
+            classify_tunnel_connect_error(&FortiError::ProtocolError(
+                "malformed tunnel HTTP response".into()
+            )),
+            ConnectFailureKind::PostUpgrade
+        );
+        assert_eq!(
+            classify_tunnel_connect_error(&FortiError::CookieRejected(403)),
+            ConnectFailureKind::CookieRejected
+        );
     }
 
     #[test]
@@ -596,6 +838,43 @@ mod tests {
         assert!(apply_negotiated_ip(&mut config, new_ip));
         assert_eq!(config.ip_address, new_ip);
         assert!(network_config_changed(&applied, &config));
+    }
+
+    #[test]
+    fn user_quit_attempts_terminate_but_sleep_does_not() {
+        assert!(should_send_terminate(&DisconnectReason::UserQuit));
+        assert!(should_send_terminate(&DisconnectReason::DeadPeer));
+        assert!(!should_send_terminate(&DisconnectReason::SystemSleep));
+    }
+
+    #[test]
+    fn only_required_terminal_auth_failure_stops_controller() {
+        assert!(auth_failure_is_terminal(
+            AuthAttemptKind::Required,
+            SamlFailureKind::TerminalConfiguration
+        ));
+        assert!(!auth_failure_is_terminal(
+            AuthAttemptKind::CompatibilityProbe,
+            SamlFailureKind::TerminalConfiguration
+        ));
+        assert!(!auth_failure_is_terminal(
+            AuthAttemptKind::Required,
+            SamlFailureKind::CallbackTimedOut
+        ));
+    }
+
+    #[test]
+    fn auth_attempt_invalidates_only_definitively_rejected_cookie() {
+        let mut required_cookie = "rejected".to_string();
+        prepare_cookie_for_auth(AuthAttemptKind::Required, &mut required_cookie);
+        assert!(required_cookie.is_empty());
+
+        let mut compatibility_cookie = "possibly-valid".to_string();
+        prepare_cookie_for_auth(
+            AuthAttemptKind::CompatibilityProbe,
+            &mut compatibility_cookie,
+        );
+        assert_eq!(compatibility_cookie, "possibly-valid");
     }
 
     #[tokio::test]

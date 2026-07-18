@@ -3,11 +3,25 @@
 ## Quick Reference
 
 ```bash
-cargo build                # Build
-cargo test                 # Run all 50 tests
-cargo check                # Check without building
-cargo clippy               # Lint
+cargo build
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+git diff --check
 ```
+
+The reconnect backoff is `1, 2, 4, 8, 16, 32, 60, ...` seconds. It is preserved across transport failures, network/wake notifications, and SAML attempts, and resets only after TLS plus PPP negotiation succeeds.
+
+Bounded operations:
+
+- FortiGate HTTP/TLS connect: 30 seconds
+- Tunnel write: 10 seconds
+- SAML callback connection I/O: 5 seconds
+- Whole interactive SAML callback wait: 5 minutes
+- Best-effort LCP terminate: 2 seconds
+- Route + DNS cleanup: one shared 10-second budget
+
+A first Ctrl+C starts graceful shutdown. A second Ctrl+C is an explicit force-exit and returns status 130.
 
 ## Running the Client
 
@@ -43,3 +57,29 @@ cargo test --test power_monitor_test
 # Specific test by name
 cargo test test_encode_fortinet_frame
 ```
+
+
+## Reconnect and Shutdown Regression Tests
+
+```bash
+cargo test --test reconnect_test
+cargo test --lib auth::tests
+cargo test --lib reconnect::tests
+cargo test --lib tunnel::tests
+cargo test --lib vpn::tests
+cargo test --test signal_test
+```
+
+These tests cover typed failure policy, sticky rejected cookies, the one-probe compatibility episode, backoff reset timing, callback fragmentation/size/deadline handling, tunnel HTTP rejection, level-triggered shutdown, unbiased ready-source progress, UserQuit termination policy, and the shared cleanup deadline.
+
+## Manual release blockers
+
+The automated suite does not substitute for a root-enabled macOS test gateway and IdP. Before treating this checkpoint as merge-ready, capture timestamped logs for:
+
+1. FortiGate dead-peer/firewall block and recovery with cookie reuse and no SAML.
+2. Wi-Fi off/on and sleep/wake in connect, backoff, SAML, and connected states.
+3. Expired cookie with a valid IdP session, changed MFA/password, and an unavailable IdP.
+4. Ctrl+C in every controller state, including a deliberately stalled cleanup and second Ctrl+C exit 130.
+5. Route/DNS/IP changes and partial setup failure; verify no stale routes or `State:/Network/Service/forti-client/DNS` entry after exit.
+
+Until this evidence exists, the real FortiGate/IdP and privileged TUN/route/DNS scenarios remain release blockers rather than silently waived checks.

@@ -1,76 +1,40 @@
-use forti_client::reconnect::Backoff;
-use forti_client::reconnect::{classify_disconnect, DisconnectReason, ReconnectAction};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use forti_client::error::{AuthRequirement, ConnectFailureKind, SamlFailureKind};
+use forti_client::reconnect::{
+    classify_disconnect, AuthAttemptKind, Backoff, ConnectionState, DisconnectReason,
+    ReconnectAction, ReconnectPolicy,
+};
 
 #[test]
-fn test_dead_peer_is_recoverable() {
-    assert_eq!(
-        classify_disconnect(&DisconnectReason::DeadPeer),
-        ReconnectAction::RetryWithCookie,
-    );
-}
-
-#[test]
-fn test_tunnel_closed_is_recoverable() {
-    assert_eq!(
-        classify_disconnect(&DisconnectReason::TunnelClosed),
-        ReconnectAction::RetryWithCookie,
-    );
-}
-
-#[test]
-fn test_server_terminated_is_recoverable() {
-    assert_eq!(
-        classify_disconnect(&DisconnectReason::ServerTerminated),
-        ReconnectAction::RetryWithCookie,
-    );
-}
-
-#[test]
-fn test_io_error_is_recoverable() {
-    assert_eq!(
-        classify_disconnect(&DisconnectReason::IoError("TUN read error".into())),
-        ReconnectAction::RetryWithCookie,
-    );
-}
-
-#[test]
-fn test_user_quit_exits() {
+fn disconnect_reasons_preserve_existing_behavior() {
+    for reason in [
+        DisconnectReason::DeadPeer,
+        DisconnectReason::TunnelClosed,
+        DisconnectReason::ServerTerminated,
+        DisconnectReason::IoError("TUN read error".into()),
+        DisconnectReason::SystemSleep,
+    ] {
+        assert_eq!(
+            classify_disconnect(&reason),
+            ReconnectAction::RetryWithCookie
+        );
+    }
     assert_eq!(
         classify_disconnect(&DisconnectReason::UserQuit),
-        ReconnectAction::Exit,
+        ReconnectAction::Exit
     );
 }
 
 #[test]
-fn test_backoff_initial() {
-    let backoff = Backoff::new();
-    assert_eq!(backoff.current(), Duration::from_secs(1));
+fn backoff_sequence_is_one_through_capped_sixty() {
+    let mut policy = ReconnectPolicy::new();
+    let delays: Vec<_> = (0..9).map(|_| policy.next_delay().as_secs()).collect();
+    assert_eq!(delays, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
 }
 
 #[test]
-fn test_backoff_exponential() {
-    let mut backoff = Backoff::new();
-    assert_eq!(backoff.current(), Duration::from_secs(1));
-    backoff.next();
-    assert_eq!(backoff.current(), Duration::from_secs(2));
-    backoff.next();
-    assert_eq!(backoff.current(), Duration::from_secs(4));
-    backoff.next();
-    assert_eq!(backoff.current(), Duration::from_secs(8));
-}
-
-#[test]
-fn test_backoff_caps_at_60s() {
-    let mut backoff = Backoff::new();
-    for _ in 0..10 {
-        backoff.next();
-    }
-    assert_eq!(backoff.current(), Duration::from_secs(60));
-}
-
-#[test]
-fn test_backoff_reset() {
+fn standalone_backoff_reset_is_preserved() {
     let mut backoff = Backoff::new();
     backoff.next();
     backoff.next();
@@ -79,59 +43,187 @@ fn test_backoff_reset() {
     assert_eq!(backoff.current(), Duration::from_secs(1));
 }
 
-use std::time::Instant;
-
 #[test]
-fn test_no_gap_detected_for_normal_interval() {
-    let last = Instant::now() - Duration::from_secs(10);
-    assert!(!forti_client::reconnect::detect_sleep_gap(
-        last,
-        Duration::from_secs(10)
-    ));
+fn transport_unavailable_never_permits_saml() {
+    let mut policy = ReconnectPolicy::new();
+    for _ in 0..10_000 {
+        policy.on_connect_failure(ConnectFailureKind::TransportUnavailable);
+        assert_eq!(policy.auth_requirement(), AuthRequirement::NotRequired);
+        assert_eq!(policy.next_auth_attempt(), None);
+    }
 }
 
 #[test]
-fn test_gap_detected_for_long_pause() {
-    let last = Instant::now() - Duration::from_secs(45);
+fn transport_failure_breaks_consecutive_post_upgrade_count() {
+    let mut policy = ReconnectPolicy::new();
+    for _ in 0..3 {
+        policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
+        policy.on_connect_failure(ConnectFailureKind::TransportUnavailable);
+    }
+    assert_eq!(policy.auth_requirement(), AuthRequirement::NotRequired);
+    assert_eq!(policy.next_auth_attempt(), None);
+
+    for _ in 0..3 {
+        policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
+    }
+    assert_eq!(
+        policy.next_auth_attempt(),
+        Some(AuthAttemptKind::CompatibilityProbe)
+    );
+}
+
+#[test]
+fn cookie_rejection_requires_immediate_sticky_authentication() {
+    let mut policy = ReconnectPolicy::new();
+    policy.on_connect_failure(ConnectFailureKind::CookieRejected);
+
+    assert_eq!(policy.auth_requirement(), AuthRequirement::Required);
+    assert_eq!(policy.next_auth_attempt(), Some(AuthAttemptKind::Required));
+
+    policy.on_saml_failure(
+        AuthAttemptKind::Required,
+        SamlFailureKind::TerminalConfiguration,
+    );
+    assert_eq!(policy.auth_requirement(), AuthRequirement::Required);
+    assert_eq!(policy.next_auth_attempt(), Some(AuthAttemptKind::Required));
+
+    policy.on_saml_failure(
+        AuthAttemptKind::Required,
+        SamlFailureKind::GatewayUnavailable,
+    );
+    assert_eq!(policy.auth_requirement(), AuthRequirement::Required);
+    assert_eq!(policy.next_auth_attempt(), Some(AuthAttemptKind::Required));
+}
+
+#[derive(Clone, Copy)]
+enum ScenarioStep {
+    PostUpgradeFailure,
+    SamlFailure,
+    SamlSuccess,
+}
+
+fn run_post_upgrade_script(
+    policy: &mut ReconnectPolicy,
+    script: &[ScenarioStep],
+) -> Vec<Option<AuthAttemptKind>> {
+    script
+        .iter()
+        .map(|step| {
+            match step {
+                ScenarioStep::PostUpgradeFailure => {
+                    policy.on_connect_failure(ConnectFailureKind::PostUpgrade)
+                }
+                ScenarioStep::SamlFailure => policy.on_saml_failure(
+                    AuthAttemptKind::CompatibilityProbe,
+                    SamlFailureKind::TerminalConfiguration,
+                ),
+                ScenarioStep::SamlSuccess => policy.on_saml_success(),
+            }
+            policy.next_auth_attempt()
+        })
+        .collect()
+}
+
+#[test]
+fn third_post_upgrade_failure_gets_only_one_probe_in_episode() {
+    let mut policy = ReconnectPolicy::new();
+    let attempts = run_post_upgrade_script(
+        &mut policy,
+        &[
+            ScenarioStep::PostUpgradeFailure,
+            ScenarioStep::PostUpgradeFailure,
+            ScenarioStep::PostUpgradeFailure,
+            ScenarioStep::SamlFailure,
+            ScenarioStep::SamlSuccess,
+            ScenarioStep::PostUpgradeFailure,
+            ScenarioStep::PostUpgradeFailure,
+        ],
+    );
+
+    assert_eq!(
+        attempts,
+        [
+            None,
+            None,
+            Some(AuthAttemptKind::CompatibilityProbe),
+            None,
+            None,
+            None,
+            None,
+        ]
+    );
+}
+
+#[test]
+fn successful_tunnel_starts_a_new_probe_episode() {
+    let mut policy = ReconnectPolicy::new();
+    for _ in 0..3 {
+        policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
+    }
+    assert_eq!(
+        policy.next_auth_attempt(),
+        Some(AuthAttemptKind::CompatibilityProbe)
+    );
+    policy.on_saml_success();
+    policy.on_tunnel_established();
+
+    for _ in 0..2 {
+        policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
+        assert_eq!(policy.next_auth_attempt(), None);
+    }
+    policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
+    assert_eq!(
+        policy.next_auth_attempt(),
+        Some(AuthAttemptKind::CompatibilityProbe)
+    );
+}
+
+#[test]
+fn only_tls_plus_ppp_success_resets_backoff() {
+    let mut policy = ReconnectPolicy::new();
+    assert_eq!(policy.next_delay(), Duration::from_secs(1));
+    assert_eq!(policy.current_delay(), Duration::from_secs(2));
+
+    policy.on_network_reachable();
+    assert_eq!(policy.current_delay(), Duration::from_secs(2));
+    policy.on_system_wake();
+    assert_eq!(policy.current_delay(), Duration::from_secs(2));
+
+    policy.on_connect_failure(ConnectFailureKind::CookieRejected);
+    assert_eq!(policy.next_auth_attempt(), Some(AuthAttemptKind::Required));
+    policy.on_saml_success();
+    assert_eq!(policy.current_delay(), Duration::from_secs(2));
+
+    policy.on_tunnel_established();
+    assert_eq!(policy.current_delay(), Duration::from_secs(1));
+}
+
+#[test]
+fn sleep_gap_detection_behavior_is_preserved() {
+    let interval = Duration::from_secs(10);
+    assert!(!forti_client::reconnect::detect_sleep_gap(
+        Instant::now() - Duration::from_secs(10),
+        interval
+    ));
+    assert!(!forti_client::reconnect::detect_sleep_gap(
+        Instant::now() - Duration::from_secs(20),
+        interval
+    ));
     assert!(forti_client::reconnect::detect_sleep_gap(
-        last,
-        Duration::from_secs(10)
+        Instant::now() - Duration::from_secs(45),
+        interval
     ));
 }
 
 #[test]
-fn test_no_gap_for_moderate_delay() {
-    // 20s elapsed with 10s interval — 2x is not enough to trigger (threshold is 3x)
-    let last = Instant::now() - Duration::from_secs(20);
-    assert!(!forti_client::reconnect::detect_sleep_gap(
-        last,
-        Duration::from_secs(10)
-    ));
-}
-
-use forti_client::reconnect::ConnectionState;
-
-#[test]
-fn test_initial_state_is_connecting() {
-    let state = ConnectionState::Connecting;
-    assert!(matches!(state, ConnectionState::Connecting));
-}
-
-#[test]
-fn test_state_transitions() {
+fn connection_states_name_actual_controller_phases() {
     let states = [
-        ConnectionState::Connecting,
-        ConnectionState::Connected,
-        ConnectionState::Reconnecting,
-        ConnectionState::ReAuthenticating,
+        ConnectionState::EstablishingTunnel,
+        ConnectionState::Authenticating,
+        ConnectionState::Running,
+        ConnectionState::WaitingToRetry,
         ConnectionState::WaitingForNetwork,
-        ConnectionState::Cleanup,
+        ConnectionState::CleaningUp,
     ];
     assert_eq!(states.len(), 6);
-}
-
-#[test]
-fn test_waiting_for_network_state() {
-    let state = ConnectionState::WaitingForNetwork;
-    assert!(matches!(state, ConnectionState::WaitingForNetwork));
 }

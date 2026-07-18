@@ -8,6 +8,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn post_upgrade_error(error: FortiError) -> FortiError {
+    match error {
+        FortiError::CookieRejected(_) | FortiError::PostUpgradeNegotiation(_) => error,
+        other => FortiError::PostUpgradeNegotiation(other.to_string()),
+    }
+}
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HTTP_HEADER: usize = 16 * 1024;
@@ -35,7 +42,9 @@ impl TlsTunnel {
             Self::connect_inner(server, port, svpn_cookie, tls_config),
         )
         .await
-        .map_err(|_| FortiError::TunnelError("TLS tunnel connect timed out after 30s".into()))?
+        .map_err(|_| {
+            FortiError::TransportUnavailable("TLS tunnel connect timed out after 30s".into())
+        })?
     }
 
     async fn connect_inner(
@@ -46,14 +55,18 @@ impl TlsTunnel {
     ) -> Result<Self> {
         let connector = tokio_rustls::TlsConnector::from(tls_config);
         let server_name = rustls::pki_types::ServerName::try_from(server.to_string())
-            .map_err(|e| FortiError::TunnelError(format!("invalid server name: {}", e)))?;
+            .map_err(|e| FortiError::TransportUnavailable(format!("invalid server name: {}", e)))?;
 
-        let tcp = tokio::net::TcpStream::connect(format!("{}:{}", server, port)).await?;
-        tcp.set_nodelay(true)?;
+        let tcp = tokio::net::TcpStream::connect(format!("{}:{}", server, port))
+            .await
+            .map_err(|e| FortiError::TransportUnavailable(format!("TCP connect failed: {}", e)))?;
+        tcp.set_nodelay(true).map_err(|e| {
+            FortiError::TransportUnavailable(format!("failed to configure TCP socket: {}", e))
+        })?;
         let mut tls = connector
             .connect(server_name, tcp)
             .await
-            .map_err(|e| FortiError::TunnelError(format!("TLS connect failed: {}", e)))?;
+            .map_err(|e| FortiError::TransportUnavailable(format!("TLS connect failed: {}", e)))?;
 
         let http_req = format!(
             "GET /remote/sslvpn-tunnel HTTP/1.1\r\n\
@@ -83,8 +96,12 @@ impl TlsTunnel {
                 .join("\n");
             debug!("Tunnel request:\n{}", redacted_req.trim());
         }
-        tls.write_all(http_req.as_bytes()).await?;
-        tls.flush().await?;
+        tls.write_all(http_req.as_bytes()).await.map_err(|e| {
+            FortiError::TransportUnavailable(format!("tunnel request write failed: {}", e))
+        })?;
+        tls.flush().await.map_err(|e| {
+            FortiError::TransportUnavailable(format!("tunnel request flush failed: {}", e))
+        })?;
         info!("Sent tunnel upgrade request");
 
         let mut read_buf = Vec::new();
@@ -92,17 +109,21 @@ impl TlsTunnel {
         let mut upgrade_response_pending = true;
         match tokio::time::timeout(INITIAL_RESPONSE_TIMEOUT, tls.read(&mut response_buf)).await {
             Ok(Ok(0)) => {
-                return Err(FortiError::TunnelError(
+                return Err(FortiError::PostUpgradeNegotiation(
                     "connection closed after tunnel request".into(),
                 ));
             }
             Ok(Ok(n)) => {
                 read_buf.extend_from_slice(&response_buf[..n]);
-                upgrade_response_pending = process_upgrade_response(&mut read_buf)?;
+                upgrade_response_pending =
+                    process_upgrade_response(&mut read_buf).map_err(post_upgrade_error)?;
                 debug!("Tunnel received {} initial bytes", n);
             }
             Ok(Err(e)) => {
-                return Err(FortiError::TunnelError(format!("tunnel read error: {}", e)));
+                return Err(FortiError::PostUpgradeNegotiation(format!(
+                    "tunnel read error: {}",
+                    e
+                )));
             }
             Err(_) => {
                 // Some FortiGates wait for the first LCP packet. recv_frame() will
@@ -146,7 +167,7 @@ impl TlsTunnel {
 
             let n = self.tls_stream.read(&mut self.recv_tmp).await?;
             if n == 0 {
-                return Err(FortiError::TunnelError("tunnel closed by peer".into()));
+                return Err(FortiError::TunnelClosed);
             }
             self.read_buf.extend_from_slice(&self.recv_tmp[..n]);
             if self.read_buf.len() > MAX_HTTP_HEADER && self.upgrade_response_pending {
@@ -175,9 +196,19 @@ fn process_upgrade_response(buf: &mut Vec<u8>) -> Result<bool> {
     }
 
     let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        if buf.len() > MAX_HTTP_HEADER {
+            return Err(FortiError::ProtocolError(
+                "tunnel HTTP response header exceeds 16 KiB".into(),
+            ));
+        }
         return Ok(true);
     };
     let header_len = header_end + 4;
+    if header_len > MAX_HTTP_HEADER {
+        return Err(FortiError::ProtocolError(
+            "tunnel HTTP response header exceeds 16 KiB".into(),
+        ));
+    }
     let status_line_end = buf
         .windows(2)
         .position(|w| w == b"\r\n")
@@ -226,6 +257,26 @@ mod tests {
         assert!(matches!(
             process_upgrade_response(&mut buf),
             Err(FortiError::CookieRejected(403))
+        ));
+    }
+
+    #[test]
+    fn unauthorized_upgrade_is_typed_cookie_rejection() {
+        let mut buf = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_vec();
+        assert!(matches!(
+            process_upgrade_response(&mut buf),
+            Err(FortiError::CookieRejected(401))
+        ));
+    }
+
+    #[test]
+    fn oversized_complete_upgrade_header_is_rejected() {
+        let mut buf = b"HTTP/1.1 200 OK\r\nX-Fill: ".to_vec();
+        buf.extend(std::iter::repeat_n(b'a', MAX_HTTP_HEADER));
+        buf.extend_from_slice(b"\r\n\r\n");
+        assert!(matches!(
+            process_upgrade_response(&mut buf),
+            Err(FortiError::ProtocolError(_))
         ));
     }
 
