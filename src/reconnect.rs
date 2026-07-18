@@ -108,6 +108,7 @@ pub enum AuthAttemptKind {
 pub struct ReconnectPolicy {
     backoff: Backoff,
     auth_requirement: AuthRequirement,
+    connect_attempts: u32,
     transport_attempts: u32,
     post_upgrade_failures: u32,
     compatibility_probe_used: bool,
@@ -125,6 +126,7 @@ impl ReconnectPolicy {
         Self {
             backoff: Backoff::new(),
             auth_requirement: AuthRequirement::NotRequired,
+            connect_attempts: 0,
             transport_attempts: 0,
             post_upgrade_failures: 0,
             compatibility_probe_used: false,
@@ -178,6 +180,10 @@ impl ReconnectPolicy {
         }
     }
 
+    pub fn on_connect_attempt(&mut self) {
+        self.connect_attempts = self.connect_attempts.saturating_add(1);
+    }
+
     pub fn on_saml_failure(&mut self, attempt: AuthAttemptKind, _kind: SamlFailureKind) {
         self.auth_requirement = match attempt {
             // A rejected cookie remains unusable until a new cookie is obtained.
@@ -204,6 +210,7 @@ impl ReconnectPolicy {
     pub fn on_tunnel_established(&mut self) {
         self.backoff.reset();
         self.auth_requirement = AuthRequirement::NotRequired;
+        self.connect_attempts = 0;
         self.transport_attempts = 0;
         self.post_upgrade_failures = 0;
         self.compatibility_probe_used = false;
@@ -224,6 +231,10 @@ impl ReconnectPolicy {
         self.transport_attempts
     }
 
+    pub fn connect_attempts(&self) -> u32 {
+        self.connect_attempts
+    }
+
     pub fn negotiation_failures(&self) -> u32 {
         self.post_upgrade_failures
     }
@@ -237,6 +248,7 @@ impl ReconnectPolicy {
 pub enum ConnectionState {
     EstablishingTunnel,
     Authenticating,
+    RefreshingConfig,
     Running,
     WaitingToRetry,
     WaitingForNetwork,
@@ -290,12 +302,12 @@ struct ConnectFailure {
 type ConnectedTunnel<Tunnel, Lcp> = (Tunnel, Lcp, std::net::Ipv4Addr);
 type DriverConnectResult<Tunnel, Lcp> =
     std::result::Result<ConnectedTunnel<Tunnel, Lcp>, ConnectFailure>;
-type DriverFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + 'a>>;
+type DriverFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-trait ControllerDriver {
-    type Tun;
-    type Tunnel;
-    type Lcp;
+trait ControllerDriver: Send {
+    type Tun: Sync;
+    type Tunnel: Send;
+    type Lcp: Send;
 
     fn setup_tun<'a>(
         &'a mut self,
@@ -488,6 +500,44 @@ enum RetryOutcome {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RetryContext {
+    current_operation: &'static str,
+    retry_reason: &'static str,
+    failure_class: &'static str,
+}
+
+fn connect_failure_class(kind: ConnectFailureKind) -> &'static str {
+    match kind {
+        ConnectFailureKind::TransportUnavailable => "transport_unavailable",
+        ConnectFailureKind::CookieRejected => "cookie_rejected",
+        ConnectFailureKind::PostUpgrade => "post_upgrade",
+        ConnectFailureKind::LocalSetup => "local_setup",
+        ConnectFailureKind::Cancelled => "cancelled",
+    }
+}
+
+fn saml_failure_class(kind: SamlFailureKind) -> &'static str {
+    match kind {
+        SamlFailureKind::CallbackTimedOut => "callback_timed_out",
+        SamlFailureKind::GatewayUnavailable => "gateway_unavailable",
+        SamlFailureKind::CallbackInvalid => "callback_invalid",
+        SamlFailureKind::UserCancelled => "user_cancelled",
+        SamlFailureKind::TerminalConfiguration => "terminal_configuration",
+    }
+}
+
+fn disconnect_failure_class(reason: &DisconnectReason) -> &'static str {
+    match reason {
+        DisconnectReason::DeadPeer => "dead_peer",
+        DisconnectReason::TunnelClosed => "tunnel_closed",
+        DisconnectReason::ServerTerminated => "server_terminated",
+        DisconnectReason::IoError(_) => "io_error",
+        DisconnectReason::SystemSleep => "system_sleep",
+        DisconnectReason::UserQuit => "user_quit",
+    }
+}
+
 async fn next_network_event(rx: &mut mpsc::UnboundedReceiver<NetworkEvent>) -> NetworkEvent {
     match rx.recv().await {
         Some(event) => event,
@@ -581,7 +631,7 @@ impl ReconnectController {
 
         'reconnect: loop {
             if pending_config_refresh {
-                self.state = ConnectionState::Authenticating;
+                self.state = ConnectionState::RefreshingConfig;
                 match interruptible(
                     driver.fetch_tunnel_config(&self.auth_params, &self.svpn_cookie),
                     &shutdown,
@@ -604,13 +654,30 @@ impl ReconnectController {
                         pending_config_refresh = false;
                         self.policy
                             .on_connect_failure(ConnectFailureKind::CookieRejected);
+                        self.log_retry_transition(
+                            RetryContext {
+                                current_operation: "config_refresh",
+                                retry_reason: "cookie_rejected",
+                                failure_class: "cookie_rejected",
+                            },
+                            Duration::ZERO,
+                            &ConnectionState::Authenticating,
+                        );
                         continue;
                     }
                     Ok(Err(error)) => {
                         warn!(error = %error, "Tunnel config refresh failed; retrying without authentication");
-                        let delay = self.policy.next_delay();
+                        let failure_kind = SamlFailureKind::classify(&error);
                         if self
-                            .wait_for_retry(delay, &mut network_rx, &mut power_rx)
+                            .wait_for_retry(
+                                RetryContext {
+                                    current_operation: "config_refresh",
+                                    retry_reason: "config_refresh_failed",
+                                    failure_class: saml_failure_class(failure_kind),
+                                },
+                                &mut network_rx,
+                                &mut power_rx,
+                            )
                             .await
                             == RetryOutcome::Shutdown
                         {
@@ -673,9 +740,16 @@ impl ReconnectController {
                             break 'reconnect;
                         }
                         self.policy.on_saml_failure(attempt_kind, failure_kind);
-                        let delay = self.policy.next_delay();
                         if self
-                            .wait_for_retry(delay, &mut network_rx, &mut power_rx)
+                            .wait_for_retry(
+                                RetryContext {
+                                    current_operation: "authentication",
+                                    retry_reason: "authentication_failed",
+                                    failure_class: saml_failure_class(failure_kind),
+                                },
+                                &mut network_rx,
+                                &mut power_rx,
+                            )
                             .await
                             == RetryOutcome::Shutdown
                         {
@@ -700,6 +774,14 @@ impl ReconnectController {
             }
 
             self.state = ConnectionState::EstablishingTunnel;
+            self.policy.on_connect_attempt();
+            info!(
+                state = ?self.state,
+                connect_attempt = self.policy.connect_attempts(),
+                auth_requirement = ?self.policy.auth_requirement(),
+                saml_attempt = self.policy.saml_attempts(),
+                "Starting tunnel connection attempt"
+            );
             let connect_result = match interruptible(
                 driver.connect_tunnel(&self.auth_params, &self.svpn_cookie),
                 &shutdown,
@@ -734,18 +816,35 @@ impl ReconnectController {
                     warn!(
                         state = ?self.state,
                         failure_class = ?connect_failure.kind,
-                        connect_attempt = self.policy.transport_attempts(),
+                        connect_attempt = self.policy.connect_attempts(),
+                        transport_failure_count = self.policy.transport_attempts(),
                         negotiation_failure_count = self.policy.negotiation_failures(),
                         auth_requirement = ?self.policy.auth_requirement(),
                         error = %connect_failure.source,
                         "Tunnel connection attempt failed"
                     );
                     if self.policy.auth_requirement() != AuthRequirement::NotRequired {
+                        self.log_retry_transition(
+                            RetryContext {
+                                current_operation: "tunnel_connect",
+                                retry_reason: "authentication_required",
+                                failure_class: connect_failure_class(connect_failure.kind),
+                            },
+                            Duration::ZERO,
+                            &ConnectionState::Authenticating,
+                        );
                         continue;
                     }
-                    let delay = self.policy.next_delay();
                     if self
-                        .wait_for_retry(delay, &mut network_rx, &mut power_rx)
+                        .wait_for_retry(
+                            RetryContext {
+                                current_operation: "tunnel_connect",
+                                retry_reason: "connect_failed",
+                                failure_class: connect_failure_class(connect_failure.kind),
+                            },
+                            &mut network_rx,
+                            &mut power_rx,
+                        )
                         .await
                         == RetryOutcome::Shutdown
                     {
@@ -814,9 +913,16 @@ impl ReconnectController {
             match classify_disconnect(&reason) {
                 ReconnectAction::Exit => break,
                 ReconnectAction::RetryWithCookie | ReconnectAction::ReAuthenticate => {
-                    let delay = self.policy.next_delay();
                     if self
-                        .wait_for_retry(delay, &mut network_rx, &mut power_rx)
+                        .wait_for_retry(
+                            RetryContext {
+                                current_operation: "data_plane",
+                                retry_reason: "data_plane_disconnected",
+                                failure_class: disconnect_failure_class(&reason),
+                            },
+                            &mut network_rx,
+                            &mut power_rx,
+                        )
                         .await
                         == RetryOutcome::Shutdown
                     {
@@ -890,13 +996,35 @@ impl ReconnectController {
         }
     }
 
+    fn log_retry_transition(
+        &self,
+        context: RetryContext,
+        delay: Duration,
+        next_state: &ConnectionState,
+    ) {
+        info!(
+            state = ?next_state,
+            backoff_ms = delay.as_millis() as u64,
+            current_operation = context.current_operation,
+            retry_reason = context.retry_reason,
+            failure_class = context.failure_class,
+            connect_attempt = self.policy.connect_attempts(),
+            transport_failure_count = self.policy.transport_attempts(),
+            saml_attempt = self.policy.saml_attempts(),
+            auth_requirement = ?self.policy.auth_requirement(),
+            "Reconnect retry transition"
+        );
+    }
+
     async fn wait_for_retry(
         &mut self,
-        delay: Duration,
+        context: RetryContext,
         network_rx: &mut mpsc::UnboundedReceiver<NetworkEvent>,
         power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
     ) -> RetryOutcome {
         self.state = ConnectionState::WaitingToRetry;
+        let delay = self.policy.next_delay();
+        self.log_retry_transition(context, delay, &self.state);
         if self.shutdown.is_cancelled() {
             return RetryOutcome::Shutdown;
         }
@@ -1084,6 +1212,7 @@ mod tests {
 
     enum ScriptConnect {
         Failure(ConnectFailureKind),
+        FailureThenSleepWake(ConnectFailureKind),
         Success(Ipv4Addr),
         Sleep,
     }
@@ -1091,6 +1220,8 @@ mod tests {
     enum ScriptAuth {
         Result(Result<String>),
         NetworkDown,
+        SleepUntil(tokio::sync::oneshot::Receiver<()>),
+        Pending,
     }
 
     struct ScriptDriver {
@@ -1098,6 +1229,7 @@ mod tests {
         connects: VecDeque<ScriptConnect>,
         auth: VecDeque<ScriptAuth>,
         configs: VecDeque<Result<TunnelConfig>>,
+        config_network_down: usize,
         events: VecDeque<DisconnectReason>,
         network_tx: Option<mpsc::UnboundedSender<NetworkEvent>>,
         power_tx: Option<mpsc::UnboundedSender<PowerEvent>>,
@@ -1112,6 +1244,7 @@ mod tests {
                 connects: VecDeque::new(),
                 auth: VecDeque::new(),
                 configs: VecDeque::new(),
+                config_network_down: 0,
                 events: VecDeque::new(),
                 network_tx: None,
                 power_tx: None,
@@ -1216,6 +1349,17 @@ mod tests {
                     tx.send(NetworkEvent::Reachable).unwrap();
                     Box::pin(std::future::pending())
                 }
+                ScriptAuth::SleepUntil(wake) => {
+                    let tx = self.power_tx.as_ref().unwrap().clone();
+                    tx.send(PowerEvent::WillSleep).unwrap();
+                    tokio::spawn(async move {
+                        if wake.await.is_ok() {
+                            let _ = tx.send(PowerEvent::HasPoweredOn);
+                        }
+                    });
+                    Box::pin(std::future::pending())
+                }
+                ScriptAuth::Pending => Box::pin(std::future::pending()),
             }
         }
 
@@ -1225,6 +1369,13 @@ mod tests {
             cookie: &'a str,
         ) -> DriverFuture<'a, Result<TunnelConfig>> {
             self.record(format!("config:{cookie}"));
+            if self.config_network_down > 0 {
+                self.config_network_down -= 1;
+                let tx = self.network_tx.as_ref().unwrap().clone();
+                tx.send(NetworkEvent::Unreachable).unwrap();
+                tx.send(NetworkEvent::Reachable).unwrap();
+                return Box::pin(std::future::pending());
+            }
             let result = self.configs.pop_front().expect("missing scripted config");
             Box::pin(async move { result })
         }
@@ -1248,6 +1399,22 @@ mod tests {
                     };
                     Err(ConnectFailure { kind, source })
                 }),
+                ScriptConnect::FailureThenSleepWake(kind) => {
+                    let tx = self.power_tx.as_ref().unwrap().clone();
+                    tokio::spawn(async move {
+                        tokio::task::yield_now().await;
+                        tx.send(PowerEvent::WillSleep).unwrap();
+                        tx.send(PowerEvent::HasPoweredOn).unwrap();
+                    });
+                    Box::pin(async move {
+                        Err(ConnectFailure {
+                            kind,
+                            source: FortiError::TransportUnavailable(
+                                "scripted failure before sleep".into(),
+                            ),
+                        })
+                    })
+                }
                 ScriptConnect::Success(ip) => {
                     Box::pin(async move { Ok((ScriptTunnel, ScriptLcp, ip)) })
                 }
@@ -1300,12 +1467,20 @@ mod tests {
     }
 
     fn controller(initial: TunnelConfig, shutdown: Shutdown) -> ReconnectController {
+        controller_with_saml(initial, shutdown, true)
+    }
+
+    fn controller_with_saml(
+        initial: TunnelConfig,
+        shutdown: Shutdown,
+        saml: bool,
+    ) -> ReconnectController {
         let auth_client = AuthClient::new("vpn.example", 443, false).unwrap();
         ReconnectController::new(
             AuthParams {
                 server: "vpn.example".into(),
                 port: 443,
-                saml: true,
+                saml,
                 username: None,
                 password: None,
                 realm: None,
@@ -1316,6 +1491,242 @@ mod tests {
             initial,
             shutdown,
         )
+    }
+
+    #[test]
+    fn public_controller_run_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+
+        let mut controller = controller(
+            config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]),
+            Shutdown::new(),
+        );
+        assert_send(controller.run());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cookie_rejections_bypass_capped_backoff_without_advancing_time() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        for _ in 0..7 {
+            controller.policy.next_delay();
+        }
+        assert_eq!(controller.policy.current_delay(), Duration::from_secs(60));
+
+        let mut driver = ScriptDriver::default();
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("first-new-cookie".into())));
+        driver
+            .configs
+            .push_back(Err(FortiError::CookieRejected(403)));
+        driver.auth.push_back(ScriptAuth::Pending);
+
+        let log = driver.log.clone();
+        let started_at = tokio::time::Instant::now();
+        {
+            let run = controller.run_with_driver(&mut driver);
+            tokio::pin!(run);
+            let observe_second_auth = async {
+                for _ in 0..1_000 {
+                    if log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|entry| *entry == "auth")
+                        .count()
+                        == 2
+                    {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                panic!("authentication was not called without waiting for capped backoff");
+            };
+            tokio::select! {
+                result = &mut run => panic!("controller unexpectedly completed: {result:?}"),
+                _ = observe_second_auth => {}
+            }
+        }
+
+        assert_eq!(tokio::time::Instant::now(), started_at);
+        assert_eq!(controller.policy.current_delay(), Duration::from_secs(60));
+        assert_eq!(
+            driver
+                .snapshot()
+                .iter()
+                .filter(|entry| *entry == "auth")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn saml_sleep_waits_for_explicit_wake_before_retrying_authentication() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        let (wake_tx, wake_rx) = tokio::sync::oneshot::channel();
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver.auth.push_back(ScriptAuth::SleepUntil(wake_rx));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("new-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        let log = driver.log.clone();
+        let run = controller.run_with_driver(&mut driver);
+        tokio::pin!(run);
+        let prove_auth_is_blocked_before_wake = async {
+            for _ in 0..1_000 {
+                let auth_calls = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|entry| *entry == "auth")
+                    .count();
+                assert!(
+                    auth_calls <= 1,
+                    "authentication retried before HasPoweredOn"
+                );
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            result = &mut run => panic!("controller completed before explicit wake: {result:?}"),
+            _ = prove_auth_is_blocked_before_wake => {}
+        }
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| *entry == "auth")
+                .count(),
+            1
+        );
+
+        wake_tx.send(()).expect("release scripted wake gate");
+        (&mut run).await.unwrap();
+
+        let log = log.lock().unwrap();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 2);
+        assert!(log.contains(&"connect:new-cookie".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dead_peer_backoff_reconnects_with_cached_cookie_then_user_quits() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        driver.connects.extend([
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+        ]);
+        driver
+            .events
+            .extend([DisconnectReason::DeadPeer, DisconnectReason::UserQuit]);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+        assert_eq!(
+            log.iter()
+                .filter(|entry| *entry == "connect:old-cookie")
+                .count(),
+            2
+        );
+        assert_eq!(log.iter().filter(|entry| *entry == "event_loop").count(), 2);
+        assert_eq!(controller.state, ConnectionState::CleaningUp);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_sleep_waits_for_wake_before_cached_cookie_retry() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        driver.connects.extend([
+            ScriptConnect::FailureThenSleepWake(ConnectFailureKind::TransportUnavailable),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+        ]);
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        assert_eq!(
+            driver
+                .snapshot()
+                .iter()
+                .filter(|entry| *entry == "connect:old-cookie")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn network_cycle_during_config_refresh_retries_only_config() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver {
+            config_network_down: 1,
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("new-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 1);
+        assert_eq!(
+            log.iter()
+                .filter(|entry| *entry == "config:new-cookie")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_pending_saml_and_mfa_auth_and_cleans_up() {
+        for saml in [true, false] {
+            let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+            let shutdown = Shutdown::new();
+            let trigger = shutdown.clone();
+            let mut controller = controller_with_saml(initial, shutdown, saml);
+            let mut driver = ScriptDriver::default();
+            driver
+                .connects
+                .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+            driver.auth.push_back(ScriptAuth::Pending);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                trigger.cancel();
+            });
+
+            controller.run_with_driver(&mut driver).await.unwrap();
+            let log = driver.snapshot();
+            assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 1);
+            assert_eq!(
+                log.iter()
+                    .filter(|entry| entry.starts_with("cleanup:"))
+                    .count(),
+                1
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

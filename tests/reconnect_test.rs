@@ -181,6 +181,9 @@ fn successful_tunnel_starts_a_new_probe_episode() {
 #[test]
 fn only_tls_plus_ppp_success_resets_backoff() {
     let mut policy = ReconnectPolicy::new();
+    policy.on_connect_attempt();
+    policy.on_connect_attempt();
+    assert_eq!(policy.connect_attempts(), 2);
     assert_eq!(policy.next_delay(), Duration::from_secs(1));
     assert_eq!(policy.current_delay(), Duration::from_secs(2));
 
@@ -196,6 +199,7 @@ fn only_tls_plus_ppp_success_resets_backoff() {
 
     policy.on_tunnel_established();
     assert_eq!(policy.current_delay(), Duration::from_secs(1));
+    assert_eq!(policy.connect_attempts(), 0);
 }
 
 #[test]
@@ -220,10 +224,11 @@ fn connection_states_name_actual_controller_phases() {
     let states = [
         ConnectionState::EstablishingTunnel,
         ConnectionState::Authenticating,
+        ConnectionState::RefreshingConfig,
         ConnectionState::Running,
         ConnectionState::WaitingToRetry,
         ConnectionState::WaitingForNetwork,
         ConnectionState::CleaningUp,
     ];
-    assert_eq!(states.len(), 6);
+    assert_eq!(states.len(), 7);
 }

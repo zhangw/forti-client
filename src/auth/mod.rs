@@ -3,7 +3,7 @@ pub mod xml;
 use crate::error::{FortiError, Result};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 const HTTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -617,6 +617,46 @@ fn parse_saml_session_id(request_bytes: &[u8]) -> Option<String> {
     session_id
 }
 
+async fn read_saml_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<Option<Vec<u8>>> {
+    let mut request = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        request.extend_from_slice(&chunk[..n]);
+        if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_len = header_end + 4;
+            if header_len > MAX_SAML_CALLBACK_HEADER {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "SAML callback header exceeds 16 KiB",
+                ));
+            }
+            request.truncate(header_len);
+            return Ok(Some(request));
+        }
+        if request.len() > MAX_SAML_CALLBACK_HEADER {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "SAML callback header exceeds 16 KiB",
+            ));
+        }
+    }
+}
+
+async fn write_saml_response<Writer>(writer: &mut Writer, response: &[u8])
+where
+    Writer: AsyncWrite + Unpin,
+{
+    let _ = tokio::time::timeout(SAML_CALLBACK_IO_TIMEOUT, async {
+        writer.write_all(response).await?;
+        writer.shutdown().await
+    })
+    .await;
+}
+
 /// Inner accept loop: extracts the `id` parameter from the browser callback URL.
 /// Rejects malformed/invalid requests and continues listening until a valid
 /// callback is received. The outer 5-minute timeout controls the overall budget.
@@ -630,55 +670,27 @@ async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Resu
 
         // Read through the complete HTTP header. A browser may split the
         // request line or headers across arbitrary TCP packets.
-        let request_bytes = match tokio::time::timeout(SAML_CALLBACK_IO_TIMEOUT, async {
-            let mut request = Vec::with_capacity(1024);
-            let mut chunk = [0u8; 1024];
-            loop {
-                let n = stream.read(&mut chunk).await?;
-                if n == 0 {
-                    return Ok::<Option<Vec<u8>>, std::io::Error>(None);
+        let request_bytes =
+            match tokio::time::timeout(SAML_CALLBACK_IO_TIMEOUT, read_saml_request(&mut stream))
+                .await
+            {
+                Ok(Ok(Some(request))) => request,
+                Ok(Ok(None)) => {
+                    debug!("SAML callback: connection closed before complete headers");
+                    let _ = stream.shutdown().await;
+                    continue;
                 }
-                request.extend_from_slice(&chunk[..n]);
-                if let Some(header_end) =
-                    request.windows(4).position(|window| window == b"\r\n\r\n")
-                {
-                    let header_len = header_end + 4;
-                    if header_len > MAX_SAML_CALLBACK_HEADER {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "SAML callback header exceeds 16 KiB",
-                        ));
-                    }
-                    request.truncate(header_len);
-                    return Ok(Some(request));
+                Ok(Err(e)) => {
+                    debug!("SAML callback: read error: {}", e);
+                    let _ = stream.shutdown().await;
+                    continue;
                 }
-                if request.len() > MAX_SAML_CALLBACK_HEADER {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "SAML callback header exceeds 16 KiB",
-                    ));
+                Err(_) => {
+                    debug!("SAML callback: read timeout, rejecting connection");
+                    let _ = stream.shutdown().await;
+                    continue;
                 }
-            }
-        })
-        .await
-        {
-            Ok(Ok(Some(request))) => request,
-            Ok(Ok(None)) => {
-                debug!("SAML callback: connection closed before complete headers");
-                let _ = stream.shutdown().await;
-                continue;
-            }
-            Ok(Err(e)) => {
-                debug!("SAML callback: read error: {}", e);
-                let _ = stream.shutdown().await;
-                continue;
-            }
-            Err(_) => {
-                debug!("SAML callback: read timeout, rejecting connection");
-                let _ = stream.shutdown().await;
-                continue;
-            }
-        };
+            };
         let request = String::from_utf8_lossy(&request_bytes);
 
         // Log method only — request line contains session ID in the URL
@@ -706,11 +718,7 @@ async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Resu
                     <noscript><p>You may close this browser tab and return to the terminal.</p></noscript>\
                     </body></html>";
 
-                let _ = tokio::time::timeout(SAML_CALLBACK_IO_TIMEOUT, async {
-                    stream.write_all(response.as_bytes()).await?;
-                    stream.shutdown().await
-                })
-                .await;
+                write_saml_response(&mut stream, response.as_bytes()).await;
                 return Ok(id);
             }
             None => {
@@ -723,11 +731,7 @@ async fn wait_for_saml_callback_inner(listener: tokio::net::TcpListener) -> Resu
                     Connection: close\r\n\
                     \r\n\
                     Invalid callback request";
-                let _ = tokio::time::timeout(SAML_CALLBACK_IO_TIMEOUT, async {
-                    stream.write_all(response.as_bytes()).await?;
-                    stream.shutdown().await
-                })
-                .await;
+                write_saml_response(&mut stream, response.as_bytes()).await;
                 continue;
             }
         }
@@ -770,6 +774,27 @@ fn urlencoded(s: &str) -> String {
 mod tests {
     use super::*;
 
+    async fn announce_when_pending<F>(
+        future: F,
+        started: tokio::sync::oneshot::Sender<()>,
+    ) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        tokio::pin!(future);
+        let mut started = Some(started);
+        std::future::poll_fn(|context| {
+            let poll = future.as_mut().poll(context);
+            if poll.is_pending() {
+                if let Some(started) = started.take() {
+                    let _ = started.send(());
+                }
+            }
+            poll
+        })
+        .await
+    }
+
     #[test]
     fn test_redact_svpncookie() {
         let input = "SVPNCOOKIE=abc123secret; path=/; secure; HttpOnly";
@@ -786,6 +811,123 @@ mod tests {
     fn test_redact_empty_svpncookie() {
         let input = "SVPNCOOKIE=; path=/";
         assert_eq!(redact_set_cookie(input), "SVPNCOOKIE=<redacted>");
+    }
+
+    #[tokio::test]
+    async fn aborting_pending_callback_accept_releases_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(announce_when_pending(
+            wait_for_saml_callback_inner(listener),
+            started_tx,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("callback accept must be polled")
+            .expect("callback accept pending signal must be sent");
+
+        task.abort();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("aborted accept must finish promptly")
+            .expect_err("callback waiter must be cancelled");
+        let rebound = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("aborting accept must release the listener");
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn aborting_pending_callback_read_releases_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+        drop(listener);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            announce_when_pending(read_saml_request(&mut server_stream), started_tx).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("callback read must be polled")
+            .expect("callback read pending signal must be sent");
+
+        task.abort();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("aborted read must finish promptly")
+            .expect_err("callback read must be cancelled");
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .expect("peer stream must close after read cancellation")
+            .unwrap();
+        assert_eq!(read, 0);
+        let rebound = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("aborting read must leave the callback address reusable");
+        drop(rebound);
+    }
+
+    struct PendingWriter {
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for PendingWriter {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_pending_callback_write_drops_writer() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut writer = PendingWriter {
+                dropped: task_dropped,
+            };
+            announce_when_pending(write_saml_response(&mut writer, b"response"), started_tx).await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("callback write must be polled")
+            .expect("callback write pending signal must be sent");
+
+        task.abort();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("aborted write must finish promptly")
+            .expect_err("callback write must be cancelled");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

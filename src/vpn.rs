@@ -432,44 +432,81 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), ["routes", "cleanup"]);
     }
 
-    #[derive(Default)]
+    const MAX_FAKE_OPERATIONS: usize = 20_000;
+
+    #[derive(Debug, Default)]
     struct Progress {
+        operations: usize,
         tun_reads: usize,
         tun_writes: usize,
         tunnel_reads: usize,
         tunnel_writes: usize,
-        keepalives: usize,
+        lcp_writes: usize,
     }
 
-    struct FakeTun {
+    fn record_operation(
+        progress: &std::sync::Arc<std::sync::Mutex<Progress>>,
+    ) -> std::io::Result<()> {
+        let mut progress = progress.lock().unwrap();
+        progress.operations += 1;
+        if progress.operations > MAX_FAKE_OPERATIONS {
+            return Err(std::io::Error::other(
+                "fake I/O operation budget exhausted; event-loop source starved",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn wait_for_lcp_writes(
+        progress: &std::sync::Arc<std::sync::Mutex<Progress>>,
+        target: usize,
+    ) {
+        for _ in 0..1_000 {
+            if progress.lock().unwrap().lcp_writes >= target {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("keepalive did not run before the fake operation budget");
+    }
+
+    struct FairTun {
         progress: std::sync::Arc<std::sync::Mutex<Progress>>,
     }
 
-    impl TunIo for FakeTun {
+    impl TunIo for FairTun {
         async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            record_operation(&self.progress)?;
+            tokio::task::yield_now().await;
             self.progress.lock().unwrap().tun_reads += 1;
             buffer[..4].copy_from_slice(&[0x45, 0, 0, 0]);
             Ok(4)
         }
 
         async fn send(&self, packet: &[u8]) -> std::io::Result<usize> {
+            record_operation(&self.progress)?;
+            tokio::task::yield_now().await;
             self.progress.lock().unwrap().tun_writes += 1;
             Ok(packet.len())
         }
     }
 
-    struct FakeTunnel {
+    struct FairTunnel {
         progress: std::sync::Arc<std::sync::Mutex<Progress>>,
     }
 
-    impl TunnelIo for FakeTunnel {
+    impl TunnelIo for FairTunnel {
         async fn recv_frame(&mut self) -> Result<FortinetFrame> {
+            record_operation(&self.progress)?;
+            tokio::task::yield_now().await;
             let mut progress = self.progress.lock().unwrap();
+            // The first interval tick is immediate. Require two later ticks,
+            // in addition to progress from both continuously active directions.
             if progress.tun_reads > 0
                 && progress.tun_writes > 0
                 && progress.tunnel_reads > 0
                 && progress.tunnel_writes > 0
-                && progress.keepalives > 0
+                && progress.lcp_writes.saturating_sub(1) >= 2
             {
                 return Err(FortiError::TunnelClosed);
             }
@@ -481,10 +518,12 @@ mod tests {
         }
 
         async fn send_frame(&mut self, payload: Vec<u8>) -> Result<()> {
+            record_operation(&self.progress)?;
+            tokio::task::yield_now().await;
             if let Ok(frame) = PppFrame::decode(&payload) {
                 let mut progress = self.progress.lock().unwrap();
                 match frame.protocol() {
-                    PppProtocol::Lcp => progress.keepalives += 1,
+                    PppProtocol::Lcp => progress.lcp_writes += 1,
                     PppProtocol::Ipv4 => progress.tunnel_writes += 1,
                     _ => {}
                 }
@@ -496,24 +535,247 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn actual_event_loop_kernel_gives_all_ready_sources_progress() {
         let progress = std::sync::Arc::new(std::sync::Mutex::new(Progress::default()));
-        let mut tunnel = FakeTunnel {
-            progress: progress.clone(),
-        };
-        let tun = FakeTun {
-            progress: progress.clone(),
-        };
-        let mut lcp = LcpState::new(1500);
-        let shutdown = Shutdown::new();
-        let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+        let task_progress = progress.clone();
+        let task = tokio::spawn(async move {
+            let mut tunnel = FairTunnel {
+                progress: task_progress.clone(),
+            };
+            let tun = FairTun {
+                progress: task_progress,
+            };
+            let mut lcp = LcpState::new(1500);
+            let shutdown = Shutdown::new();
+            let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+            event_loop_with_io(&mut tunnel, &mut lcp, &tun, &shutdown, &mut power_rx).await
+        });
 
-        let reason =
-            event_loop_with_io(&mut tunnel, &mut lcp, &tun, &shutdown, &mut power_rx).await;
-        assert_eq!(reason, DisconnectReason::TunnelClosed);
+        // Consume and ignore interval's immediate first tick before measuring.
+        wait_for_lcp_writes(&progress, 1).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        wait_for_lcp_writes(&progress, 2).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let reason = task.await.expect("event loop task must not panic");
+        assert_eq!(
+            reason,
+            DisconnectReason::TunnelClosed,
+            "progress: {:?}",
+            *progress.lock().unwrap()
+        );
         let progress = progress.lock().unwrap();
+        assert!(progress.operations <= MAX_FAKE_OPERATIONS);
         assert!(progress.tun_reads > 0);
         assert!(progress.tun_writes > 0);
         assert!(progress.tunnel_reads > 0);
         assert!(progress.tunnel_writes > 0);
-        assert!(progress.keepalives > 0);
+        assert!(
+            progress.lcp_writes.saturating_sub(1) >= 2,
+            "two keepalives after the immediate interval tick must run"
+        );
+    }
+
+    struct AlwaysReadyTun {
+        operations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        shutdown: Shutdown,
+    }
+
+    impl AlwaysReadyTun {
+        fn operation(&self) -> std::io::Result<()> {
+            let operation = self
+                .operations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if operation == 100 {
+                self.shutdown.cancel();
+            }
+            if operation > MAX_FAKE_OPERATIONS {
+                return Err(std::io::Error::other(
+                    "shutdown was starved by continuously ready I/O",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl TunIo for AlwaysReadyTun {
+        async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.operation()?;
+            buffer[..4].copy_from_slice(&[0x45, 0, 0, 0]);
+            Ok(4)
+        }
+
+        async fn send(&self, packet: &[u8]) -> std::io::Result<usize> {
+            self.operation()?;
+            Ok(packet.len())
+        }
+    }
+
+    struct AlwaysReadyTunnel {
+        operations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        shutdown: Shutdown,
+    }
+
+    impl AlwaysReadyTunnel {
+        fn operation(&self) -> Result<()> {
+            let operation = self
+                .operations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if operation == 100 {
+                self.shutdown.cancel();
+            }
+            if operation > MAX_FAKE_OPERATIONS {
+                return Err(FortiError::TunnelError(
+                    "shutdown was starved by continuously ready I/O".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl TunnelIo for AlwaysReadyTunnel {
+        async fn recv_frame(&mut self) -> Result<FortinetFrame> {
+            self.operation()?;
+            Ok(FortinetFrame::new(
+                PppFrame::new(PppProtocol::Ipv4, vec![0x45, 0, 0, 0]).encode(),
+            ))
+        }
+
+        async fn send_frame(&mut self, _payload: Vec<u8>) -> Result<()> {
+            self.operation()
+        }
+    }
+
+    #[tokio::test]
+    async fn continuously_ready_io_does_not_starve_shutdown() {
+        let shutdown = Shutdown::new();
+        let operations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tunnel = AlwaysReadyTunnel {
+            operations: operations.clone(),
+            shutdown: shutdown.clone(),
+        };
+        let tun = AlwaysReadyTun {
+            operations: operations.clone(),
+            shutdown: shutdown.clone(),
+        };
+        let mut lcp = LcpState::new(1500);
+        let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+
+        let reason =
+            event_loop_with_io(&mut tunnel, &mut lcp, &tun, &shutdown, &mut power_rx).await;
+        assert_eq!(reason, DisconnectReason::UserQuit);
+        assert!(operations.load(std::sync::atomic::Ordering::Relaxed) <= MAX_FAKE_OPERATIONS);
+    }
+
+    struct PendingSendTun;
+
+    impl TunIo for PendingSendTun {
+        async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            buffer[..4].copy_from_slice(&[0x45, 0, 0, 0]);
+            Ok(4)
+        }
+
+        async fn send(&self, _packet: &[u8]) -> std::io::Result<usize> {
+            std::future::pending().await
+        }
+    }
+
+    struct PendingSendTunnel {
+        send_started: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl TunnelIo for PendingSendTunnel {
+        async fn recv_frame(&mut self) -> Result<FortinetFrame> {
+            std::future::pending().await
+        }
+
+        async fn send_frame(&mut self, _payload: Vec<u8>) -> Result<()> {
+            self.send_started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_nested_pending_tunnel_send() {
+        let shutdown = Shutdown::new();
+        let trigger = shutdown.clone();
+        let send_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let started = send_started.clone();
+        let task = tokio::spawn(async move {
+            let mut tunnel = PendingSendTunnel { send_started };
+            let tun = PendingSendTun;
+            let mut lcp = LcpState::new(1500);
+            let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+            event_loop_with_io(&mut tunnel, &mut lcp, &tun, &trigger, &mut power_rx).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("nested tunnel send must start");
+        shutdown.cancel();
+        let reason = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown must cancel pending tunnel send")
+            .unwrap();
+        assert_eq!(reason, DisconnectReason::UserQuit);
+    }
+
+    struct PendingWriteTun {
+        write_started: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl TunIo for PendingWriteTun {
+        async fn recv(&self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            std::future::pending().await
+        }
+
+        async fn send(&self, _packet: &[u8]) -> std::io::Result<usize> {
+            self.write_started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    struct PendingWriteTunnel {
+        frame_sent: bool,
+    }
+
+    impl TunnelIo for PendingWriteTunnel {
+        async fn recv_frame(&mut self) -> Result<FortinetFrame> {
+            if self.frame_sent {
+                return std::future::pending().await;
+            }
+            self.frame_sent = true;
+            Ok(FortinetFrame::new(
+                PppFrame::new(PppProtocol::Ipv4, vec![0x45, 0, 0, 0]).encode(),
+            ))
+        }
+
+        async fn send_frame(&mut self, _payload: Vec<u8>) -> Result<()> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_nested_pending_tun_write() {
+        let shutdown = Shutdown::new();
+        let trigger = shutdown.clone();
+        let write_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let started = write_started.clone();
+        let task = tokio::spawn(async move {
+            let mut tunnel = PendingWriteTunnel { frame_sent: false };
+            let tun = PendingWriteTun { write_started };
+            let mut lcp = LcpState::new(1500);
+            let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+            event_loop_with_io(&mut tunnel, &mut lcp, &tun, &trigger, &mut power_rx).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("nested TUN write must start");
+        shutdown.cancel();
+        let reason = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown must cancel pending TUN write")
+            .unwrap();
+        assert_eq!(reason, DisconnectReason::UserQuit);
     }
 }
