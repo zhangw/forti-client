@@ -1,6 +1,7 @@
 pub mod xml;
 
 use crate::error::{FortiError, Result};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -12,6 +13,44 @@ const SAML_CALLBACK_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SAML_CALLBACK_HEADER: usize = 16 * 1024;
 const MAX_AUTH_BODY_SIZE: usize = 4 * 1024 * 1024;
+const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Resolve the gateway hostname to a single socket address.
+///
+/// The caller pins this for the process lifetime so later reconnects never
+/// depend on the system resolver, which may be pointed at VPN-internal DNS
+/// servers reachable only through the tunnel being rebuilt.
+pub async fn resolve_server_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    let lookup = tokio::net::lookup_host(format!("{}:{}", host, port));
+    let addresses = tokio::time::timeout(DNS_RESOLVE_TIMEOUT, lookup)
+        .await
+        .map_err(|_| {
+            FortiError::TransportUnavailable(format!(
+                "DNS resolution for {} timed out after 10s",
+                host
+            ))
+        })?
+        .map_err(|error| {
+            FortiError::TransportUnavailable(format!("failed to resolve {}: {}", host, error))
+        })?;
+
+    select_gateway_addr(addresses).ok_or_else(|| {
+        FortiError::TransportUnavailable(format!("no addresses returned for {}", host))
+    })
+}
+
+/// Pick the gateway address to pin. The data plane is IPv4-only today, so an
+/// IPv4 address wins; otherwise keep the resolver's own ordering.
+fn select_gateway_addr(addresses: impl IntoIterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    let mut fallback = None;
+    for address in addresses {
+        if address.is_ipv4() {
+            return Some(address);
+        }
+        fallback.get_or_insert(address);
+    }
+    fallback
+}
 
 async fn collect_auth_body(body: hyper::body::Incoming, context: &str) -> Result<bytes::Bytes> {
     let limited = http_body_util::Limited::new(body, MAX_AUTH_BODY_SIZE);
@@ -116,6 +155,10 @@ pub struct AuthClient {
     server: String,
     port: u16,
     tls_config: Arc<rustls::ClientConfig>,
+    /// Pinned gateway address, bypassing the system resolver on every
+    /// connection. TLS still validates the certificate against `server`, so
+    /// pinning the address does not weaken verification.
+    pinned_addr: Option<SocketAddr>,
 }
 
 impl AuthClient {
@@ -135,7 +178,18 @@ impl AuthClient {
             server: server.to_string(),
             port,
             tls_config: Arc::new(tls_config),
+            pinned_addr: None,
         })
+    }
+
+    /// Pin the gateway address used for every subsequent connection.
+    pub fn with_pinned_addr(mut self, addr: SocketAddr) -> Self {
+        self.pinned_addr = Some(addr);
+        self
+    }
+
+    pub fn pinned_addr(&self) -> Option<SocketAddr> {
+        self.pinned_addr
     }
 
     /// Create a new TLS+HTTP connection to the server.
@@ -151,8 +205,12 @@ impl AuthClient {
             let server_name = rustls::pki_types::ServerName::try_from(self.server.clone())
                 .map_err(|e| FortiError::TunnelError(format!("invalid server name: {}", e)))?;
 
-            let tcp =
-                tokio::net::TcpStream::connect(format!("{}:{}", self.server, self.port)).await?;
+            let tcp = match self.pinned_addr {
+                Some(addr) => tokio::net::TcpStream::connect(addr).await?,
+                None => {
+                    tokio::net::TcpStream::connect(format!("{}:{}", self.server, self.port)).await?
+                }
+            };
             let tls = connector
                 .connect(server_name.clone(), tcp)
                 .await
@@ -799,6 +857,35 @@ mod tests {
     fn test_redact_svpncookie() {
         let input = "SVPNCOOKIE=abc123secret; path=/; secure; HttpOnly";
         assert_eq!(redact_set_cookie(input), "SVPNCOOKIE=<redacted>");
+    }
+
+    #[test]
+    fn ipv4_gateway_wins_over_earlier_ipv6_answer() {
+        let ipv6: SocketAddr = "[2001:db8::1]:10443".parse().unwrap();
+        let ipv4: SocketAddr = "203.0.113.7:10443".parse().unwrap();
+        assert_eq!(select_gateway_addr([ipv6, ipv4]), Some(ipv4));
+        assert_eq!(select_gateway_addr([ipv4, ipv6]), Some(ipv4));
+    }
+
+    #[test]
+    fn ipv6_only_answer_is_kept_and_empty_answer_is_rejected() {
+        let ipv6: SocketAddr = "[2001:db8::1]:10443".parse().unwrap();
+        assert_eq!(select_gateway_addr([ipv6]), Some(ipv6));
+        assert_eq!(select_gateway_addr([]), None);
+    }
+
+    #[test]
+    fn pinned_gateway_address_is_recorded_without_touching_server_name() {
+        let addr: SocketAddr = "203.0.113.7:10443".parse().unwrap();
+        let client = AuthClient::new("vpn.example", 10443, false)
+            .unwrap()
+            .with_pinned_addr(addr);
+        assert_eq!(client.pinned_addr(), Some(addr));
+        // TLS validation still targets the hostname, not the pinned address.
+        assert_eq!(client.server, "vpn.example");
+
+        let unpinned = AuthClient::new("vpn.example", 10443, false).unwrap();
+        assert_eq!(unpinned.pinned_addr(), None);
     }
 
     #[test]

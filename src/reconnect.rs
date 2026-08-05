@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use secrecy::{ExposeSecret, SecretString};
@@ -9,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use crate::auth::xml::TunnelConfig;
 use crate::auth::AuthClient;
 use crate::error::{AuthRequirement, ConnectFailureKind, FortiError, Result, SamlFailureKind};
-use crate::network_monitor::{NetworkEvent, NetworkMonitor};
+use crate::network_monitor::{NetworkEvent, NetworkMonitor, ReachabilityTarget};
 use crate::power_monitor::{PowerEvent, PowerMonitor};
 use crate::ppp::codec::{PppFrame, PppProtocol};
 use crate::ppp::PppEngine;
@@ -258,12 +259,26 @@ pub enum ConnectionState {
 pub struct AuthParams {
     pub server: String,
     pub port: u16,
+    /// Gateway address resolved once at startup. Reconnects connect straight to
+    /// it so they never depend on the system resolver, which the tunnel itself
+    /// may have pointed at VPN-internal DNS servers.
+    pub server_addr: Option<SocketAddr>,
     pub saml: bool,
     pub username: Option<String>,
     pub password: Option<SecretString>,
     pub realm: Option<String>,
     pub tls_config: Arc<rustls::ClientConfig>,
     pub enable_keylog: bool,
+}
+
+impl AuthParams {
+    fn auth_client(&self) -> Result<AuthClient> {
+        let client = AuthClient::new(&self.server, self.port, self.enable_keylog)?;
+        Ok(match self.server_addr {
+            Some(addr) => client.with_pinned_addr(addr),
+            None => client,
+        })
+    }
 }
 
 pub struct ReconnectController {
@@ -321,7 +336,7 @@ trait ControllerDriver: Send {
     ) -> DriverFuture<'a, ()>;
     fn start_monitors(
         &mut self,
-        server: &str,
+        target: ReachabilityTarget,
     ) -> Result<(
         mpsc::UnboundedReceiver<NetworkEvent>,
         mpsc::UnboundedReceiver<PowerEvent>,
@@ -332,6 +347,16 @@ trait ControllerDriver: Send {
         params: &'a AuthParams,
         cookie: &'a str,
     ) -> DriverFuture<'a, Result<TunnelConfig>>;
+    /// Withdraw the VPN DNS servers while no tunnel carries them. Returns an
+    /// error if the withdrawal could not be completed, so the caller can keep
+    /// treating VPN DNS as installed rather than falsely recording a withdraw.
+    fn suspend_dns(&mut self) -> DriverFuture<'_, Result<()>>;
+    /// Reinstall the VPN DNS servers once a tunnel is carrying them again.
+    fn resume_dns<'a>(
+        &'a mut self,
+        config: &'a TunnelConfig,
+        shutdown: &'a Shutdown,
+    ) -> DriverFuture<'a, Result<()>>;
     fn connect_tunnel<'a>(
         &'a mut self,
         params: &'a AuthParams,
@@ -381,12 +406,12 @@ impl ControllerDriver for ProductionDriver {
 
     fn start_monitors(
         &mut self,
-        server: &str,
+        target: ReachabilityTarget,
     ) -> Result<(
         mpsc::UnboundedReceiver<NetworkEvent>,
         mpsc::UnboundedReceiver<PowerEvent>,
     )> {
-        let (network_monitor, network_rx) = NetworkMonitor::start(server)
+        let (network_monitor, network_rx) = NetworkMonitor::start(target)
             .map_err(|error| FortiError::TunnelError(format!("network monitor failed: {error}")))?;
         self.network_monitor = Some(network_monitor);
         let (power_monitor, power_rx) = PowerMonitor::start()
@@ -397,7 +422,7 @@ impl ControllerDriver for ProductionDriver {
 
     fn authenticate<'a>(&'a mut self, params: &'a AuthParams) -> DriverFuture<'a, Result<String>> {
         Box::pin(async move {
-            let auth_client = AuthClient::new(&params.server, params.port, params.enable_keylog)?;
+            let auth_client = params.auth_client()?;
             if params.saml {
                 info!("Re-authenticating via SAML...");
                 auth_client.authenticate_saml().await
@@ -427,11 +452,22 @@ impl ControllerDriver for ProductionDriver {
         params: &'a AuthParams,
         cookie: &'a str,
     ) -> DriverFuture<'a, Result<TunnelConfig>> {
-        Box::pin(async move {
-            AuthClient::new(&params.server, params.port, params.enable_keylog)?
-                .fetch_tunnel_config(cookie)
-                .await
-        })
+        Box::pin(async move { params.auth_client()?.fetch_tunnel_config(cookie).await })
+    }
+
+    fn suspend_dns(&mut self) -> DriverFuture<'_, Result<()>> {
+        Box::pin(crate::tun::dns::remove_dns())
+    }
+
+    fn resume_dns<'a>(
+        &'a mut self,
+        config: &'a TunnelConfig,
+        shutdown: &'a Shutdown,
+    ) -> DriverFuture<'a, Result<()>> {
+        Box::pin(crate::tun::dns::configure_dns(
+            &config.dns_servers,
+            shutdown,
+        ))
     }
 
     fn connect_tunnel<'a>(
@@ -443,6 +479,7 @@ impl ControllerDriver for ProductionDriver {
             let mut tunnel = TlsTunnel::connect(
                 &params.server,
                 params.port,
+                params.server_addr,
                 cookie,
                 params.tls_config.clone(),
             )
@@ -580,6 +617,23 @@ async fn interruptible<T>(
     }
 }
 
+/// Withdraw VPN DNS unless it has already been withdrawn. On failure the flag
+/// is left unchanged: the controller keeps treating VPN DNS as installed (the
+/// safe assumption for the SAML browser path) rather than recording a withdraw
+/// that did not actually happen.
+async fn suspend_vpn_dns<Driver: ControllerDriver>(driver: &mut Driver, dns_suspended: &mut bool) {
+    if *dns_suspended {
+        return;
+    }
+    match driver.suspend_dns().await {
+        Ok(()) => *dns_suspended = true,
+        Err(error) => warn!(
+            error = %error,
+            "Failed to withdraw VPN DNS; it may remain installed and black-hole the reconnect path"
+        ),
+    }
+}
+
 impl ReconnectController {
     pub fn new(
         auth_params: AuthParams,
@@ -617,7 +671,16 @@ impl ReconnectController {
         let mut setup_active = true;
         info!("Press Ctrl+C to disconnect.");
 
-        let (mut network_rx, mut power_rx) = match driver.start_monitors(&self.auth_params.server) {
+        // Watch the gateway by its pinned IP when we have one. The hostname
+        // path resolves via the system resolver, which by this point may be the
+        // VPN's own DNS — that can pin the monitor to a VPN-internal address
+        // that falsely reports unreachable once the tunnel drops, stalling every
+        // reconnect until the 15s monitor fallback fires.
+        let monitor_target = match self.auth_params.server_addr {
+            Some(addr) => ReachabilityTarget::Address(addr),
+            None => ReachabilityTarget::Host(self.auth_params.server.clone()),
+        };
+        let (mut network_rx, mut power_rx) = match driver.start_monitors(monitor_target) {
             Ok(receivers) => receivers,
             Err(error) => {
                 driver.cleanup_tun(&applied_config, &iface_name).await;
@@ -628,6 +691,10 @@ impl ReconnectController {
         let shutdown = self.shutdown.clone();
         let mut terminal_error: Option<FortiError> = None;
         let mut pending_config_refresh = false;
+        // VPN DNS servers are typically reachable only through the tunnel. While
+        // no tunnel carries them they are withdrawn, otherwise every reconnect
+        // attempt (and any SAML browser launch) resolves into a black hole.
+        let mut dns_suspended = false;
 
         'reconnect: loop {
             if pending_config_refresh {
@@ -793,12 +860,18 @@ impl ReconnectController {
                 Ok(result) => result,
                 Err(Interrupt::Shutdown) => break,
                 Err(Interrupt::Sleep) => {
+                    // The first connect attempt can be interrupted before any
+                    // tunnel exists, while setup_tun has already installed the
+                    // VPN DNS. Withdraw it so the system resolver is usable
+                    // again while we wait for wake.
+                    suspend_vpn_dns(driver, &mut dns_suspended).await;
                     if self.wait_for_wake(&mut power_rx).await {
                         break;
                     }
                     continue;
                 }
                 Err(Interrupt::NetworkDown) => {
+                    suspend_vpn_dns(driver, &mut dns_suspended).await;
                     if self.wait_for_network(&mut network_rx, &mut power_rx).await {
                         break;
                     }
@@ -813,6 +886,7 @@ impl ReconnectController {
                 }
                 Err(connect_failure) => {
                     self.policy.on_connect_failure(connect_failure.kind);
+                    suspend_vpn_dns(driver, &mut dns_suspended).await;
                     warn!(
                         state = ?self.state,
                         failure_class = ?connect_failure.kind,
@@ -869,12 +943,22 @@ impl ReconnectController {
                         iface_name = new_iface;
                         applied_config = self.tunnel_config.clone();
                         setup_active = true;
+                        // setup_tun reinstalls DNS for the new configuration.
+                        dns_suspended = false;
                     }
                     Err(_) if shutdown.is_cancelled() => break 'reconnect,
                     Err(error) => {
                         terminal_error = Some(error);
                         break 'reconnect;
                     }
+                }
+            }
+
+            if dns_suspended {
+                if let Err(error) = driver.resume_dns(&self.tunnel_config, &shutdown).await {
+                    warn!(error = %error, "Failed to reinstall VPN DNS after reconnect");
+                } else {
+                    dns_suspended = false;
                 }
             }
 
@@ -898,6 +982,11 @@ impl ReconnectController {
                 .await;
             }
             drop(tunnel);
+
+            // The tunnel is gone; withdraw its DNS servers before any wait.
+            if reason != DisconnectReason::UserQuit {
+                suspend_vpn_dns(driver, &mut dns_suspended).await;
+            }
 
             if reason == DisconnectReason::SystemSleep {
                 if self.wait_for_wake(&mut power_rx).await {
@@ -1235,6 +1324,7 @@ mod tests {
         power_tx: Option<mpsc::UnboundedSender<PowerEvent>>,
         setup_calls: usize,
         fail_setup_call: Option<usize>,
+        fail_dns_suspend: usize,
     }
 
     impl Default for ScriptDriver {
@@ -1250,6 +1340,7 @@ mod tests {
                 power_tx: None,
                 setup_calls: 0,
                 fail_setup_call: None,
+                fail_dns_suspend: 0,
             }
         }
     }
@@ -1324,7 +1415,7 @@ mod tests {
 
         fn start_monitors(
             &mut self,
-            _server: &str,
+            _target: ReachabilityTarget,
         ) -> Result<(
             mpsc::UnboundedReceiver<NetworkEvent>,
             mpsc::UnboundedReceiver<PowerEvent>,
@@ -1378,6 +1469,39 @@ mod tests {
             }
             let result = self.configs.pop_front().expect("missing scripted config");
             Box::pin(async move { result })
+        }
+
+        fn suspend_dns(&mut self) -> DriverFuture<'_, Result<()>> {
+            self.record("dns_suspend");
+            let fail = self.fail_dns_suspend > 0;
+            if fail {
+                self.fail_dns_suspend -= 1;
+            }
+            Box::pin(async move {
+                if fail {
+                    Err(FortiError::TunnelError(
+                        "scripted DNS suspend failure".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn resume_dns<'a>(
+            &'a mut self,
+            config: &'a TunnelConfig,
+            _shutdown: &'a Shutdown,
+        ) -> DriverFuture<'a, Result<()>> {
+            self.record(format!(
+                "dns_resume:{}",
+                config
+                    .dns_servers
+                    .first()
+                    .copied()
+                    .unwrap_or(Ipv4Addr::UNSPECIFIED)
+            ));
+            Box::pin(async { Ok(()) })
         }
 
         fn connect_tunnel<'a>(
@@ -1480,6 +1604,7 @@ mod tests {
             AuthParams {
                 server: "vpn.example".into(),
                 port: 443,
+                server_addr: None,
                 saml,
                 username: None,
                 password: None,
@@ -2019,6 +2144,181 @@ mod tests {
                 .filter(|entry| entry.starts_with("cleanup:"))
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn data_plane_disconnect_withdraws_vpn_dns_until_tunnel_returns() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        driver.connects.extend([
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+        ]);
+        driver
+            .events
+            .extend([DisconnectReason::DeadPeer, DisconnectReason::UserQuit]);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        // The VPN DNS servers are only reachable through the tunnel, so they
+        // must be withdrawn while it is down and reinstalled once it is back.
+        let suspend = log.iter().position(|entry| entry == "dns_suspend");
+        let resume = log.iter().position(|entry| entry == "dns_resume:10.0.0.53");
+        assert!(
+            suspend.is_some(),
+            "disconnect must withdraw VPN DNS: {log:?}"
+        );
+        assert!(
+            resume.is_some(),
+            "reconnect must reinstall VPN DNS: {log:?}"
+        );
+        assert!(suspend < resume, "withdraw must precede reinstall: {log:?}");
+
+        // The retry wait must happen with DNS already withdrawn.
+        let retry_connect = log
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.starts_with("connect:"))
+            .nth(1)
+            .map(|(index, _)| index);
+        assert!(
+            suspend < retry_connect,
+            "DNS must be withdrawn before the retry connect: {log:?}"
+        );
+
+        assert_eq!(
+            log.iter().filter(|entry| *entry == "dns_suspend").count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_connect_failures_withdraw_vpn_dns_exactly_once() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        for _ in 0..4 {
+            driver.connects.push_back(ScriptConnect::Failure(
+                ConnectFailureKind::TransportUnavailable,
+            ));
+        }
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        // Repeated failures must not re-run scutil on every attempt.
+        assert_eq!(
+            log.iter().filter(|entry| *entry == "dns_suspend").count(),
+            1,
+            "{log:?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|entry| *entry == "dns_resume:10.0.0.53")
+                .count(),
+            1,
+            "{log:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clean_user_quit_leaves_dns_to_final_cleanup() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        // A never-interrupted session installs DNS once via setup_tun and
+        // removes it once via cleanup_tun; no mid-session churn.
+        assert!(!log.iter().any(|entry| entry == "dns_suspend"), "{log:?}");
+        assert!(
+            !log.iter().any(|entry| entry.starts_with("dns_resume")),
+            "{log:?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.starts_with("cleanup:"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_connect_sleep_interrupt_withdraws_vpn_dns() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        // The first connect is interrupted by sleep before any tunnel is up,
+        // while setup_tun has already installed the VPN DNS.
+        driver.connects.push_back(ScriptConnect::Sleep);
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        // setup_tun installs DNS; the first-iteration sleep must withdraw it
+        // before the retry reconnects, then the reconnect reinstalls it.
+        let suspend = log.iter().position(|entry| entry == "dns_suspend");
+        let resume = log.iter().position(|entry| entry == "dns_resume:10.0.0.53");
+        assert!(
+            suspend.is_some(),
+            "first-iteration sleep must withdraw VPN DNS: {log:?}"
+        );
+        assert!(
+            resume.is_some(),
+            "reconnect must reinstall VPN DNS: {log:?}"
+        );
+        assert!(suspend < resume, "withdraw must precede reinstall: {log:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suspend_dns_failure_is_retried_not_skipped() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver {
+            fail_dns_suspend: 1,
+            ..ScriptDriver::default()
+        };
+        // The first suspend is scripted to fail; because the controller must
+        // not record a withdraw that did not happen, it suspends again on the
+        // next failure before finally resuming on connect success.
+        driver.connects.extend([
+            ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
+            ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+        ]);
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        assert_eq!(
+            log.iter().filter(|entry| *entry == "dns_suspend").count(),
+            2,
+            "a failed suspend must be retried on the next failure: {log:?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|entry| *entry == "dns_resume:10.0.0.53")
+                .count(),
+            1,
+            "{log:?}"
         );
     }
 }

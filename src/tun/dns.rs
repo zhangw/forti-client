@@ -5,10 +5,34 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 const SCUTIL_SERVICE: &str = "State:/Network/Service/forti-client/DNS";
 const SCUTIL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Extract a failure message from a scutil run, or `None` on success.
+///
+/// scutil reports errors by printing them to **stdout** and still exiting `0`,
+/// so the exit status alone cannot detect a failed `set` or `remove`. Mutating
+/// commands are silent on success, which makes any output the error signal.
+fn scutil_failure(success: bool, stdout: &str, stderr: &str) -> Option<String> {
+    let message = if !stdout.trim().is_empty() {
+        stdout.trim()
+    } else if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else if success {
+        return None;
+    } else {
+        "scutil exited with a failure status and no diagnostics"
+    };
+    Some(message.to_string())
+}
+
+/// scutil's report for removing a key that is not present. Removal is meant to
+/// be idempotent: an absent key already is the desired end state.
+fn is_missing_key(message: &str) -> bool {
+    message.eq_ignore_ascii_case("No such key")
+}
 
 async fn run_scutil(input: &str) -> std::io::Result<Output> {
     let operation = async {
@@ -61,11 +85,13 @@ pub async fn configure_dns(servers: &[Ipv4Addr], shutdown: &Shutdown) -> Result<
         }
     };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Some(error) = scutil_failure(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    ) {
         return Err(FortiError::TunnelError(format!(
-            "scutil failed: {}",
-            stderr.trim()
+            "scutil failed to configure VPN DNS: {error}"
         )));
     }
 
@@ -73,13 +99,70 @@ pub async fn configure_dns(servers: &[Ipv4Addr], shutdown: &Shutdown) -> Result<
     Ok(())
 }
 
-pub async fn remove_dns() {
+/// Remove the VPN DNS configuration.
+///
+/// Returns an error when scutil cannot complete the removal (timeout or
+/// non-zero exit) so callers know the VPN DNS may still be installed. In the
+/// suspend path this matters: a silent failure would leave the controller
+/// believing the DNS was withdrawn while the system resolver still points at
+/// VPN-internal servers, black-holing the next reconnect.
+pub async fn remove_dns() -> Result<()> {
     let input = format!("remove {SCUTIL_SERVICE}\n");
-    match run_scutil(&input).await {
-        Ok(output) if output.status.success() => info!("Removed DNS configuration"),
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            warn!("DNS cleanup timed out after 5s")
+    let output = run_scutil(&input)
+        .await
+        .map_err(|e| FortiError::TunnelError(format!("failed to remove VPN DNS: {e}")))?;
+    match scutil_failure(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    ) {
+        None => {
+            info!("Removed DNS configuration");
+            Ok(())
         }
-        _ => debug!("DNS cleanup: nothing to remove or scutil failed"),
+        Some(error) if is_missing_key(&error) => {
+            debug!("VPN DNS configuration was already absent");
+            Ok(())
+        }
+        Some(error) => Err(FortiError::TunnelError(format!(
+            "scutil failed to remove VPN DNS: {error}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn silent_success_is_not_a_failure() {
+        assert_eq!(scutil_failure(true, "", ""), None);
+        assert_eq!(scutil_failure(true, "  \n ", " \n"), None);
+    }
+
+    #[test]
+    fn errors_printed_to_stdout_with_exit_zero_are_detected() {
+        // scutil's real behavior: diagnostics on stdout, exit status 0.
+        assert_eq!(
+            scutil_failure(true, "  Permission denied\n", ""),
+            Some("Permission denied".to_string())
+        );
+        assert_eq!(
+            scutil_failure(true, "  No such key\n", ""),
+            Some("No such key".to_string())
+        );
+    }
+
+    #[test]
+    fn stderr_and_bare_failure_status_are_still_reported() {
+        assert_eq!(scutil_failure(true, "", "boom\n"), Some("boom".to_string()));
+        assert!(scutil_failure(false, "", "").is_some());
+    }
+
+    #[test]
+    fn removing_an_absent_key_counts_as_success() {
+        assert!(is_missing_key("No such key"));
+        assert!(is_missing_key("no such key"));
+        assert!(!is_missing_key("Permission denied"));
     }
 }

@@ -12,7 +12,7 @@ use crate::tunnel::TlsTunnel;
 use std::future::Future;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 async fn finish_tun_setup<
     RouteSetup,
@@ -102,7 +102,9 @@ pub async fn cleanup_tun(config: &TunnelConfig, iface_name: &str) {
         async {
             cleanup_phase.store(1, std::sync::atomic::Ordering::Relaxed);
             info!("Removing VPN DNS configuration");
-            tun::dns::remove_dns().await;
+            if let Err(error) = tun::dns::remove_dns().await {
+                warn!(error = %error, "Failed to remove VPN DNS during cleanup");
+            }
         },
         CLEANUP_TIMEOUT,
     )

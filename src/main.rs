@@ -108,7 +108,15 @@ async fn main() -> anyhow::Result<()> {
         false
     };
 
-    let auth_client = AuthClient::new(&cli.server, cli.port, enable_keylog)?;
+    // Resolve the gateway once, up front, while the system resolver is still
+    // pointed at physical DNS servers. Every later connection and reconnect
+    // uses this address, so a tunnel that installs VPN-internal DNS servers
+    // cannot black-hole its own reconnect path.
+    let server_addr = forti_client::auth::resolve_server_addr(&cli.server, cli.port).await?;
+    tracing::info!("Resolved {} to {}", cli.server, server_addr);
+
+    let auth_client =
+        AuthClient::new(&cli.server, cli.port, enable_keylog)?.with_pinned_addr(server_addr);
 
     // Prompt for password early (before we need sudo/root)
     let password: Option<SecretString> = if !cli.saml {
@@ -208,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
     let auth_params = AuthParams {
         server: cli.server,
         port: cli.port,
+        server_addr: Some(server_addr),
         saml: cli.saml,
         username: cli.username,
         password,

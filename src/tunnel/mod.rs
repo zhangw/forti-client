@@ -2,6 +2,7 @@ pub mod codec;
 
 use crate::error::{FortiError, Result};
 use codec::{FortinetCodec, FortinetFrame};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -33,15 +34,19 @@ pub struct TlsTunnel {
 }
 
 impl TlsTunnel {
+    /// Connect the tunnel. When `server_addr` is set the TCP connection goes
+    /// straight to that address, bypassing the system resolver; `server` is
+    /// still used for SNI and certificate validation.
     pub async fn connect(
         server: &str,
         port: u16,
+        server_addr: Option<SocketAddr>,
         svpn_cookie: &str,
         tls_config: Arc<rustls::ClientConfig>,
     ) -> Result<Self> {
         tokio::time::timeout(
             CONNECT_TIMEOUT,
-            Self::connect_inner(server, port, svpn_cookie, tls_config),
+            Self::connect_inner(server, port, server_addr, svpn_cookie, tls_config),
         )
         .await
         .map_err(|_| {
@@ -52,6 +57,7 @@ impl TlsTunnel {
     async fn connect_inner(
         server: &str,
         port: u16,
+        server_addr: Option<SocketAddr>,
         svpn_cookie: &str,
         tls_config: Arc<rustls::ClientConfig>,
     ) -> Result<Self> {
@@ -59,9 +65,11 @@ impl TlsTunnel {
         let server_name = rustls::pki_types::ServerName::try_from(server.to_string())
             .map_err(|e| FortiError::TransportUnavailable(format!("invalid server name: {}", e)))?;
 
-        let tcp = tokio::net::TcpStream::connect(format!("{}:{}", server, port))
-            .await
-            .map_err(|e| FortiError::TransportUnavailable(format!("TCP connect failed: {}", e)))?;
+        let tcp = match server_addr {
+            Some(addr) => tokio::net::TcpStream::connect(addr).await,
+            None => tokio::net::TcpStream::connect(format!("{}:{}", server, port)).await,
+        }
+        .map_err(|e| FortiError::TransportUnavailable(format!("TCP connect failed: {}", e)))?;
         tcp.set_nodelay(true).map_err(|e| {
             FortiError::TransportUnavailable(format!("failed to configure TCP socket: {}", e))
         })?;
