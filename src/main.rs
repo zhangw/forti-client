@@ -135,31 +135,63 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Tokio keeps the SIGINT handler installed for the process lifetime. The
+    // Tokio keeps the signal handlers installed for the process lifetime. The
     // first signal starts bounded graceful shutdown; a second is an explicit
     // user override if protocol or system cleanup is stuck.
+    //
+    // SIGTERM and SIGHUP funnel into the same Shutdown as SIGINT rather than a
+    // separate channel, so the data-plane select! gains no extra branch. Before
+    // this, `kill` or a system shutdown skipped cleanup entirely and left the
+    // VPN DNS key installed system-wide.
     let shutdown = Shutdown::new();
     let signal_shutdown = shutdown.clone();
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     tokio::spawn(async move {
         let mut signal_number = 0u8;
         loop {
-            if tokio::signal::ctrl_c().await.is_err() {
-                return;
-            }
+            let signal_name = tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    if result.is_err() {
+                        return;
+                    }
+                    "SIGINT"
+                }
+                received = sigterm.recv() => {
+                    if received.is_none() {
+                        return;
+                    }
+                    "SIGTERM"
+                }
+                received = sighup.recv() => {
+                    if received.is_none() {
+                        return;
+                    }
+                    "SIGHUP"
+                }
+            };
             signal_number = signal_number.saturating_add(1);
             match shutdown_signal_action(signal_number) {
                 ShutdownSignalAction::Graceful => {
                     tracing::info!(
+                        signal = signal_name,
                         shutdown_phase = "graceful",
-                        "Ctrl+C received; disconnecting"
+                        "Signal received; disconnecting"
                     );
                     signal_shutdown.cancel();
                 }
                 ShutdownSignalAction::ForceExit => {
                     tracing::warn!(
+                        signal = signal_name,
                         shutdown_phase = "forced",
-                        "Second Ctrl+C received; forcing exit and possibly leaving routes or DNS behind"
+                        "Second signal received; forcing exit and possibly leaving routes behind"
                     );
+                    // process::exit runs no destructors, so the DNS guard never
+                    // fires here. Removing the key synchronously first is what
+                    // keeps a forced exit from breaking name resolution
+                    // machine-wide. Routes need no such care: the kernel drops
+                    // them when the utun interface closes with the process.
+                    forti_client::tun::dns::remove_dns_blocking();
                     std::process::exit(FORCED_SIGINT_EXIT_CODE);
                 }
             }
@@ -231,6 +263,11 @@ async fn main() -> anyhow::Result<()> {
         auth_result.tunnel_config,
         shutdown,
     );
+
+    // Last-resort cleanup for paths that never reach the controller's own
+    // teardown, such as a panic unwinding out of it. Unlike routes, the DNS key
+    // survives process death and would break resolution machine-wide.
+    let _dns_guard = forti_client::tun::dns::DnsGuard;
 
     controller.run().await?;
 

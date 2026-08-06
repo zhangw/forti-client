@@ -2,13 +2,28 @@ use crate::error::{FortiError, Result};
 use crate::shutdown::Shutdown;
 use std::net::Ipv4Addr;
 use std::process::{Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 
 const SCUTIL_SERVICE: &str = "State:/Network/Service/forti-client/DNS";
 const SCUTIL_TIMEOUT: Duration = Duration::from_secs(5);
+const BLOCKING_REMOVE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether our DNS key is currently installed in the system configuration.
+///
+/// This tracks a genuinely process-global resource. The SCDynamicStore key
+/// outlives the scutil process that created it, so a client that dies without
+/// removing it leaves the system resolver pointing at VPN-internal servers —
+/// unlike routes, which the kernel drops when the utun interface disappears.
+static DNS_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process currently has VPN DNS installed system-wide.
+pub fn dns_is_installed() -> bool {
+    DNS_INSTALLED.load(Ordering::SeqCst)
+}
 
 /// Extract a failure message from a scutil run, or `None` on success.
 ///
@@ -96,6 +111,7 @@ pub async fn configure_dns(servers: &[Ipv4Addr], shutdown: &Shutdown) -> Result<
     }
 
     info!("Configured DNS servers: {}", servers_joined);
+    DNS_INSTALLED.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -118,15 +134,93 @@ pub async fn remove_dns() -> Result<()> {
     ) {
         None => {
             info!("Removed DNS configuration");
+            DNS_INSTALLED.store(false, Ordering::SeqCst);
             Ok(())
         }
         Some(error) if is_missing_key(&error) => {
             debug!("VPN DNS configuration was already absent");
+            DNS_INSTALLED.store(false, Ordering::SeqCst);
             Ok(())
         }
         Some(error) => Err(FortiError::TunnelError(format!(
             "scutil failed to remove VPN DNS: {error}"
         ))),
+    }
+}
+
+/// Remove the VPN DNS configuration synchronously, bounded by a deadline.
+///
+/// Teardown paths that cannot await need this: `Drop` while unwinding from a
+/// panic, and the forced-exit signal handler. The async [`remove_dns`] is
+/// preferred whenever the runtime is still usable.
+///
+/// Returns true when the configuration is known to be gone. stdout and stderr
+/// go to /dev/null rather than pipes: nothing here can act on a diagnostic, and
+/// an unread pipe is one more way to block a path whose whole purpose is to
+/// finish quickly.
+pub fn remove_dns_blocking() -> bool {
+    if !dns_is_installed() {
+        return true;
+    }
+
+    let mut child = match std::process::Command::new("/usr/sbin/scutil")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            error!(%error, "Could not spawn scutil to remove VPN DNS");
+            return false;
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(format!("remove {SCUTIL_SERVICE}\n").as_bytes());
+        // Dropping stdin closes the pipe so scutil sees EOF and exits.
+    }
+
+    let deadline = std::time::Instant::now() + BLOCKING_REMOVE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                DNS_INSTALLED.store(false, Ordering::SeqCst);
+                return true;
+            }
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Removes the VPN DNS configuration on drop if it is still installed.
+///
+/// The normal shutdown path removes DNS asynchronously, and this guard then
+/// finds nothing to do. It exists for the paths that never reach that code: a
+/// panic unwinding out of the controller, or an early error return. Leaving the
+/// key behind breaks name resolution machine-wide until a human removes it, so
+/// a best-effort synchronous attempt is worth the blocking call.
+pub struct DnsGuard;
+
+impl Drop for DnsGuard {
+    fn drop(&mut self) {
+        if !dns_is_installed() {
+            return;
+        }
+        warn!("VPN DNS still installed during teardown; removing synchronously");
+        if !remove_dns_blocking() {
+            error!(
+                "Could not remove VPN DNS. System name resolution may stay broken. \
+                 Recover with: sudo scutil <<< 'remove {SCUTIL_SERVICE}'"
+            );
+        }
     }
 }
 
