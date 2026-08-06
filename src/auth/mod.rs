@@ -452,10 +452,20 @@ impl AuthClient {
         let saml_port: u16 = 8020;
 
         // Step 1: Start local HTTP server to receive the SAML callback
+        // A busy callback port is recoverable, so it must not be reported as a
+        // terminal configuration error. During a reconnect that would strand
+        // the client: SAML is the only way back to a usable cookie, so giving
+        // up guarantees the tunnel never returns, whereas retrying behind the
+        // controller's backoff costs nothing if the port frees up.
+        //
+        // std (and therefore tokio) already sets SO_REUSEADDR on Unix, so a
+        // lingering TIME_WAIT socket from our own previous listener does not
+        // reach this path. What does: another client instance, or an unrelated
+        // process holding the port.
         let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", saml_port))
             .await
             .map_err(|e| {
-                FortiError::SamlTerminalConfiguration(format!(
+                FortiError::SamlCallbackPortUnavailable(format!(
                     "failed to bind callback port {}: {} (is another VPN client running?)",
                     saml_port, e
                 ))

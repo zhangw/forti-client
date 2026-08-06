@@ -15,6 +15,9 @@ pub enum SamlFailureKind {
     GatewayUnavailable,
     CallbackInvalid,
     UserCancelled,
+    /// The local callback port could not be bound. Recoverable: the occupying
+    /// socket may be in TIME_WAIT, or the other process may exit.
+    LocalPortUnavailable,
     TerminalConfiguration,
 }
 
@@ -35,6 +38,9 @@ pub enum FortiError {
 
     #[error("invalid SAML callback: {0}")]
     SamlCallbackInvalid(String),
+
+    #[error("SAML callback port unavailable: {0}")]
+    SamlCallbackPortUnavailable(String),
 
     #[error("SAML terminal configuration error: {0}")]
     SamlTerminalConfiguration(String),
@@ -75,6 +81,7 @@ impl SamlFailureKind {
         match error {
             FortiError::SamlCallbackTimedOut => Self::CallbackTimedOut,
             FortiError::SamlCallbackInvalid(_) => Self::CallbackInvalid,
+            FortiError::SamlCallbackPortUnavailable(_) => Self::LocalPortUnavailable,
             FortiError::SamlTerminalConfiguration(_) => Self::TerminalConfiguration,
             FortiError::Io(_)
             | FortiError::Tls(_)

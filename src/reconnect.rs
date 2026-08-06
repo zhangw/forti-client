@@ -304,6 +304,7 @@ fn classify_tunnel_connect_error(error: &FortiError) -> ConnectFailureKind {
         | FortiError::AuthFailed(_)
         | FortiError::SamlCallbackTimedOut
         | FortiError::SamlCallbackInvalid(_)
+        | FortiError::SamlCallbackPortUnavailable(_)
         | FortiError::SamlTerminalConfiguration(_)
         | FortiError::Http(_) => ConnectFailureKind::TransportUnavailable,
     }
@@ -560,6 +561,7 @@ fn saml_failure_class(kind: SamlFailureKind) -> &'static str {
         SamlFailureKind::GatewayUnavailable => "gateway_unavailable",
         SamlFailureKind::CallbackInvalid => "callback_invalid",
         SamlFailureKind::UserCancelled => "user_cancelled",
+        SamlFailureKind::LocalPortUnavailable => "local_port_unavailable",
         SamlFailureKind::TerminalConfiguration => "terminal_configuration",
     }
 }
@@ -1225,6 +1227,19 @@ mod tests {
             AuthAttemptKind::Required,
             SamlFailureKind::CallbackTimedOut
         ));
+        // A busy callback port must not strand the client: without a SAML
+        // session there is no way back to a working tunnel, so giving up is
+        // strictly worse than retrying behind the backoff.
+        assert!(!auth_failure_is_terminal(
+            AuthAttemptKind::Required,
+            SamlFailureKind::LocalPortUnavailable
+        ));
+        assert_eq!(
+            SamlFailureKind::classify(&FortiError::SamlCallbackPortUnavailable(
+                "port 8020 busy".into()
+            )),
+            SamlFailureKind::LocalPortUnavailable
+        );
     }
 
     #[test]
