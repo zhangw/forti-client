@@ -22,6 +22,13 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HTTP_HEADER: usize = 16 * 1024;
 
+/// Hard ceiling on buffered-but-undecoded tunnel bytes.
+///
+/// The codec always consumes bytes when it cannot decode, so this is defence in
+/// depth rather than the primary guard: it bounds memory if a peer dribbles a
+/// stream that never yields a decodable frame.
+const MAX_READ_BUF: usize = 64 * 1024;
+
 /// A raw TLS tunnel to the FortiGate, carrying Fortinet-framed PPP data.
 pub struct TlsTunnel {
     tls_stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
@@ -183,6 +190,11 @@ impl TlsTunnel {
             if self.read_buf.len() > MAX_HTTP_HEADER && self.upgrade_response_pending {
                 return Err(FortiError::ProtocolError(
                     "tunnel HTTP response header exceeds 16 KiB".into(),
+                ));
+            }
+            if self.read_buf.len() > MAX_READ_BUF {
+                return Err(FortiError::ProtocolError(
+                    "tunnel receive buffer exceeded 64 KiB without a decodable frame".into(),
                 ));
             }
         }
