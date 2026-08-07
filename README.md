@@ -64,6 +64,8 @@ You'll be prompted for your password. If 2FA is enabled, you'll be prompted for 
       --realm <REALM>                Realm/user-group (optional)
       --saml                         Use SAML/SSO authentication
       --tls-keylog-file <PATH>       TLS key logging for Wireshark (opt-in)
+      --reauth-after-failures <N>    Failed reconnect cycles before forcing full re-authentication [default: 5]
+      --tunnel-flap-window <SECS>    Tunnel lifetime below this counts as a failed reconnect cycle [default: 120]
 ```
 
 ### Verbose logging

@@ -36,6 +36,14 @@ struct Cli {
     /// Enable TLS key logging to file (for Wireshark debugging)
     #[arg(long)]
     tls_keylog_file: Option<String>,
+
+    /// Failed reconnect cycles before forcing full re-authentication
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
+    reauth_after_failures: u32,
+
+    /// Tunnel lifetime below this many seconds counts as a failed reconnect cycle
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
+    tunnel_flap_window: u64,
 }
 
 const FORCED_SIGINT_EXIT_CODE: i32 = 130;
@@ -262,6 +270,10 @@ async fn main() -> anyhow::Result<()> {
         auth_result.svpn_cookie,
         auth_result.tunnel_config,
         shutdown,
+        forti_client::reconnect::EscalationConfig {
+            max_failed_cycles: cli.reauth_after_failures,
+            flap_window: std::time::Duration::from_secs(cli.tunnel_flap_window),
+        },
     );
 
     // Last-resort cleanup for paths that never reach the controller's own

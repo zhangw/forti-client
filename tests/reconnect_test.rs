@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use forti_client::error::{AuthRequirement, ConnectFailureKind, SamlFailureKind};
 use forti_client::reconnect::{
-    classify_disconnect, AuthAttemptKind, Backoff, ConnectionState, DisconnectReason,
-    ReconnectAction, ReconnectPolicy,
+    classify_disconnect, Backoff, ConnectionState, DisconnectReason, ReconnectAction,
+    ReconnectPolicy,
 };
 
 #[test]
@@ -44,32 +44,28 @@ fn standalone_backoff_reset_is_preserved() {
 }
 
 #[test]
-fn transport_unavailable_never_permits_saml() {
+fn failures_below_threshold_never_permit_saml() {
     let mut policy = ReconnectPolicy::new();
-    for _ in 0..10_000 {
+    for _ in 0..4 {
         policy.on_connect_failure(ConnectFailureKind::TransportUnavailable);
         assert_eq!(policy.auth_requirement(), AuthRequirement::NotRequired);
-        assert_eq!(policy.next_auth_attempt(), None);
+        assert!(!policy.next_auth_attempt());
     }
 }
 
 #[test]
-fn transport_failure_breaks_consecutive_post_upgrade_count() {
+fn mixed_failure_kinds_accumulate_toward_escalation() {
     let mut policy = ReconnectPolicy::new();
-    for _ in 0..3 {
+    for _ in 0..2 {
         policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
         policy.on_connect_failure(ConnectFailureKind::TransportUnavailable);
     }
     assert_eq!(policy.auth_requirement(), AuthRequirement::NotRequired);
-    assert_eq!(policy.next_auth_attempt(), None);
+    assert!(!policy.next_auth_attempt());
 
-    for _ in 0..3 {
-        policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
-    }
-    assert_eq!(
-        policy.next_auth_attempt(),
-        Some(AuthAttemptKind::CompatibilityProbe)
-    );
+    policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
+    assert_eq!(policy.auth_requirement(), AuthRequirement::Required);
+    assert!(policy.next_auth_attempt());
 }
 
 #[test]
@@ -78,104 +74,91 @@ fn cookie_rejection_requires_immediate_sticky_authentication() {
     policy.on_connect_failure(ConnectFailureKind::CookieRejected);
 
     assert_eq!(policy.auth_requirement(), AuthRequirement::Required);
-    assert_eq!(policy.next_auth_attempt(), Some(AuthAttemptKind::Required));
+    assert!(policy.next_auth_attempt());
 
-    policy.on_saml_failure(
-        AuthAttemptKind::Required,
-        SamlFailureKind::TerminalConfiguration,
-    );
+    policy.on_saml_failure(SamlFailureKind::TerminalConfiguration);
     assert_eq!(policy.auth_requirement(), AuthRequirement::Required);
-    assert_eq!(policy.next_auth_attempt(), Some(AuthAttemptKind::Required));
+    assert!(policy.next_auth_attempt());
 
-    policy.on_saml_failure(
-        AuthAttemptKind::Required,
-        SamlFailureKind::GatewayUnavailable,
-    );
+    policy.on_saml_failure(SamlFailureKind::GatewayUnavailable);
     assert_eq!(policy.auth_requirement(), AuthRequirement::Required);
-    assert_eq!(policy.next_auth_attempt(), Some(AuthAttemptKind::Required));
-}
-
-#[derive(Clone, Copy)]
-enum ScenarioStep {
-    PostUpgradeFailure,
-    SamlFailure,
-    SamlSuccess,
-}
-
-fn run_post_upgrade_script(
-    policy: &mut ReconnectPolicy,
-    script: &[ScenarioStep],
-) -> Vec<Option<AuthAttemptKind>> {
-    script
-        .iter()
-        .map(|step| {
-            match step {
-                ScenarioStep::PostUpgradeFailure => {
-                    policy.on_connect_failure(ConnectFailureKind::PostUpgrade)
-                }
-                ScenarioStep::SamlFailure => policy.on_saml_failure(
-                    AuthAttemptKind::CompatibilityProbe,
-                    SamlFailureKind::TerminalConfiguration,
-                ),
-                ScenarioStep::SamlSuccess => policy.on_saml_success(),
-            }
-            policy.next_auth_attempt()
-        })
-        .collect()
+    assert!(policy.next_auth_attempt());
 }
 
 #[test]
-fn third_post_upgrade_failure_gets_only_one_probe_in_episode() {
+fn escalated_auth_requirement_is_sticky_until_saml_success() {
     let mut policy = ReconnectPolicy::new();
-    let attempts = run_post_upgrade_script(
-        &mut policy,
-        &[
-            ScenarioStep::PostUpgradeFailure,
-            ScenarioStep::PostUpgradeFailure,
-            ScenarioStep::PostUpgradeFailure,
-            ScenarioStep::SamlFailure,
-            ScenarioStep::SamlSuccess,
-            ScenarioStep::PostUpgradeFailure,
-            ScenarioStep::PostUpgradeFailure,
-        ],
-    );
-
-    assert_eq!(
-        attempts,
-        [
-            None,
-            None,
-            Some(AuthAttemptKind::CompatibilityProbe),
-            None,
-            None,
-            None,
-            None,
-        ]
-    );
-}
-
-#[test]
-fn successful_tunnel_starts_a_new_probe_episode() {
-    let mut policy = ReconnectPolicy::new();
-    for _ in 0..3 {
+    for _ in 0..5 {
         policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
     }
-    assert_eq!(
-        policy.next_auth_attempt(),
-        Some(AuthAttemptKind::CompatibilityProbe)
-    );
+    assert!(policy.next_auth_attempt());
+
+    policy.on_saml_failure(SamlFailureKind::GatewayUnavailable);
+    assert!(policy.next_auth_attempt());
+
     policy.on_saml_success();
+    assert!(!policy.next_auth_attempt());
+}
+
+#[test]
+fn post_escalation_failures_reescalate_immediately() {
+    let mut policy = ReconnectPolicy::new();
+    for _ in 0..5 {
+        policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
+    }
+    assert!(policy.next_auth_attempt());
+
+    policy.on_saml_success();
+    assert!(!policy.next_auth_attempt());
+
+    // SAML success deliberately does not reset failed_cycles, so one more
+    // connect failure pushes the count back over the threshold at once.
+    policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
+    assert!(policy.next_auth_attempt());
+}
+
+#[test]
+fn tunnel_establishment_resets_failed_cycles() {
+    let mut policy = ReconnectPolicy::new();
+    for _ in 0..5 {
+        policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
+    }
     policy.on_tunnel_established();
 
-    for _ in 0..2 {
+    for _ in 0..4 {
         policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
-        assert_eq!(policy.next_auth_attempt(), None);
+        assert!(!policy.next_auth_attempt());
     }
-    policy.on_connect_failure(ConnectFailureKind::PostUpgrade);
-    assert_eq!(
-        policy.next_auth_attempt(),
-        Some(AuthAttemptKind::CompatibilityProbe)
-    );
+}
+
+#[test]
+fn short_lived_tunnels_count_toward_escalation() {
+    let mut policy = ReconnectPolicy::new();
+    for _ in 0..4 {
+        policy.on_short_lived_tunnel();
+        assert!(!policy.next_auth_attempt());
+    }
+    policy.on_short_lived_tunnel();
+    assert!(policy.next_auth_attempt());
+}
+
+#[test]
+fn flap_and_connect_failures_share_one_escalation_budget() {
+    // A flapping tunnel and the failed retry that follows it are two failed
+    // cycles from one physical outage. Pin the shared budget so a future
+    // refactor cannot silently double or halve the effective threshold.
+    let mut policy = ReconnectPolicy::new();
+    for pair in 0..2 {
+        policy.on_short_lived_tunnel();
+        policy.on_connect_failure(ConnectFailureKind::TransportUnavailable);
+        assert!(
+            !policy.next_auth_attempt(),
+            "escalated after only {} flap+failure pairs",
+            pair + 1
+        );
+    }
+    policy.on_short_lived_tunnel();
+    assert!(policy.next_auth_attempt());
 }
 
 #[test]
@@ -193,7 +176,7 @@ fn only_tls_plus_ppp_success_resets_backoff() {
     assert_eq!(policy.current_delay(), Duration::from_secs(2));
 
     policy.on_connect_failure(ConnectFailureKind::CookieRejected);
-    assert_eq!(policy.next_auth_attempt(), Some(AuthAttemptKind::Required));
+    assert!(policy.next_auth_attempt());
     policy.on_saml_success();
     assert_eq!(policy.current_delay(), Duration::from_secs(2));
 

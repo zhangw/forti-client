@@ -70,7 +70,7 @@ cargo test --lib vpn::tests
 cargo test --test signal_test
 ```
 
-These tests cover typed failure policy, sticky rejected cookies, the one-probe compatibility episode, backoff reset timing, callback fragmentation/size/deadline handling, tunnel HTTP rejection, level-triggered shutdown, unbiased ready-source progress, UserQuit termination policy, and the shared cleanup deadline.
+These tests cover typed failure policy, sticky rejected cookies, failed-cycle escalation to full re-authentication, backoff reset timing, callback fragmentation/size/deadline handling, tunnel HTTP rejection, level-triggered shutdown, unbiased ready-source progress, UserQuit termination policy, and the shared cleanup deadline.
 
 ## Manual release blockers
 

@@ -47,14 +47,8 @@ fn should_send_terminate(reason: &DisconnectReason) -> bool {
     *reason != DisconnectReason::SystemSleep
 }
 
-fn auth_failure_is_terminal(attempt: AuthAttemptKind, failure: SamlFailureKind) -> bool {
-    attempt == AuthAttemptKind::Required && failure == SamlFailureKind::TerminalConfiguration
-}
-
-fn prepare_cookie_for_auth(attempt: AuthAttemptKind, cookie: &mut String) {
-    if attempt == AuthAttemptKind::Required {
-        cookie.clear();
-    }
+fn saml_failure_is_terminal(failure: SamlFailureKind) -> bool {
+    failure == SamlFailureKind::TerminalConfiguration
 }
 
 /// Detect a likely sleep gap from a delayed keepalive tick.
@@ -64,7 +58,6 @@ pub fn detect_sleep_gap(last_tick: Instant, expected_interval: Duration) -> bool
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
-const POST_UPGRADE_FAILURES_BEFORE_PROBE: u32 = 3;
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(2);
 const MONITOR_FALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -98,10 +91,29 @@ impl Backoff {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthAttemptKind {
-    Required,
-    CompatibilityProbe,
+/// When repeated reconnect failures escalate from cookie retries to full
+/// re-authentication.
+///
+/// The gateway only sends a definitive cookie rejection (401/403) when it
+/// considers the session gone. A zombie session left behind by an unclean
+/// disconnect never produces one, so local failure evidence must be able to
+/// escalate on its own.
+#[derive(Debug, Clone, Copy)]
+pub struct EscalationConfig {
+    /// Consecutive failed cycles that force full re-authentication.
+    pub max_failed_cycles: u32,
+    /// A tunnel dying within this window after establishment counts as a
+    /// failed cycle, not a success.
+    pub flap_window: Duration,
+}
+
+impl Default for EscalationConfig {
+    fn default() -> Self {
+        Self {
+            max_failed_cycles: 5,
+            flap_window: Duration::from_secs(120),
+        }
+    }
 }
 
 /// Pure reconnect decision state. An episode ends only after both TLS and PPP
@@ -111,8 +123,12 @@ pub struct ReconnectPolicy {
     auth_requirement: AuthRequirement,
     connect_attempts: u32,
     transport_attempts: u32,
-    post_upgrade_failures: u32,
-    compatibility_probe_used: bool,
+    failed_cycles: u32,
+    /// The failed-cycle count as it was when the current tunnel came up. A
+    /// tunnel that dies within the flap window was never a real success, so
+    /// the flap handler restores this evidence before counting the flap.
+    failed_cycles_at_establishment: u32,
+    escalation: EscalationConfig,
     saml_attempts: u32,
 }
 
@@ -124,13 +140,18 @@ impl Default for ReconnectPolicy {
 
 impl ReconnectPolicy {
     pub fn new() -> Self {
+        Self::with_escalation(EscalationConfig::default())
+    }
+
+    pub fn with_escalation(escalation: EscalationConfig) -> Self {
         Self {
             backoff: Backoff::new(),
             auth_requirement: AuthRequirement::NotRequired,
             connect_attempts: 0,
             transport_attempts: 0,
-            post_upgrade_failures: 0,
-            compatibility_probe_used: false,
+            failed_cycles: 0,
+            failed_cycles_at_establishment: 0,
+            escalation,
             saml_attempts: 0,
         }
     }
@@ -139,43 +160,43 @@ impl ReconnectPolicy {
         self.auth_requirement
     }
 
-    /// Return the only operation permitted by the authentication gate. A
-    /// compatibility probe is marked used before it starts, so a timeout cannot
-    /// launch another browser in the same reconnect episode.
-    pub fn next_auth_attempt(&mut self) -> Option<AuthAttemptKind> {
-        let attempt = match self.auth_requirement {
-            AuthRequirement::NotRequired => return None,
-            AuthRequirement::Required => AuthAttemptKind::Required,
-            AuthRequirement::CompatibilityProbeAllowed => {
-                self.auth_requirement = AuthRequirement::NotRequired;
-                AuthAttemptKind::CompatibilityProbe
-            }
-        };
+    /// The authentication gate: re-authentication only runs once the cookie is
+    /// known or suspected to be unusable.
+    pub fn next_auth_attempt(&mut self) -> bool {
+        if self.auth_requirement != AuthRequirement::Required {
+            return false;
+        }
         self.saml_attempts = self.saml_attempts.saturating_add(1);
-        Some(attempt)
+        true
+    }
+
+    /// Count one more cycle that failed to produce a healthy tunnel. Any failure
+    /// kind counts: during unstable networking the failure modes interleave, and
+    /// a counter that only tracks one kind consecutively never reaches its
+    /// threshold. Past the configured threshold the only way back is a fresh
+    /// session, so escalate to full re-authentication rather than retrying a
+    /// possibly-zombie cookie forever.
+    fn record_failed_cycle(&mut self) {
+        self.failed_cycles = self.failed_cycles.saturating_add(1);
+        if self.failed_cycles >= self.escalation.max_failed_cycles {
+            self.auth_requirement = AuthRequirement::Required;
+        }
     }
 
     pub fn on_connect_failure(&mut self, kind: ConnectFailureKind) {
         match kind {
             ConnectFailureKind::TransportUnavailable => {
                 self.transport_attempts = self.transport_attempts.saturating_add(1);
-                self.post_upgrade_failures = 0;
+                self.record_failed_cycle();
             }
             ConnectFailureKind::CookieRejected => {
                 // A definitive rejection begins a new required-auth episode.
                 self.transport_attempts = 0;
-                self.post_upgrade_failures = 0;
-                self.compatibility_probe_used = false;
+                self.failed_cycles = 0;
                 self.auth_requirement = AuthRequirement::Required;
             }
             ConnectFailureKind::PostUpgrade => {
-                self.post_upgrade_failures = self.post_upgrade_failures.saturating_add(1);
-                if self.post_upgrade_failures >= POST_UPGRADE_FAILURES_BEFORE_PROBE
-                    && !self.compatibility_probe_used
-                {
-                    self.compatibility_probe_used = true;
-                    self.auth_requirement = AuthRequirement::CompatibilityProbeAllowed;
-                }
+                self.record_failed_cycle();
             }
             ConnectFailureKind::LocalSetup | ConnectFailureKind::Cancelled => {}
         }
@@ -185,14 +206,10 @@ impl ReconnectPolicy {
         self.connect_attempts = self.connect_attempts.saturating_add(1);
     }
 
-    pub fn on_saml_failure(&mut self, attempt: AuthAttemptKind, _kind: SamlFailureKind) {
-        self.auth_requirement = match attempt {
-            // A rejected cookie remains unusable until a new cookie is obtained.
-            AuthAttemptKind::Required => AuthRequirement::Required,
-            // A compatibility probe is optional. Its failure returns to cookie
-            // retries without permitting another probe in this episode.
-            AuthAttemptKind::CompatibilityProbe => AuthRequirement::NotRequired,
-        };
+    /// A SAML failure keeps the requirement sticky: without a fresh cookie
+    /// there is no way back to a working tunnel.
+    pub fn on_saml_failure(&mut self, _kind: SamlFailureKind) {
+        self.auth_requirement = AuthRequirement::Required;
     }
 
     pub fn on_saml_success(&mut self) {
@@ -208,13 +225,24 @@ impl ReconnectPolicy {
         // Wake only changes when the next attempt can run.
     }
 
+    /// The tunnel came up but died within the flap window for a non-user reason:
+    /// the gateway accepted the cookie, yet the session cannot carry traffic.
+    /// Establishment reset the failure evidence, but this tunnel was never a
+    /// real success, so restore the count it wiped before counting the flap —
+    /// otherwise repeated accept-then-drop flapping would never reach the
+    /// escalation threshold.
+    pub fn on_short_lived_tunnel(&mut self) {
+        self.failed_cycles = self.failed_cycles.max(self.failed_cycles_at_establishment);
+        self.record_failed_cycle();
+    }
+
     pub fn on_tunnel_established(&mut self) {
         self.backoff.reset();
         self.auth_requirement = AuthRequirement::NotRequired;
         self.connect_attempts = 0;
         self.transport_attempts = 0;
-        self.post_upgrade_failures = 0;
-        self.compatibility_probe_used = false;
+        self.failed_cycles_at_establishment = self.failed_cycles;
+        self.failed_cycles = 0;
         self.saml_attempts = 0;
     }
 
@@ -236,8 +264,12 @@ impl ReconnectPolicy {
         self.connect_attempts
     }
 
-    pub fn negotiation_failures(&self) -> u32 {
-        self.post_upgrade_failures
+    pub fn failed_cycles(&self) -> u32 {
+        self.failed_cycles
+    }
+
+    pub fn flap_window(&self) -> Duration {
+        self.escalation.flap_window
     }
 
     pub fn saml_attempts(&self) -> u32 {
@@ -642,12 +674,13 @@ impl ReconnectController {
         svpn_cookie: String,
         tunnel_config: TunnelConfig,
         shutdown: Shutdown,
+        escalation: EscalationConfig,
     ) -> Self {
         Self {
             auth_params,
             svpn_cookie,
             tunnel_config,
-            policy: ReconnectPolicy::new(),
+            policy: ReconnectPolicy::with_escalation(escalation),
             state: ConnectionState::EstablishingTunnel,
             shutdown,
         }
@@ -770,16 +803,17 @@ impl ReconnectController {
                 }
             }
 
-            if let Some(attempt_kind) = self.policy.next_auth_attempt() {
+            if self.policy.next_auth_attempt() {
                 self.state = ConnectionState::Authenticating;
                 info!(
                     state = ?self.state,
                     auth_requirement = ?self.policy.auth_requirement(),
                     saml_attempt = self.policy.saml_attempts(),
-                    attempt_kind = ?attempt_kind,
                     "Starting reconnect authentication attempt"
                 );
-                prepare_cookie_for_auth(attempt_kind, &mut self.svpn_cookie);
+                // The cookie was rejected or the failure count escalated — it
+                // must never be presented again.
+                self.svpn_cookie.clear();
                 match interruptible(
                     driver.authenticate(&self.auth_params),
                     &shutdown,
@@ -804,11 +838,11 @@ impl ReconnectController {
                             error = %auth_error,
                             "Re-authentication failed"
                         );
-                        if auth_failure_is_terminal(attempt_kind, failure_kind) {
+                        if saml_failure_is_terminal(failure_kind) {
                             terminal_error = Some(auth_error);
                             break 'reconnect;
                         }
-                        self.policy.on_saml_failure(attempt_kind, failure_kind);
+                        self.policy.on_saml_failure(failure_kind);
                         if self
                             .wait_for_retry(
                                 RetryContext {
@@ -894,7 +928,7 @@ impl ReconnectController {
                         failure_class = ?connect_failure.kind,
                         connect_attempt = self.policy.connect_attempts(),
                         transport_failure_count = self.policy.transport_attempts(),
-                        negotiation_failure_count = self.policy.negotiation_failures(),
+                        failed_cycles = self.policy.failed_cycles(),
                         auth_requirement = ?self.policy.auth_requirement(),
                         error = %connect_failure.source,
                         "Tunnel connection attempt failed"
@@ -929,6 +963,7 @@ impl ReconnectController {
                     continue;
                 }
             };
+            let established_at = std::time::Instant::now();
 
             if apply_negotiated_ip(&mut self.tunnel_config, negotiated_ip) {
                 info!("IPCP assigned a new address: {}", negotiated_ip);
@@ -975,6 +1010,10 @@ impl ReconnectController {
                     &mut power_rx,
                 )
                 .await;
+            // Sample the lifetime immediately: teardown below (terminate up to
+            // 2s, DNS withdrawal up to 5s) must not push a short-lived tunnel
+            // past the flap window and suppress the escalation.
+            let tunnel_alive = established_at.elapsed();
 
             if should_send_terminate(&reason) {
                 let _ = tokio::time::timeout(
@@ -988,6 +1027,22 @@ impl ReconnectController {
             // The tunnel is gone; withdraw its DNS servers before any wait.
             if reason != DisconnectReason::UserQuit {
                 suspend_vpn_dns(driver, &mut dns_suspended).await;
+            }
+
+            // A tunnel that dies within the flap window for a non-user reason never
+            // carried healthy traffic: count it as a failed cycle so repeated
+            // accept-then-drop behavior escalates to re-authentication. Sleep and
+            // user-initiated exits are excluded — they say nothing about the cookie.
+            if !matches!(
+                reason,
+                DisconnectReason::UserQuit | DisconnectReason::SystemSleep
+            ) && tunnel_alive < self.policy.flap_window()
+            {
+                warn!(
+                    tunnel_alive_ms = tunnel_alive.as_millis() as u64,
+                    "Tunnel died within the flap window; counting as a failed cycle"
+                );
+                self.policy.on_short_lived_tunnel();
             }
 
             if reason == DisconnectReason::SystemSleep {
@@ -1214,24 +1269,15 @@ mod tests {
     }
 
     #[test]
-    fn only_required_terminal_auth_failure_stops_controller() {
-        assert!(auth_failure_is_terminal(
-            AuthAttemptKind::Required,
+    fn only_terminal_configuration_auth_failure_stops_controller() {
+        assert!(saml_failure_is_terminal(
             SamlFailureKind::TerminalConfiguration
         ));
-        assert!(!auth_failure_is_terminal(
-            AuthAttemptKind::CompatibilityProbe,
-            SamlFailureKind::TerminalConfiguration
-        ));
-        assert!(!auth_failure_is_terminal(
-            AuthAttemptKind::Required,
-            SamlFailureKind::CallbackTimedOut
-        ));
+        assert!(!saml_failure_is_terminal(SamlFailureKind::CallbackTimedOut));
         // A busy callback port must not strand the client: without a SAML
         // session there is no way back to a working tunnel, so giving up is
         // strictly worse than retrying behind the backoff.
-        assert!(!auth_failure_is_terminal(
-            AuthAttemptKind::Required,
+        assert!(!saml_failure_is_terminal(
             SamlFailureKind::LocalPortUnavailable
         ));
         assert_eq!(
@@ -1240,20 +1286,6 @@ mod tests {
             )),
             SamlFailureKind::LocalPortUnavailable
         );
-    }
-
-    #[test]
-    fn auth_attempt_invalidates_only_definitively_rejected_cookie() {
-        let mut required_cookie = "rejected".to_string();
-        prepare_cookie_for_auth(AuthAttemptKind::Required, &mut required_cookie);
-        assert!(required_cookie.is_empty());
-
-        let mut compatibility_cookie = "possibly-valid".to_string();
-        prepare_cookie_for_auth(
-            AuthAttemptKind::CompatibilityProbe,
-            &mut compatibility_cookie,
-        );
-        assert_eq!(compatibility_cookie, "possibly-valid");
     }
 
     #[tokio::test]
@@ -1606,13 +1638,30 @@ mod tests {
     }
 
     fn controller(initial: TunnelConfig, shutdown: Shutdown) -> ReconnectController {
-        controller_with_saml(initial, shutdown, true)
+        controller_with_escalation(initial, shutdown, EscalationConfig::default())
     }
 
     fn controller_with_saml(
         initial: TunnelConfig,
         shutdown: Shutdown,
         saml: bool,
+    ) -> ReconnectController {
+        controller_with_saml_and_escalation(initial, shutdown, saml, EscalationConfig::default())
+    }
+
+    fn controller_with_escalation(
+        initial: TunnelConfig,
+        shutdown: Shutdown,
+        escalation: EscalationConfig,
+    ) -> ReconnectController {
+        controller_with_saml_and_escalation(initial, shutdown, true, escalation)
+    }
+
+    fn controller_with_saml_and_escalation(
+        initial: TunnelConfig,
+        shutdown: Shutdown,
+        saml: bool,
+        escalation: EscalationConfig,
     ) -> ReconnectController {
         let auth_client = AuthClient::new("vpn.example", 443, false).unwrap();
         ReconnectController::new(
@@ -1630,6 +1679,7 @@ mod tests {
             "old-cookie".into(),
             initial,
             shutdown,
+            escalation,
         )
     }
 
@@ -1870,13 +1920,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn repeated_transport_and_http_5xx_failures_never_open_saml() {
+    async fn transport_failures_below_threshold_never_open_saml() {
         let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
         let shutdown = Shutdown::new();
         let mut controller = controller(initial, shutdown);
         let mut driver = ScriptDriver::default();
         driver.connects.extend([
-            ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
             ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
             ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
             ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
@@ -1892,7 +1941,7 @@ mod tests {
             log.iter()
                 .filter(|entry| entry.starts_with("connect:"))
                 .count(),
-            6
+            5
         );
     }
 
@@ -1963,9 +2012,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn compatibility_probe_runs_once_per_reconnect_episode() {
+    async fn failed_cycles_escalate_to_full_reauthentication() {
         let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
-        let mut controller = controller(initial, Shutdown::new());
+        let mut controller = controller(initial.clone(), Shutdown::new());
         let mut driver = ScriptDriver::default();
         for _ in 0..5 {
             driver
@@ -1974,21 +2023,167 @@ mod tests {
         }
         driver
             .auth
-            .push_back(ScriptAuth::Result(Err(FortiError::SamlCallbackTimedOut)));
+            .push_back(ScriptAuth::Result(Ok("new-cookie".into())));
+        driver.configs.push_back(Ok(initial));
         driver
             .connects
             .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
         driver.events.push_back(DisconnectReason::UserQuit);
 
         controller.run_with_driver(&mut driver).await.unwrap();
-        assert_eq!(
+        let log = driver.snapshot();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 1);
+        assert!(log.contains(&"connect:new-cookie".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mixed_failure_kinds_escalate_to_reauthentication() {
+        // Regression test for the zombie-cookie incident: during unstable
+        // networking transport and post-upgrade failures interleave, and a
+        // counter that only tracks one kind consecutively never escalates.
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        driver.connects.extend([
+            ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
+            ScriptConnect::Failure(ConnectFailureKind::PostUpgrade),
+            ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
+            ScriptConnect::Failure(ConnectFailureKind::PostUpgrade),
+            ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
+        ]);
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("new-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 1);
+        assert!(log.contains(&"connect:new-cookie".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn short_lived_tunnels_escalate_to_reauthentication() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        // With paused time each tunnel lives ~0s, well under the 120s default
+        // flap window, so every death counts as a failed cycle.
+        for _ in 0..5 {
             driver
-                .snapshot()
-                .iter()
-                .filter(|entry| *entry == "auth")
-                .count(),
-            1
+                .connects
+                .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+            driver.events.push_back(DisconnectReason::DeadPeer);
+        }
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("new-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 1);
+        assert!(log.contains(&"connect:new-cookie".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_lived_tunnels_do_not_escalate() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        // A zero flap window means no elapsed time is ever below it, so no
+        // tunnel death counts as a failed cycle.
+        let mut controller = controller_with_escalation(
+            initial,
+            Shutdown::new(),
+            EscalationConfig {
+                max_failed_cycles: 5,
+                flap_window: Duration::ZERO,
+            },
         );
+        let mut driver = ScriptDriver::default();
+        for _ in 0..5 {
+            driver
+                .connects
+                .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+            driver.events.push_back(DisconnectReason::DeadPeer);
+        }
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn system_sleep_cycles_never_escalate() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        // A laptop that keeps sleeping shortly after each reconnect must never
+        // march toward re-authentication: sleep deaths say nothing about the
+        // cookie. Six sleep cycles exceed the default threshold of five, so an
+        // escalation would hit the empty auth queue and fail this test loudly.
+        for _ in 0..6 {
+            driver
+                .connects
+                .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+            driver.events.push_back(DisconnectReason::SystemSleep);
+        }
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 0);
+        assert_eq!(
+            log.iter()
+                .filter(|entry| *entry == "connect:old-cookie")
+                .count(),
+            7
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn escalation_threshold_is_configurable() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller_with_escalation(
+            initial.clone(),
+            Shutdown::new(),
+            EscalationConfig {
+                max_failed_cycles: 2,
+                ..EscalationConfig::default()
+            },
+        );
+        let mut driver = ScriptDriver::default();
+        driver.connects.extend([
+            ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
+            ScriptConnect::Failure(ConnectFailureKind::TransportUnavailable),
+        ]);
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("new-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 1);
+        assert!(log.contains(&"connect:new-cookie".to_string()));
     }
 
     #[tokio::test(start_paused = true)]

@@ -25,7 +25,6 @@ pub enum SamlFailureKind {
 pub enum AuthRequirement {
     NotRequired,
     Required,
-    CompatibilityProbeAllowed,
 }
 
 #[derive(Error, Debug)]
