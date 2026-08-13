@@ -3,11 +3,12 @@ use crate::error::{FortiError, Result};
 use crate::power_monitor::PowerEvent;
 use crate::ppp::codec::{PppFrame, PppProtocol};
 use crate::ppp::lcp::{LcpCode, LcpState};
-use crate::reconnect::DisconnectReason;
+use crate::reconnect::{is_trusted_wifi, next_wifi_event, DisconnectReason};
 use crate::shutdown::Shutdown;
 use crate::tun;
 use crate::tunnel::codec::FortinetFrame;
 use crate::tunnel::TlsTunnel;
+use crate::wifi_monitor::WifiEvent;
 
 use std::future::Future;
 use std::time::Duration;
@@ -126,11 +127,15 @@ async fn next_power_event(rx: &mut mpsc::UnboundedReceiver<PowerEvent>) -> Power
     }
 }
 
-/// Await an operation while retaining immediate shutdown and sleep handling.
+/// Await an operation while retaining immediate shutdown, sleep, and
+/// trusted-Wi-Fi handling. A send blocked mid-network-switch must not delay
+/// the trusted-network teardown, for the same reason the sleep arm is nested.
 async fn interruptible<T>(
     operation: impl Future<Output = T>,
     shutdown: &Shutdown,
     power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+    wifi_rx: &mut mpsc::UnboundedReceiver<WifiEvent>,
+    trusted_ssids: &[String],
 ) -> std::result::Result<T, DisconnectReason> {
     tokio::pin!(operation);
     loop {
@@ -142,6 +147,11 @@ async fn interruptible<T>(
             event = next_power_event(power_rx) => {
                 if event == PowerEvent::WillSleep {
                     return Err(DisconnectReason::SystemSleep);
+                }
+            }
+            event = next_wifi_event(wifi_rx) => {
+                if is_trusted_wifi(event.ssid.as_deref(), trusted_ssids) {
+                    return Err(DisconnectReason::TrustedNetwork);
                 }
             }
             result = &mut operation => return Ok(result),
@@ -189,8 +199,19 @@ pub async fn event_loop(
     tun_dev: &tun_rs::AsyncDevice,
     shutdown: &Shutdown,
     power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+    wifi_rx: &mut mpsc::UnboundedReceiver<WifiEvent>,
+    trusted_ssids: &[String],
 ) -> DisconnectReason {
-    event_loop_with_io(tunnel, lcp, tun_dev, shutdown, power_rx).await
+    event_loop_with_io(
+        tunnel,
+        lcp,
+        tun_dev,
+        shutdown,
+        power_rx,
+        wifi_rx,
+        trusted_ssids,
+    )
+    .await
 }
 
 async fn event_loop_with_io<Tunnel, Tun>(
@@ -199,6 +220,8 @@ async fn event_loop_with_io<Tunnel, Tun>(
     tun_dev: &Tun,
     shutdown: &Shutdown,
     power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+    wifi_rx: &mut mpsc::UnboundedReceiver<WifiEvent>,
+    trusted_ssids: &[String],
 ) -> DisconnectReason
 where
     Tunnel: TunnelIo,
@@ -225,6 +248,12 @@ where
                 if event == PowerEvent::WillSleep {
                     info!("System sleep requested");
                     return DisconnectReason::SystemSleep;
+                }
+            }
+            event = next_wifi_event(wifi_rx) => {
+                if is_trusted_wifi(event.ssid.as_deref(), trusted_ssids) {
+                    info!(ssid = ?event.ssid, "Joined trusted Wi-Fi — disconnecting VPN");
+                    return DisconnectReason::TrustedNetwork;
                 }
             }
 
@@ -256,6 +285,8 @@ where
                     send_ppp(tunnel, protocol, tun_buf[..n].to_vec()),
                     shutdown,
                     power_rx,
+                    wifi_rx,
+                    trusted_ssids,
                 ).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => return DisconnectReason::IoError(format!("tunnel send error: {}", e)),
@@ -286,7 +317,7 @@ where
                         if pkt_count <= 10 {
                             debug!("Tunnel → TUN: {} bytes IPv4", ppp.data().len());
                         }
-                        match interruptible(tun_dev.send(ppp.data()), shutdown, power_rx).await {
+                        match interruptible(tun_dev.send(ppp.data()), shutdown, power_rx, wifi_rx, trusted_ssids).await {
                             Ok(Ok(_)) => {}
                             Ok(Err(e)) => return DisconnectReason::IoError(format!("TUN write error: {}", e)),
                             Err(reason) => return reason,
@@ -300,6 +331,8 @@ where
                                 send_ppp(tunnel, PppProtocol::Lcp, resp),
                                 shutdown,
                                 power_rx,
+                                wifi_rx,
+                                trusted_ssids,
                             ).await {
                                 Ok(Ok(())) => {}
                                 Ok(Err(e)) => return DisconnectReason::IoError(format!("LCP send error: {}", e)),
@@ -331,6 +364,8 @@ where
                     send_ppp(tunnel, PppProtocol::Lcp, lcp.build_echo_request()),
                     shutdown,
                     power_rx,
+                    wifi_rx,
+                    trusted_ssids,
                 ).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => return DisconnectReason::IoError(format!("keepalive send error: {}", e)),
@@ -374,7 +409,15 @@ mod tests {
         let shutdown = Shutdown::new();
         shutdown.cancel();
         let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
-        let result = interruptible(std::future::pending::<()>(), &shutdown, &mut power_rx).await;
+        let (_wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
+        let result = interruptible(
+            std::future::pending::<()>(),
+            &shutdown,
+            &mut power_rx,
+            &mut wifi_rx,
+            &[],
+        )
+        .await;
         assert_eq!(result, Err(DisconnectReason::UserQuit));
     }
 
@@ -548,7 +591,17 @@ mod tests {
             let mut lcp = LcpState::new(1500);
             let shutdown = Shutdown::new();
             let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
-            event_loop_with_io(&mut tunnel, &mut lcp, &tun, &shutdown, &mut power_rx).await
+            let (_wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
+            event_loop_with_io(
+                &mut tunnel,
+                &mut lcp,
+                &tun,
+                &shutdown,
+                &mut power_rx,
+                &mut wifi_rx,
+                &[],
+            )
+            .await
         });
 
         // Consume and ignore interval's immediate first tick before measuring.
@@ -661,9 +714,18 @@ mod tests {
         };
         let mut lcp = LcpState::new(1500);
         let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+        let (_wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
 
-        let reason =
-            event_loop_with_io(&mut tunnel, &mut lcp, &tun, &shutdown, &mut power_rx).await;
+        let reason = event_loop_with_io(
+            &mut tunnel,
+            &mut lcp,
+            &tun,
+            &shutdown,
+            &mut power_rx,
+            &mut wifi_rx,
+            &[],
+        )
+        .await;
         assert_eq!(reason, DisconnectReason::UserQuit);
         assert!(operations.load(std::sync::atomic::Ordering::Relaxed) <= MAX_FAKE_OPERATIONS);
     }
@@ -707,7 +769,17 @@ mod tests {
             let tun = PendingSendTun;
             let mut lcp = LcpState::new(1500);
             let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
-            event_loop_with_io(&mut tunnel, &mut lcp, &tun, &trigger, &mut power_rx).await
+            let (_wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
+            event_loop_with_io(
+                &mut tunnel,
+                &mut lcp,
+                &tun,
+                &trigger,
+                &mut power_rx,
+                &mut wifi_rx,
+                &[],
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(1), started.notified())
@@ -767,7 +839,17 @@ mod tests {
             let tun = PendingWriteTun { write_started };
             let mut lcp = LcpState::new(1500);
             let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
-            event_loop_with_io(&mut tunnel, &mut lcp, &tun, &trigger, &mut power_rx).await
+            let (_wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
+            event_loop_with_io(
+                &mut tunnel,
+                &mut lcp,
+                &tun,
+                &trigger,
+                &mut power_rx,
+                &mut wifi_rx,
+                &[],
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(1), started.notified())
@@ -778,6 +860,83 @@ mod tests {
             .await
             .expect("shutdown must cancel pending TUN write")
             .unwrap();
+        assert_eq!(reason, DisconnectReason::UserQuit);
+    }
+
+    #[tokio::test]
+    async fn event_loop_returns_trusted_network_on_trusted_wifi_event() {
+        let shutdown = Shutdown::new();
+        let mut tunnel = PendingSendTunnel {
+            send_started: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+        let tun = PendingWriteTun {
+            write_started: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+        let mut lcp = LcpState::new(1500);
+        let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+        let (wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
+        wifi_tx
+            .send(WifiEvent {
+                ssid: Some("Home".into()),
+            })
+            .unwrap();
+
+        let reason = tokio::time::timeout(
+            Duration::from_secs(1),
+            event_loop_with_io(
+                &mut tunnel,
+                &mut lcp,
+                &tun,
+                &shutdown,
+                &mut power_rx,
+                &mut wifi_rx,
+                &["Home".to_string()],
+            ),
+        )
+        .await
+        .expect("trusted Wi-Fi must interrupt the data plane");
+        assert_eq!(reason, DisconnectReason::TrustedNetwork);
+    }
+
+    #[tokio::test]
+    async fn event_loop_ignores_untrusted_wifi_change() {
+        let shutdown = Shutdown::new();
+        let trigger = shutdown.clone();
+        let mut tunnel = PendingSendTunnel {
+            send_started: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+        let tun = PendingWriteTun {
+            write_started: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+        let mut lcp = LcpState::new(1500);
+        let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+        let (wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
+        // Drifting between untrusted networks must not disconnect the tunnel;
+        // reconnect handling belongs to the reachability monitor.
+        wifi_tx
+            .send(WifiEvent {
+                ssid: Some("Cafe".into()),
+            })
+            .unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let reason = tokio::time::timeout(
+            Duration::from_secs(1),
+            event_loop_with_io(
+                &mut tunnel,
+                &mut lcp,
+                &tun,
+                &shutdown,
+                &mut power_rx,
+                &mut wifi_rx,
+                &["Home".to_string()],
+            ),
+        )
+        .await
+        .expect("event loop must keep running past untrusted drift");
         assert_eq!(reason, DisconnectReason::UserQuit);
     }
 }

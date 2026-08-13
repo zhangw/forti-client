@@ -17,6 +17,7 @@ use crate::ppp::PppEngine;
 use crate::shutdown::Shutdown;
 use crate::tunnel::TlsTunnel;
 use crate::vpn;
+use crate::wifi_monitor::WifiEvent;
 
 /// Reason the VPN event loop exited.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,9 @@ pub enum DisconnectReason {
     ServerTerminated,
     IoError(String),
     SystemSleep,
+    /// The machine joined a trusted Wi-Fi network; the VPN must stay down
+    /// until the network drifts off the whitelist again.
+    TrustedNetwork,
     UserQuit,
 }
 
@@ -285,7 +289,25 @@ pub enum ConnectionState {
     Running,
     WaitingToRetry,
     WaitingForNetwork,
+    SuspendedOnTrustedWifi,
     CleaningUp,
+}
+
+/// Whether the given SSID exactly matches a whitelisted trusted network.
+/// `None` (no Wi-Fi, or the SSID could not be determined) is never trusted,
+/// so wired networks and query failures fail open toward establishing the
+/// VPN. An empty whitelist trusts nothing — the feature is disabled.
+pub fn is_trusted_wifi(ssid: Option<&str>, whitelist: &[String]) -> bool {
+    ssid.is_some_and(|current| whitelist.iter().any(|trusted| trusted == current))
+}
+
+/// Trusted Wi-Fi gating configuration. With no whitelisted SSIDs the
+/// controller behaves exactly as before; `wifi_rx` carries events from a
+/// [`crate::wifi_monitor::WifiMonitor`] started by the caller.
+#[derive(Default)]
+pub struct TrustedWifiConfig {
+    pub ssids: Vec<String>,
+    pub wifi_rx: Option<mpsc::UnboundedReceiver<WifiEvent>>,
 }
 
 pub struct AuthParams {
@@ -320,6 +342,9 @@ pub struct ReconnectController {
     policy: ReconnectPolicy,
     state: ConnectionState,
     shutdown: Shutdown,
+    trusted_ssids: Vec<String>,
+    wifi_rx: Option<mpsc::UnboundedReceiver<WifiEvent>>,
+    wifi_trusted: bool,
 }
 
 fn classify_tunnel_connect_error(error: &FortiError) -> ConnectFailureKind {
@@ -395,6 +420,7 @@ trait ControllerDriver: Send {
         params: &'a AuthParams,
         cookie: &'a str,
     ) -> DriverFuture<'a, DriverConnectResult<Self::Tunnel, Self::Lcp>>;
+    #[allow(clippy::too_many_arguments)]
     fn event_loop<'a>(
         &'a mut self,
         tunnel: &'a mut Self::Tunnel,
@@ -402,6 +428,8 @@ trait ControllerDriver: Send {
         tun: &'a Self::Tun,
         shutdown: &'a Shutdown,
         power_rx: &'a mut mpsc::UnboundedReceiver<PowerEvent>,
+        wifi_rx: &'a mut mpsc::UnboundedReceiver<WifiEvent>,
+        trusted_ssids: &'a [String],
     ) -> DriverFuture<'a, DisconnectReason>;
     fn send_terminate<'a>(
         &'a mut self,
@@ -541,8 +569,18 @@ impl ControllerDriver for ProductionDriver {
         tun: &'a Self::Tun,
         shutdown: &'a Shutdown,
         power_rx: &'a mut mpsc::UnboundedReceiver<PowerEvent>,
+        wifi_rx: &'a mut mpsc::UnboundedReceiver<WifiEvent>,
+        trusted_ssids: &'a [String],
     ) -> DriverFuture<'a, DisconnectReason> {
-        Box::pin(vpn::event_loop(tunnel, lcp, tun, shutdown, power_rx))
+        Box::pin(vpn::event_loop(
+            tunnel,
+            lcp,
+            tun,
+            shutdown,
+            power_rx,
+            wifi_rx,
+            trusted_ssids,
+        ))
     }
 
     fn send_terminate<'a>(
@@ -562,6 +600,7 @@ enum Interrupt {
     Shutdown,
     Sleep,
     NetworkDown,
+    TrustedWifi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -605,6 +644,7 @@ fn disconnect_failure_class(reason: &DisconnectReason) -> &'static str {
         DisconnectReason::ServerTerminated => "server_terminated",
         DisconnectReason::IoError(_) => "io_error",
         DisconnectReason::SystemSleep => "system_sleep",
+        DisconnectReason::TrustedNetwork => "trusted_network",
         DisconnectReason::UserQuit => "user_quit",
     }
 }
@@ -623,11 +663,28 @@ async fn next_power_event(rx: &mut mpsc::UnboundedReceiver<PowerEvent>) -> Power
     }
 }
 
+pub(crate) async fn next_wifi_event(rx: &mut mpsc::UnboundedReceiver<WifiEvent>) -> WifiEvent {
+    match rx.recv().await {
+        Some(event) => event,
+        None => std::future::pending().await,
+    }
+}
+
+/// A receiver whose sender is already gone: `next_wifi_event` pends on it
+/// forever, so every Wi-Fi select arm is inert when the feature is disabled.
+fn closed_wifi_receiver() -> mpsc::UnboundedReceiver<WifiEvent> {
+    let (_tx, rx) = mpsc::unbounded_channel();
+    rx
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn interruptible<T>(
     operation: impl Future<Output = T>,
     shutdown: &Shutdown,
     network_rx: &mut mpsc::UnboundedReceiver<NetworkEvent>,
     power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+    wifi_rx: &mut mpsc::UnboundedReceiver<WifiEvent>,
+    trusted_ssids: &[String],
 ) -> std::result::Result<T, Interrupt> {
     tokio::pin!(operation);
     loop {
@@ -644,6 +701,11 @@ async fn interruptible<T>(
             network = next_network_event(network_rx) => {
                 if network == NetworkEvent::Unreachable {
                     return Err(Interrupt::NetworkDown);
+                }
+            }
+            wifi = next_wifi_event(wifi_rx) => {
+                if is_trusted_wifi(wifi.ssid.as_deref(), trusted_ssids) {
+                    return Err(Interrupt::TrustedWifi);
                 }
             }
             result = &mut operation => return Ok(result),
@@ -675,6 +737,7 @@ impl ReconnectController {
         tunnel_config: TunnelConfig,
         shutdown: Shutdown,
         escalation: EscalationConfig,
+        trusted_wifi: TrustedWifiConfig,
     ) -> Self {
         Self {
             auth_params,
@@ -683,6 +746,11 @@ impl ReconnectController {
             policy: ReconnectPolicy::with_escalation(escalation),
             state: ConnectionState::EstablishingTunnel,
             shutdown,
+            trusted_ssids: trusted_wifi.ssids,
+            wifi_rx: trusted_wifi.wifi_rx,
+            // The caller only hands over control on an untrusted network; a
+            // trusted SSID at startup is handled before the controller runs.
+            wifi_trusted: false,
         }
     }
 
@@ -695,15 +763,31 @@ impl ReconnectController {
         &mut self,
         driver: &mut Driver,
     ) -> Result<()> {
-        let (initial_tun, mut iface_name) =
+        let mut wifi_rx = self.wifi_rx.take().unwrap_or_else(closed_wifi_receiver);
+        let trusted_ssids = self.trusted_ssids.clone();
+        // A trusted SSID may already be queued before the first TUN setup
+        // (the network flipped between the caller's startup gate and here).
+        // Routes and DNS must never be installed on a trusted network, so
+        // check before setting anything up rather than tearing it down again.
+        while let Ok(event) = wifi_rx.try_recv() {
+            self.wifi_trusted = is_trusted_wifi(event.ssid.as_deref(), &trusted_ssids);
+        }
+
+        let mut tun_dev = None;
+        let mut iface_name = String::new();
+        let mut setup_active = false;
+        let mut applied_config = self.tunnel_config.clone();
+        if !self.wifi_trusted {
             match driver.setup_tun(&self.tunnel_config, &self.shutdown).await {
-                Ok(setup) => setup,
+                Ok((initial_tun, initial_iface)) => {
+                    tun_dev = Some(initial_tun);
+                    iface_name = initial_iface;
+                    setup_active = true;
+                }
                 Err(_) if self.shutdown.is_cancelled() => return Ok(()),
                 Err(error) => return Err(error),
-            };
-        let mut tun_dev = Some(initial_tun);
-        let mut applied_config = self.tunnel_config.clone();
-        let mut setup_active = true;
+            }
+        }
         info!("Press Ctrl+C to disconnect.");
 
         // Watch the gateway by its pinned IP when we have one. The hostname
@@ -718,7 +802,9 @@ impl ReconnectController {
         let (mut network_rx, mut power_rx) = match driver.start_monitors(monitor_target) {
             Ok(receivers) => receivers,
             Err(error) => {
-                driver.cleanup_tun(&applied_config, &iface_name).await;
+                if setup_active {
+                    driver.cleanup_tun(&applied_config, &iface_name).await;
+                }
                 return Err(error);
             }
         };
@@ -732,6 +818,39 @@ impl ReconnectController {
         let mut dns_suspended = false;
 
         'reconnect: loop {
+            // Trusted Wi-Fi gate: the single place that owns suspension. All
+            // other observation points only set `wifi_trusted` and loop back
+            // here, so the full local teardown exists exactly once.
+            while let Ok(event) = wifi_rx.try_recv() {
+                self.wifi_trusted = is_trusted_wifi(event.ssid.as_deref(), &trusted_ssids);
+            }
+            if self.wifi_trusted {
+                if setup_active {
+                    info!(
+                        state = ?ConnectionState::SuspendedOnTrustedWifi,
+                        "Trusted Wi-Fi detected — tearing down VPN locally"
+                    );
+                    driver.cleanup_tun(&applied_config, &iface_name).await;
+                    setup_active = false;
+                    drop(tun_dev.take());
+                    // cleanup_tun withdrew the VPN DNS along with the routes.
+                    dns_suspended = true;
+                }
+                if self
+                    .wait_while_trusted(&mut wifi_rx, &mut power_rx, &trusted_ssids)
+                    .await
+                {
+                    break;
+                }
+                while let Ok(event) = network_rx.try_recv() {
+                    debug!(
+                        "Draining network event after trusted Wi-Fi resume: {:?}",
+                        event
+                    );
+                }
+                continue;
+            }
+
             if pending_config_refresh {
                 self.state = ConnectionState::RefreshingConfig;
                 match interruptible(
@@ -739,6 +858,8 @@ impl ReconnectController {
                     &shutdown,
                     &mut network_rx,
                     &mut power_rx,
+                    &mut wifi_rx,
+                    &trusted_ssids,
                 )
                 .await
                 {
@@ -779,6 +900,8 @@ impl ReconnectController {
                                 },
                                 &mut network_rx,
                                 &mut power_rx,
+                                &mut wifi_rx,
+                                &trusted_ssids,
                             )
                             .await
                             == RetryOutcome::Shutdown
@@ -795,9 +918,21 @@ impl ReconnectController {
                         continue;
                     }
                     Err(Interrupt::NetworkDown) => {
-                        if self.wait_for_network(&mut network_rx, &mut power_rx).await {
+                        if self
+                            .wait_for_network(
+                                &mut network_rx,
+                                &mut power_rx,
+                                &mut wifi_rx,
+                                &trusted_ssids,
+                            )
+                            .await
+                        {
                             break;
                         }
+                        continue;
+                    }
+                    Err(Interrupt::TrustedWifi) => {
+                        self.wifi_trusted = true;
                         continue;
                     }
                 }
@@ -819,6 +954,8 @@ impl ReconnectController {
                     &shutdown,
                     &mut network_rx,
                     &mut power_rx,
+                    &mut wifi_rx,
+                    &trusted_ssids,
                 )
                 .await
                 {
@@ -852,6 +989,8 @@ impl ReconnectController {
                                 },
                                 &mut network_rx,
                                 &mut power_rx,
+                                &mut wifi_rx,
+                                &trusted_ssids,
                             )
                             .await
                             == RetryOutcome::Shutdown
@@ -868,9 +1007,21 @@ impl ReconnectController {
                         continue;
                     }
                     Err(Interrupt::NetworkDown) => {
-                        if self.wait_for_network(&mut network_rx, &mut power_rx).await {
+                        if self
+                            .wait_for_network(
+                                &mut network_rx,
+                                &mut power_rx,
+                                &mut wifi_rx,
+                                &trusted_ssids,
+                            )
+                            .await
+                        {
                             break;
                         }
+                        continue;
+                    }
+                    Err(Interrupt::TrustedWifi) => {
+                        self.wifi_trusted = true;
                         continue;
                     }
                 }
@@ -890,6 +1041,8 @@ impl ReconnectController {
                 &shutdown,
                 &mut network_rx,
                 &mut power_rx,
+                &mut wifi_rx,
+                &trusted_ssids,
             )
             .await
             {
@@ -908,9 +1061,21 @@ impl ReconnectController {
                 }
                 Err(Interrupt::NetworkDown) => {
                     suspend_vpn_dns(driver, &mut dns_suspended).await;
-                    if self.wait_for_network(&mut network_rx, &mut power_rx).await {
+                    if self
+                        .wait_for_network(
+                            &mut network_rx,
+                            &mut power_rx,
+                            &mut wifi_rx,
+                            &trusted_ssids,
+                        )
+                        .await
+                    {
                         break;
                     }
+                    continue;
+                }
+                Err(Interrupt::TrustedWifi) => {
+                    self.wifi_trusted = true;
                     continue;
                 }
             };
@@ -954,6 +1119,8 @@ impl ReconnectController {
                             },
                             &mut network_rx,
                             &mut power_rx,
+                            &mut wifi_rx,
+                            &trusted_ssids,
                         )
                         .await
                         == RetryOutcome::Shutdown
@@ -969,11 +1136,15 @@ impl ReconnectController {
                 info!("IPCP assigned a new address: {}", negotiated_ip);
             }
 
-            if network_config_changed(&applied_config, &self.tunnel_config) {
-                warn!("VPN network configuration changed — recreating TUN device");
-                driver.cleanup_tun(&applied_config, &iface_name).await;
-                setup_active = false;
-                drop(tun_dev.take());
+            // Rebuild when the config changed — or when there is no TUN at
+            // all, i.e. resuming after a trusted-Wi-Fi suspension tore it down.
+            if tun_dev.is_none() || network_config_changed(&applied_config, &self.tunnel_config) {
+                if setup_active {
+                    warn!("VPN network configuration changed — recreating TUN device");
+                    driver.cleanup_tun(&applied_config, &iface_name).await;
+                    setup_active = false;
+                    drop(tun_dev.take());
+                }
                 match driver.setup_tun(&self.tunnel_config, &shutdown).await {
                     Ok((new_tun, new_iface)) => {
                         tun_dev = Some(new_tun);
@@ -1008,6 +1179,8 @@ impl ReconnectController {
                     tun_dev.as_ref().expect("active setup has a TUN device"),
                     &shutdown,
                     &mut power_rx,
+                    &mut wifi_rx,
+                    &trusted_ssids,
                 )
                 .await;
             // Sample the lifetime immediately: teardown below (terminate up to
@@ -1031,11 +1204,14 @@ impl ReconnectController {
 
             // A tunnel that dies within the flap window for a non-user reason never
             // carried healthy traffic: count it as a failed cycle so repeated
-            // accept-then-drop behavior escalates to re-authentication. Sleep and
-            // user-initiated exits are excluded — they say nothing about the cookie.
+            // accept-then-drop behavior escalates to re-authentication. Sleep,
+            // trusted-Wi-Fi suspension, and user-initiated exits are excluded —
+            // they say nothing about the cookie.
             if !matches!(
                 reason,
-                DisconnectReason::UserQuit | DisconnectReason::SystemSleep
+                DisconnectReason::UserQuit
+                    | DisconnectReason::SystemSleep
+                    | DisconnectReason::TrustedNetwork
             ) && tunnel_alive < self.policy.flap_window()
             {
                 warn!(
@@ -1055,6 +1231,13 @@ impl ReconnectController {
                 continue;
             }
 
+            if reason == DisconnectReason::TrustedNetwork {
+                // Terminate was sent and the tunnel dropped above; the gate at
+                // the top of the loop completes the local teardown.
+                self.wifi_trusted = true;
+                continue;
+            }
+
             info!("Event loop exited: {:?}", reason);
             match classify_disconnect(&reason) {
                 ReconnectAction::Exit => break,
@@ -1068,6 +1251,8 @@ impl ReconnectController {
                             },
                             &mut network_rx,
                             &mut power_rx,
+                            &mut wifi_rx,
+                            &trusted_ssids,
                         )
                         .await
                         == RetryOutcome::Shutdown
@@ -1094,6 +1279,8 @@ impl ReconnectController {
         &mut self,
         network_rx: &mut mpsc::UnboundedReceiver<NetworkEvent>,
         power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+        wifi_rx: &mut mpsc::UnboundedReceiver<WifiEvent>,
+        trusted_ssids: &[String],
     ) -> bool {
         self.state = ConnectionState::WaitingForNetwork;
         info!("Network unreachable — waiting for reachability");
@@ -1117,6 +1304,63 @@ impl ReconnectController {
                     if event == PowerEvent::WillSleep && self.wait_for_wake(power_rx).await {
                         return true;
                     }
+                }
+                event = next_wifi_event(wifi_rx) => {
+                    self.wifi_trusted = is_trusted_wifi(event.ssid.as_deref(), trusted_ssids);
+                    if self.wifi_trusted {
+                        // Let the loop-top gate take over the suspension.
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Block while the machine stays on a trusted Wi-Fi network. The VPN has
+    /// already been torn down by the gate; suspension is indefinite by design,
+    /// so unlike the other waits there is no fallback timeout. Returns true
+    /// when shutdown was requested.
+    async fn wait_while_trusted(
+        &mut self,
+        wifi_rx: &mut mpsc::UnboundedReceiver<WifiEvent>,
+        power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+        trusted_ssids: &[String],
+    ) -> bool {
+        self.state = ConnectionState::SuspendedOnTrustedWifi;
+        info!(
+            state = ?self.state,
+            "On trusted Wi-Fi — VPN suspended until the network changes"
+        );
+        loop {
+            if self.shutdown.is_cancelled() {
+                return true;
+            }
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return true,
+                // recv() directly, not next_wifi_event: this state is only
+                // reachable through a real trusted event, so a closed channel
+                // here means the active monitor died — without it no event
+                // will ever end the suspension, so fail open and reconnect
+                // rather than staying suspended until the process is killed.
+                event = wifi_rx.recv() => match event {
+                    Some(event) => {
+                        if !is_trusted_wifi(event.ssid.as_deref(), trusted_ssids) {
+                            info!(ssid = ?event.ssid, "Left trusted Wi-Fi — re-establishing VPN");
+                            self.wifi_trusted = false;
+                            self.policy.on_network_reachable();
+                            return false;
+                        }
+                    }
+                    None => {
+                        warn!("Wi-Fi monitor stopped while suspended — failing open and re-establishing the VPN");
+                        self.wifi_trusted = false;
+                        return false;
+                    }
+                },
+                event = next_power_event(power_rx) => {
+                    // Sleeping and waking on a trusted network changes nothing;
+                    // waking on a different network fires a Wi-Fi event.
+                    debug!("Ignoring power event while suspended on trusted Wi-Fi: {:?}", event);
                 }
             }
         }
@@ -1167,6 +1411,8 @@ impl ReconnectController {
         context: RetryContext,
         network_rx: &mut mpsc::UnboundedReceiver<NetworkEvent>,
         power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+        wifi_rx: &mut mpsc::UnboundedReceiver<WifiEvent>,
+        trusted_ssids: &[String],
     ) -> RetryOutcome {
         self.state = ConnectionState::WaitingToRetry;
         let delay = self.policy.next_delay();
@@ -1184,7 +1430,7 @@ impl ReconnectController {
                         RetryOutcome::Retry
                     }
                     NetworkEvent::Unreachable => {
-                        if self.wait_for_network(network_rx, power_rx).await {
+                        if self.wait_for_network(network_rx, power_rx, wifi_rx, trusted_ssids).await {
                             RetryOutcome::Shutdown
                         } else {
                             RetryOutcome::Retry
@@ -1198,6 +1444,13 @@ impl ReconnectController {
                 } else {
                     RetryOutcome::Retry
                 }
+            }
+            event = next_wifi_event(wifi_rx) => {
+                // Any Wi-Fi drift is fresh network evidence: retry right away.
+                // A trusted SSID is picked up by the loop-top gate, which must
+                // not be delayed behind a backoff while routes are installed.
+                self.wifi_trusted = is_trusted_wifi(event.ssid.as_deref(), trusted_ssids);
+                RetryOutcome::Retry
             }
         }
     }
@@ -1294,12 +1547,15 @@ mod tests {
         let trigger = shutdown.clone();
         let (_network_tx, mut network_rx) = mpsc::unbounded_channel();
         let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+        let (_wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
         trigger.cancel();
         let result = interruptible(
             std::future::pending::<()>(),
             &shutdown,
             &mut network_rx,
             &mut power_rx,
+            &mut wifi_rx,
+            &[],
         )
         .await;
         assert_eq!(result, Err(Interrupt::Shutdown));
@@ -1310,12 +1566,15 @@ mod tests {
         let shutdown = Shutdown::new();
         let (network_tx, mut network_rx) = mpsc::unbounded_channel();
         let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+        let (_wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
         network_tx.send(NetworkEvent::Unreachable).unwrap();
         let result = interruptible(
             std::future::pending::<()>(),
             &shutdown,
             &mut network_rx,
             &mut power_rx,
+            &mut wifi_rx,
+            &[],
         )
         .await;
         assert_eq!(result, Err(Interrupt::NetworkDown));
@@ -1326,12 +1585,15 @@ mod tests {
         let shutdown = Shutdown::new();
         let (_network_tx, mut network_rx) = mpsc::unbounded_channel();
         let (power_tx, mut power_rx) = mpsc::unbounded_channel();
+        let (_wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
         power_tx.send(PowerEvent::WillSleep).unwrap();
         let result = interruptible(
             std::future::pending::<()>(),
             &shutdown,
             &mut network_rx,
             &mut power_rx,
+            &mut wifi_rx,
+            &[],
         )
         .await;
         assert_eq!(result, Err(Interrupt::Sleep));
@@ -1351,6 +1613,7 @@ mod tests {
         FailureThenSleepWake(ConnectFailureKind),
         Success(Ipv4Addr),
         Sleep,
+        TrustedWifiPending(WifiEvent),
     }
 
     enum ScriptAuth {
@@ -1369,6 +1632,7 @@ mod tests {
         events: VecDeque<DisconnectReason>,
         network_tx: Option<mpsc::UnboundedSender<NetworkEvent>>,
         power_tx: Option<mpsc::UnboundedSender<PowerEvent>>,
+        wifi_tx: Option<mpsc::UnboundedSender<WifiEvent>>,
         setup_calls: usize,
         fail_setup_call: Option<usize>,
         fail_dns_suspend: usize,
@@ -1385,6 +1649,7 @@ mod tests {
                 events: VecDeque::new(),
                 network_tx: None,
                 power_tx: None,
+                wifi_tx: None,
                 setup_calls: 0,
                 fail_setup_call: None,
                 fail_dns_suspend: 0,
@@ -1595,6 +1860,10 @@ mod tests {
                     tx.send(PowerEvent::HasPoweredOn).unwrap();
                     Box::pin(std::future::pending())
                 }
+                ScriptConnect::TrustedWifiPending(event) => {
+                    self.wifi_tx.as_ref().unwrap().send(event).unwrap();
+                    Box::pin(std::future::pending())
+                }
             }
         }
 
@@ -1605,6 +1874,8 @@ mod tests {
             _tun: &'a Self::Tun,
             _shutdown: &'a Shutdown,
             _power_rx: &'a mut mpsc::UnboundedReceiver<PowerEvent>,
+            _wifi_rx: &'a mut mpsc::UnboundedReceiver<WifiEvent>,
+            _trusted_ssids: &'a [String],
         ) -> DriverFuture<'a, DisconnectReason> {
             self.record("event_loop");
             let reason = self.events.pop_front().expect("missing scripted event");
@@ -1663,6 +1934,22 @@ mod tests {
         saml: bool,
         escalation: EscalationConfig,
     ) -> ReconnectController {
+        controller_full(
+            initial,
+            shutdown,
+            saml,
+            escalation,
+            TrustedWifiConfig::default(),
+        )
+    }
+
+    fn controller_full(
+        initial: TunnelConfig,
+        shutdown: Shutdown,
+        saml: bool,
+        escalation: EscalationConfig,
+        trusted_wifi: TrustedWifiConfig,
+    ) -> ReconnectController {
         let auth_client = AuthClient::new("vpn.example", 443, false).unwrap();
         ReconnectController::new(
             AuthParams {
@@ -1680,6 +1967,7 @@ mod tests {
             initial,
             shutdown,
             escalation,
+            trusted_wifi,
         )
     }
 
@@ -2526,6 +2814,331 @@ mod tests {
         assert_eq!(
             log.iter()
                 .filter(|entry| *entry == "dns_resume:10.0.0.53")
+                .count(),
+            1,
+            "{log:?}"
+        );
+    }
+
+    fn trusted_controller(
+        initial: TunnelConfig,
+        shutdown: Shutdown,
+        escalation: EscalationConfig,
+    ) -> (ReconnectController, mpsc::UnboundedSender<WifiEvent>) {
+        let (wifi_tx, wifi_rx) = mpsc::unbounded_channel();
+        let controller = controller_full(
+            initial,
+            shutdown,
+            true,
+            escalation,
+            TrustedWifiConfig {
+                ssids: vec!["Home".into()],
+                wifi_rx: Some(wifi_rx),
+            },
+        );
+        (controller, wifi_tx)
+    }
+
+    fn trusted(ssid: &str) -> WifiEvent {
+        WifiEvent {
+            ssid: Some(ssid.into()),
+        }
+    }
+
+    fn no_wifi() -> WifiEvent {
+        WifiEvent { ssid: None }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trusted_wifi_disconnect_tears_down_and_resumes_off_trusted_network() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let (mut controller, wifi_tx) =
+            trusted_controller(initial, Shutdown::new(), EscalationConfig::default());
+        let mut driver = ScriptDriver::default();
+        driver.connects.extend([
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+        ]);
+        driver
+            .events
+            .extend([DisconnectReason::TrustedNetwork, DisconnectReason::UserQuit]);
+        // Once the controller suspends, drift to a non-Wi-Fi (untrusted)
+        // network so it resumes.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = wifi_tx.send(no_wifi());
+        });
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        // Full local teardown: LCP terminate (network is fine, unlike sleep),
+        // DNS withdrawal, then routes/TUN cleanup — before any reconnect.
+        let position = |needle: &str| log.iter().position(|entry| entry.starts_with(needle));
+        let terminate = position("terminate").expect("terminate must be sent");
+        let dns_suspend = position("dns_suspend").expect("DNS must be withdrawn");
+        let cleanup = position("cleanup:").expect("routes/TUN must be cleaned up");
+        let second_connect = log
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.starts_with("connect:"))
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("must reconnect after leaving trusted Wi-Fi");
+        assert!(terminate < dns_suspend, "{log:?}");
+        assert!(dns_suspend < cleanup, "{log:?}");
+        assert!(cleanup < second_connect, "{log:?}");
+
+        // The cookie survives suspension: no re-authentication, and the
+        // reconnect presents the old cookie.
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 0);
+        assert!(log[second_connect].ends_with(":old-cookie"), "{log:?}");
+        // setup_tun reinstalls DNS on resume; no separate dns_resume runs.
+        assert!(
+            !log.iter().any(|entry| entry.starts_with("dns_resume")),
+            "{log:?}"
+        );
+        let second_setup = log
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.starts_with("setup:"))
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("TUN must be rebuilt on resume");
+        assert!(second_connect < second_setup, "{log:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trusted_wifi_interrupt_during_connect_suspends_without_failure_accounting() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let (mut controller, wifi_tx) =
+            trusted_controller(initial, Shutdown::new(), EscalationConfig::default());
+        let mut driver = ScriptDriver {
+            wifi_tx: Some(wifi_tx.clone()),
+            ..ScriptDriver::default()
+        };
+        driver.connects.extend([
+            ScriptConnect::TrustedWifiPending(trusted("Home")),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+        ]);
+        driver.events.push_back(DisconnectReason::UserQuit);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = wifi_tx.send(no_wifi());
+        });
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        // Suspension is not a failure: no re-auth, no backoff advance.
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 0);
+        assert_eq!(controller.policy.current_delay(), Duration::from_secs(1));
+        assert_eq!(controller.policy.failed_cycles(), 0);
+        let cleanup = log
+            .iter()
+            .position(|entry| entry.starts_with("cleanup:"))
+            .expect("interrupted connect must still tear down the eager setup");
+        let second_connect = log
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.starts_with("connect:"))
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("must reconnect after resume");
+        assert!(cleanup < second_connect, "{log:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_trusted_wifi_event_defers_first_connect() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let (mut controller, wifi_tx) =
+            trusted_controller(initial, Shutdown::new(), EscalationConfig::default());
+        let mut driver = ScriptDriver::default();
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+        // A trusted SSID is already queued when the controller starts (e.g.
+        // the network flipped between main's gate and the controller run).
+        wifi_tx.send(trusted("Home")).unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = wifi_tx.send(no_wifi());
+        });
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        // The queued trusted event is consumed before the first TUN setup:
+        // routes and DNS are never installed on the trusted network, so the
+        // suspension has nothing to tear down. Setup happens only on resume,
+        // after the reconnect succeeds; the only cleanup is the final one.
+        let first_connect = log
+            .iter()
+            .position(|entry| entry.starts_with("connect:"))
+            .expect("must connect after leaving trusted Wi-Fi");
+        let first_setup = log
+            .iter()
+            .position(|entry| entry.starts_with("setup:"))
+            .expect("TUN must be set up on resume");
+        assert!(first_connect < first_setup, "{log:?}");
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.starts_with("setup:"))
+                .count(),
+            1,
+            "{log:?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.starts_with("cleanup:"))
+                .count(),
+            1,
+            "{log:?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.starts_with("connect:"))
+                .count(),
+            1,
+            "{log:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn monitor_death_while_suspended_fails_open_and_reconnects() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let (mut controller, wifi_tx) =
+            trusted_controller(initial, Shutdown::new(), EscalationConfig::default());
+        let mut driver = ScriptDriver::default();
+        driver.connects.extend([
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+        ]);
+        driver
+            .events
+            .extend([DisconnectReason::TrustedNetwork, DisconnectReason::UserQuit]);
+        // The monitor dies while the controller sits suspended. Without an
+        // event source nothing can ever end the suspension, so the controller
+        // must fail open and reconnect instead of hanging until killed.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(wifi_tx);
+        });
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        let second_connect = log
+            .iter()
+            .filter(|entry| entry.starts_with("connect:"))
+            .count();
+        assert_eq!(second_connect, 2, "monitor death must resume: {log:?}");
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trusted_network_disconnect_is_excluded_from_flap_escalation() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let (mut controller, wifi_tx) = trusted_controller(
+            initial,
+            Shutdown::new(),
+            EscalationConfig {
+                max_failed_cycles: 1,
+                flap_window: Duration::from_secs(120),
+            },
+        );
+        let mut driver = ScriptDriver::default();
+        driver.connects.extend([
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+        ]);
+        driver
+            .events
+            .extend([DisconnectReason::TrustedNetwork, DisconnectReason::UserQuit]);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = wifi_tx.send(no_wifi());
+        });
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        // The tunnel lived well under the flap window, but a trusted-network
+        // disconnect says nothing about the cookie: even with the escalation
+        // threshold at 1 no re-authentication may run.
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 0);
+        let connects: Vec<_> = log
+            .iter()
+            .filter(|entry| entry.starts_with("connect:"))
+            .collect();
+        assert_eq!(connects, ["connect:old-cookie", "connect:old-cookie"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_trusted_untrusted_cycles_are_stable() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let (mut controller, wifi_tx) =
+            trusted_controller(initial, Shutdown::new(), EscalationConfig::default());
+        let mut driver = ScriptDriver::default();
+        driver.connects.extend([
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+        ]);
+        driver.events.extend([
+            DisconnectReason::TrustedNetwork,
+            DisconnectReason::TrustedNetwork,
+            DisconnectReason::UserQuit,
+        ]);
+        // Resume the controller out of each of the two suspensions.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = wifi_tx.send(no_wifi());
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = wifi_tx.send(no_wifi());
+        });
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        let count = |needle: &str| log.iter().filter(|entry| entry.starts_with(needle)).count();
+        // Two suspensions plus the final shutdown cleanup; a fresh setup and
+        // tunnel for every resume. Suspend/resume must repeat indefinitely.
+        // Terminate fires on both trusted-network disconnects and on UserQuit.
+        assert_eq!(count("terminate"), 3, "{log:?}");
+        assert_eq!(count("cleanup:"), 3, "{log:?}");
+        assert_eq!(count("setup:"), 3, "{log:?}");
+        assert_eq!(count("connect:"), 3, "{log:?}");
+        assert_eq!(count("event_loop"), 3, "{log:?}");
+        assert_eq!(count("auth"), 0, "{log:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_while_suspended_on_trusted_wifi_exits_without_double_cleanup() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let shutdown = Shutdown::new();
+        let trigger = shutdown.clone();
+        let (mut controller, _wifi_tx) =
+            trusted_controller(initial, shutdown, EscalationConfig::default());
+        let mut driver = ScriptDriver::default();
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::TrustedNetwork);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            trigger.cancel();
+        });
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        // The suspension already tore everything down; the final cleanup pass
+        // must not run again against a dead interface.
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.starts_with("cleanup:"))
                 .count(),
             1,
             "{log:?}"

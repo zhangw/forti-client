@@ -8,3 +8,4 @@ pub mod shutdown;
 pub mod tun;
 pub mod tunnel;
 pub mod vpn;
+pub mod wifi_monitor;

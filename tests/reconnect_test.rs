@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use forti_client::error::{AuthRequirement, ConnectFailureKind, SamlFailureKind};
 use forti_client::reconnect::{
-    classify_disconnect, Backoff, ConnectionState, DisconnectReason, ReconnectAction,
-    ReconnectPolicy,
+    classify_disconnect, is_trusted_wifi, Backoff, ConnectionState, DisconnectReason,
+    ReconnectAction, ReconnectPolicy,
 };
 
 #[test]
@@ -211,7 +211,24 @@ fn connection_states_name_actual_controller_phases() {
         ConnectionState::Running,
         ConnectionState::WaitingToRetry,
         ConnectionState::WaitingForNetwork,
+        ConnectionState::SuspendedOnTrustedWifi,
         ConnectionState::CleaningUp,
     ];
-    assert_eq!(states.len(), 7);
+    assert_eq!(states.len(), 8);
+}
+
+#[test]
+fn is_trusted_wifi_matches_exactly() {
+    let whitelist = vec!["Home".to_string(), "Office-5G".to_string()];
+    // Strict, byte-exact matching only.
+    assert!(is_trusted_wifi(Some("Home"), &whitelist));
+    assert!(is_trusted_wifi(Some("Office-5G"), &whitelist));
+    assert!(!is_trusted_wifi(Some("home"), &whitelist));
+    assert!(!is_trusted_wifi(Some("Home "), &whitelist));
+    assert!(!is_trusted_wifi(Some("Homestead"), &whitelist));
+    // No Wi-Fi (wired, hotspot without SSID, failed query) is never trusted.
+    assert!(!is_trusted_wifi(None, &whitelist));
+    // An empty whitelist disables the feature entirely.
+    assert!(!is_trusted_wifi(Some("Home"), &[]));
+    assert!(!is_trusted_wifi(None, &[]));
 }

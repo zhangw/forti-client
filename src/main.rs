@@ -1,7 +1,10 @@
 use clap::Parser;
 use forti_client::auth::AuthClient;
-use forti_client::reconnect::{AuthParams, ReconnectController};
+use forti_client::reconnect::{
+    is_trusted_wifi, AuthParams, ReconnectController, TrustedWifiConfig,
+};
 use forti_client::shutdown::Shutdown;
+use forti_client::wifi_monitor::{WifiEvent, WifiMonitor};
 use secrecy::{ExposeSecret, SecretString};
 use std::io::Write;
 use tracing_subscriber::EnvFilter;
@@ -44,9 +47,34 @@ struct Cli {
     /// Tunnel lifetime below this many seconds counts as a failed reconnect cycle
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
     tunnel_flap_window: u64,
+
+    /// Wi-Fi SSID on which the VPN must stay disconnected (repeatable, exact match)
+    #[arg(long = "trusted-wifi", value_name = "SSID")]
+    trusted_wifi: Vec<String>,
 }
 
 const FORCED_SIGINT_EXIT_CODE: i32 = 130;
+
+/// Resolves only when a trusted Wi-Fi event arrives, so racing it against the
+/// initial authentication aborts the attempt the moment the machine joins a
+/// whitelisted network. Pends forever when the feature is disabled, when the
+/// drift stays between untrusted networks, or when the monitor is gone
+/// (fail open: authentication proceeds).
+async fn next_trusted_wifi_event(
+    wifi_rx: Option<&mut tokio::sync::mpsc::UnboundedReceiver<WifiEvent>>,
+    whitelist: &[String],
+) -> WifiEvent {
+    let Some(rx) = wifi_rx else {
+        return std::future::pending().await;
+    };
+    loop {
+        match rx.recv().await {
+            Some(event) if is_trusted_wifi(event.ssid.as_deref(), whitelist) => return event,
+            Some(_) => {}
+            None => return std::future::pending().await,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownSignalAction {
@@ -206,44 +234,90 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let auth_future = async {
-        if cli.saml {
-            tracing::info!(
-                "Starting SAML authentication to {}:{}",
-                cli.server,
-                cli.port
-            );
-            auth_client.login_saml().await
-        } else {
-            let username = cli.username.as_deref().ok_or_else(|| {
-                forti_client::error::FortiError::AuthFailed(
-                    "--username is required for credential auth (use --saml for SSO)".into(),
-                )
-            })?;
-            let pw = password.as_ref().ok_or_else(|| {
-                forti_client::error::FortiError::AuthFailed("password required".into())
-            })?;
-            tracing::info!("Authenticating to {}:{}", cli.server, cli.port);
-            auth_client
-                .login(username, pw.expose_secret(), cli.realm.as_deref())
-                .await
-        }
-    };
-
-    if shutdown.is_cancelled() {
-        tracing::info!("Authentication cancelled.");
-        return Ok(());
+    // Trusted Wi-Fi startup gate: while the machine sits on a whitelisted
+    // SSID no VPN may exist, so even the initial authentication (and its SAML
+    // browser popup) waits until the network drifts off the whitelist — and a
+    // drift *onto* the whitelist mid-authentication aborts the attempt and
+    // re-enters the wait. The monitor's first event always reports the
+    // current SSID.
+    let mut wifi: Option<(WifiMonitor, tokio::sync::mpsc::UnboundedReceiver<WifiEvent>)> = None;
+    if !cli.trusted_wifi.is_empty() {
+        let (monitor, wifi_rx) = WifiMonitor::start().map_err(anyhow::Error::msg)?;
+        wifi = Some((monitor, wifi_rx));
     }
-    let auth_result = tokio::select! {
-        _ = shutdown.cancelled() => {
-            tracing::info!("Authentication cancelled.");
-            #[cfg(debug_assertions)]
-            if std::env::var_os("FORTI_CLIENT_TEST_STALL_ON_SHUTDOWN").is_some() {
-                std::future::pending::<()>().await;
+
+    let auth_result = loop {
+        if let Some((_, wifi_rx)) = wifi.as_mut() {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        tracing::info!("Authentication cancelled.");
+                        return Ok(());
+                    }
+                    event = wifi_rx.recv() => match event {
+                        Some(event) if is_trusted_wifi(event.ssid.as_deref(), &cli.trusted_wifi) => {
+                            tracing::info!(
+                                ssid = ?event.ssid,
+                                "On trusted Wi-Fi — deferring VPN connection until the network changes"
+                            );
+                        }
+                        Some(event) => {
+                            tracing::debug!(ssid = ?event.ssid, "Untrusted network; connecting");
+                            break;
+                        }
+                        // Monitor died: fail open toward establishing the VPN.
+                        None => break,
+                    }
+                }
             }
+        }
+
+        let auth_future = async {
+            if cli.saml {
+                tracing::info!(
+                    "Starting SAML authentication to {}:{}",
+                    cli.server,
+                    cli.port
+                );
+                auth_client.login_saml().await
+            } else {
+                let username = cli.username.as_deref().ok_or_else(|| {
+                    forti_client::error::FortiError::AuthFailed(
+                        "--username is required for credential auth (use --saml for SSO)".into(),
+                    )
+                })?;
+                let pw = password.as_ref().ok_or_else(|| {
+                    forti_client::error::FortiError::AuthFailed("password required".into())
+                })?;
+                tracing::info!("Authenticating to {}:{}", cli.server, cli.port);
+                auth_client
+                    .login(username, pw.expose_secret(), cli.realm.as_deref())
+                    .await
+            }
+        };
+
+        if shutdown.is_cancelled() {
+            tracing::info!("Authentication cancelled.");
             return Ok(());
         }
-        result = auth_future => result?,
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!("Authentication cancelled.");
+                #[cfg(debug_assertions)]
+                if std::env::var_os("FORTI_CLIENT_TEST_STALL_ON_SHUTDOWN").is_some() {
+                    std::future::pending::<()>().await;
+                }
+                return Ok(());
+            }
+            event = next_trusted_wifi_event(wifi.as_mut().map(|(_, rx)| rx), &cli.trusted_wifi) => {
+                tracing::info!(
+                    ssid = ?event.ssid,
+                    "Joined trusted Wi-Fi during authentication — aborting until the network changes"
+                );
+                continue;
+            }
+            result = auth_future => break result?,
+        }
     };
 
     tracing::info!(
@@ -265,6 +339,13 @@ async fn main() -> anyhow::Result<()> {
         enable_keylog,
     };
 
+    // Keep the monitor handle alive for the whole run, like _dns_guard below;
+    // dropping it would end the watcher threads.
+    let (_wifi_monitor, wifi_rx) = match wifi {
+        Some((monitor, rx)) => (Some(monitor), Some(rx)),
+        None => (None, None),
+    };
+
     let mut controller = ReconnectController::new(
         auth_params,
         auth_result.svpn_cookie,
@@ -273,6 +354,10 @@ async fn main() -> anyhow::Result<()> {
         forti_client::reconnect::EscalationConfig {
             max_failed_cycles: cli.reauth_after_failures,
             flap_window: std::time::Duration::from_secs(cli.tunnel_flap_window),
+        },
+        TrustedWifiConfig {
+            ssids: cli.trusted_wifi,
+            wifi_rx,
         },
     );
 
