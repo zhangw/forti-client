@@ -211,10 +211,11 @@ fn connection_states_name_actual_controller_phases() {
         ConnectionState::Running,
         ConnectionState::WaitingToRetry,
         ConnectionState::WaitingForNetwork,
+        ConnectionState::WaitingForInteractiveAuth,
         ConnectionState::SuspendedOnTrustedWifi,
         ConnectionState::CleaningUp,
     ];
-    assert_eq!(states.len(), 8);
+    assert_eq!(states.len(), 9);
 }
 
 #[test]

@@ -15,6 +15,15 @@ const MAX_SAML_CALLBACK_HEADER: usize = 16 * 1024;
 const MAX_AUTH_BODY_SIZE: usize = 4 * 1024 * 1024;
 const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Controls whether opening the SAML URL activates the user's browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamlBrowserPresentation {
+    /// Open the URL and allow LaunchServices to activate the browser.
+    Foreground,
+    /// Open the URL without bringing the browser to the foreground.
+    Background,
+}
+
 /// Resolve the gateway hostname to a single socket address.
 ///
 /// The caller pins this for the process lifetime so later reconnects never
@@ -96,27 +105,70 @@ async fn send_auth_request(
         .map_err(|e| FortiError::TunnelError(format!("{}: {}", context, e)))
 }
 
-fn saml_browser_command(url: &str) -> tokio::process::Command {
-    #[cfg(debug_assertions)]
-    if let Some(program) = std::env::var_os("FORTI_CLIENT_TEST_BROWSER_LAUNCHER") {
+fn saml_browser_command_with_context(
+    url: &str,
+    presentation: SamlBrowserPresentation,
+    test_launcher: Option<&std::ffi::OsStr>,
+    sudo_user: Option<&str>,
+) -> tokio::process::Command {
+    if let Some(program) = test_launcher {
         let mut command = tokio::process::Command::new(program);
+        if presentation == SamlBrowserPresentation::Background {
+            command.arg("-g");
+        }
         command.arg(url);
         return command;
     }
 
-    if let Ok(user) = std::env::var("SUDO_USER") {
+    if let Some(user) = sudo_user {
         let mut command = tokio::process::Command::new("sudo");
-        command.args(["-u", &user, "open", url]);
+        command.args(["-u", user, "open"]);
+        if presentation == SamlBrowserPresentation::Background {
+            command.arg("-g");
+        }
+        command.arg(url);
         command
     } else {
         let mut command = tokio::process::Command::new("open");
+        if presentation == SamlBrowserPresentation::Background {
+            command.arg("-g");
+        }
         command.arg(url);
         command
     }
 }
 
-async fn launch_saml_browser(url: &str) -> std::io::Result<()> {
-    let mut command = saml_browser_command(url);
+#[derive(Clone)]
+struct SamlBrowserCommandContext {
+    test_launcher: Option<std::ffi::OsString>,
+    sudo_user: Option<String>,
+}
+
+impl SamlBrowserCommandContext {
+    fn current() -> Self {
+        #[cfg(debug_assertions)]
+        let test_launcher = std::env::var_os("FORTI_CLIENT_TEST_BROWSER_LAUNCHER");
+        #[cfg(not(debug_assertions))]
+        let test_launcher = None;
+
+        Self {
+            test_launcher,
+            sudo_user: std::env::var("SUDO_USER").ok(),
+        }
+    }
+}
+
+async fn launch_saml_browser_with_context(
+    url: &str,
+    presentation: SamlBrowserPresentation,
+    context: &SamlBrowserCommandContext,
+) -> std::io::Result<()> {
+    let mut command = saml_browser_command_with_context(
+        url,
+        presentation,
+        context.test_launcher.as_deref(),
+        context.sudo_user.as_deref(),
+    );
     command.kill_on_drop(true);
     let mut child = command.spawn()?;
     match tokio::time::timeout(BROWSER_LAUNCH_TIMEOUT, child.wait()).await {
@@ -136,6 +188,102 @@ async fn launch_saml_browser(url: &str) -> std::io::Result<()> {
     }
 }
 
+/// A single in-flight SAML authentication.
+///
+/// Presenting the browser more than once reuses the same callback listener and
+/// authentication task. Dropping the handle cancels that task.
+pub struct SamlAttempt {
+    saml_url: String,
+    task: tokio::task::JoinHandle<Result<String>>,
+    callback_received: tokio::sync::watch::Receiver<bool>,
+    browser_context: SamlBrowserCommandContext,
+}
+
+impl SamlAttempt {
+    /// Return the URL associated with this attempt.
+    pub fn url(&self) -> &str {
+        &self.saml_url
+    }
+
+    /// Present this attempt in the user's browser without replacing its listener.
+    ///
+    /// The returned future borrows nothing, so a caller racing it against other
+    /// events can keep polling the same future instead of rebuilding it. That
+    /// matters because the launcher kills its child on drop: a rebuilt future
+    /// would spawn a second `open`, and a dropped one loses the launch entirely.
+    pub fn present(
+        &self,
+        presentation: SamlBrowserPresentation,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send + 'static {
+        let url = self.saml_url.clone();
+        let context = self.browser_context.clone();
+        async move {
+            info!(?presentation, "Opening browser for SAML authentication...");
+            info!("If browser doesn't open, navigate to: {url}");
+            launch_saml_browser_with_context(&url, presentation, &context).await
+        }
+    }
+
+    /// Return whether this attempt has received a valid localhost callback.
+    pub fn callback_received(&self) -> bool {
+        *self.callback_received.borrow()
+    }
+
+    /// Wait until a valid localhost callback arrives.
+    ///
+    /// This wait does not include the subsequent cookie exchange and may be
+    /// cancelled and started again without affecting the authentication task.
+    pub async fn wait_for_callback(&self) -> Result<()> {
+        let mut received = self.callback_received.clone();
+        loop {
+            if *received.borrow_and_update() {
+                return Ok(());
+            }
+            received.changed().await.map_err(|_| {
+                FortiError::SamlCallbackInvalid(
+                    "SAML attempt ended before receiving a callback".into(),
+                )
+            })?;
+        }
+    }
+
+    /// Wait for this attempt's result without tying task lifetime to this wait.
+    ///
+    /// A cancelled wait may be polled again while the attempt remains pending.
+    pub async fn wait_result(&mut self) -> Result<String> {
+        (&mut self.task).await.map_err(|error| {
+            FortiError::AuthFailed(format!("SAML authentication task failed: {error}"))
+        })?
+    }
+}
+
+impl Drop for SamlAttempt {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn spawn_saml_attempt_task<Exchange, ExchangeFuture>(
+    listener: tokio::net::TcpListener,
+    exchange: Exchange,
+) -> (
+    tokio::task::JoinHandle<Result<String>>,
+    tokio::sync::watch::Receiver<bool>,
+)
+where
+    Exchange: FnOnce(String) -> ExchangeFuture + Send + 'static,
+    ExchangeFuture: std::future::Future<Output = Result<String>> + Send + 'static,
+{
+    let (callback_tx, callback_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        let session_id = wait_for_saml_callback_inner(listener).await?;
+        callback_tx.send_replace(true);
+        info!("SAML callback received, exchanging for session cookie");
+        exchange(session_id).await
+    });
+    (task, callback_rx)
+}
+
 pub struct AuthResult {
     pub svpn_cookie: String,
     pub tunnel_config: xml::TunnelConfig,
@@ -151,6 +299,7 @@ impl std::fmt::Debug for AuthResult {
     }
 }
 
+#[derive(Clone)]
 pub struct AuthClient {
     server: String,
     port: u16,
@@ -447,58 +596,93 @@ impl AuthClient {
         })
     }
 
-    /// Authenticate via SAML/SSO and return only the session cookie.
-    pub async fn authenticate_saml(&self) -> Result<String> {
+    /// Start a SAML authentication attempt without presenting the browser.
+    ///
+    /// The attempt itself has no deadline; its owner controls the wait budget.
+    pub async fn begin_saml_attempt(&self) -> Result<SamlAttempt> {
         let saml_port: u16 = 8020;
-
-        // Step 1: Start local HTTP server to receive the SAML callback
-        // A busy callback port is recoverable, so it must not be reported as a
-        // terminal configuration error. During a reconnect that would strand
-        // the client: SAML is the only way back to a usable cookie, so giving
-        // up guarantees the tunnel never returns, whereas retrying behind the
-        // controller's backoff costs nothing if the port frees up.
-        //
-        // std (and therefore tokio) already sets SO_REUSEADDR on Unix, so a
-        // lingering TIME_WAIT socket from our own previous listener does not
-        // reach this path. What does: another client instance, or an unrelated
-        // process holding the port.
-        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", saml_port))
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{saml_port}"))
             .await
-            .map_err(|e| {
+            .map_err(|error| {
                 FortiError::SamlCallbackPortUnavailable(format!(
-                    "failed to bind callback port {}: {} (is another VPN client running?)",
-                    saml_port, e
+                    "failed to bind callback port {saml_port}: {error} (is another VPN client running?)"
                 ))
             })?;
+        info!("SAML callback server listening on 127.0.0.1:{saml_port}");
 
-        info!("SAML callback server listening on 127.0.0.1:{}", saml_port);
+        Ok(self.begin_saml_attempt_with_listener(
+            listener,
+            format!(
+                "https://{}:{}/remote/saml/start?redirect=1",
+                self.server, self.port,
+            ),
+            SamlBrowserCommandContext::current(),
+        ))
+    }
 
-        // Step 2: Open browser to SAML start URL
-        let saml_url = format!(
-            "https://{}:{}/remote/saml/start?redirect=1",
-            self.server, self.port,
-        );
-        info!("Opening browser for SAML authentication...");
-        info!("If browser doesn't open, navigate to: {}", saml_url);
+    fn begin_saml_attempt_with_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+        saml_url: String,
+        browser_context: SamlBrowserCommandContext,
+    ) -> SamlAttempt {
+        let client = self.clone();
+        let (task, callback_received) =
+            spawn_saml_attempt_task(listener, move |session_id| async move {
+                client.exchange_saml_session(&session_id).await
+            });
 
-        if let Err(error) = launch_saml_browser(&saml_url).await {
+        SamlAttempt {
+            saml_url,
+            task,
+            callback_received,
+            browser_context,
+        }
+    }
+
+    /// Authenticate via SAML/SSO and return only the session cookie.
+    pub async fn authenticate_saml(&self) -> Result<String> {
+        self.authenticate_saml_with_presentation(SamlBrowserPresentation::Foreground)
+            .await
+    }
+
+    /// Authenticate via SAML/SSO with explicit browser presentation.
+    pub async fn authenticate_saml_with_presentation(
+        &self,
+        presentation: SamlBrowserPresentation,
+    ) -> Result<String> {
+        let mut attempt = self.begin_saml_attempt().await?;
+        if let Err(error) = attempt.present(presentation).await {
             debug!("Browser launcher failed: {}", error);
-            eprintln!("\nPlease open this URL in your browser:\n  {}\n", saml_url);
+            eprintln!(
+                "\nPlease open this URL in your browser:\n  {}\n",
+                attempt.url()
+            );
         }
 
-        // Step 3: Wait for the SAML callback with ?id=<session_id>
         info!("Waiting for SAML authentication (complete login in your browser)...");
-        let session_id = wait_for_saml_callback(listener).await?;
-        info!("SAML callback received, exchanging for session cookie");
+        // The budget covers the part that waits on a human. Once the callback
+        // lands the session id is already earned, so the exchange runs on its
+        // own network timeouts: expiring it here would abort the task and throw
+        // away a valid session id seconds before it produced a cookie.
+        match tokio::time::timeout(SAML_INTERACTIVE_TIMEOUT, attempt.wait_for_callback()).await {
+            // On `Err` the attempt's task has already ended, and its own error
+            // says why. Fall through rather than report the placeholder that
+            // the callback watch produces when its sender drops.
+            Ok(_) => {}
+            Err(_) => return Err(FortiError::SamlCallbackTimedOut),
+        }
+        attempt.wait_result().await
+    }
 
-        // Step 4: Exchange session ID for SVPNCOOKIE
+    async fn exchange_saml_session(&self, session_id: &str) -> Result<String> {
         let (mut sender, _, _) = self.new_http_connection().await?;
 
         let req = hyper::Request::builder()
             .method("GET")
             .uri(format!(
                 "/remote/saml/auth_id?id={}",
-                urlencoded(&session_id)
+                urlencoded(session_id)
             ))
             .header("Host", &self.server)
             .header("User-Agent", "Mozilla/5.0 SV1")
@@ -642,12 +826,7 @@ fn extract_html_field(html: &str, field_name: &str) -> Option<String> {
     Some(nearby[value_start..value_start + value_end].to_string())
 }
 
-/// Wait for the SAML IdP to redirect the browser to our local callback server.
-/// Enforces a 5-minute overall timeout for the entire callback phase.
-async fn wait_for_saml_callback(listener: tokio::net::TcpListener) -> Result<String> {
-    wait_for_saml_callback_with_timeout(listener, SAML_INTERACTIVE_TIMEOUT).await
-}
-
+#[cfg(test)]
 async fn wait_for_saml_callback_with_timeout(
     listener: tokio::net::TcpListener,
     deadline: Duration,
@@ -870,6 +1049,172 @@ mod tests {
     }
 
     #[test]
+    fn test_browser_launcher_receives_requested_presentation() {
+        let url = "https://vpn.example/remote/saml/start?redirect=1";
+        let foreground = saml_browser_command_with_context(
+            url,
+            SamlBrowserPresentation::Foreground,
+            Some(std::ffi::OsStr::new("/test/browser-launcher")),
+            Some("ignored-user"),
+        );
+        assert_eq!(foreground.as_std().get_program(), "/test/browser-launcher");
+        assert_eq!(
+            foreground.as_std().get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new(url)]
+        );
+
+        let background = saml_browser_command_with_context(
+            url,
+            SamlBrowserPresentation::Background,
+            Some(std::ffi::OsStr::new("/test/browser-launcher")),
+            Some("ignored-user"),
+        );
+        assert_eq!(background.as_std().get_program(), "/test/browser-launcher");
+        assert_eq!(
+            background.as_std().get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new("-g"), std::ffi::OsStr::new(url)]
+        );
+    }
+
+    #[test]
+    fn background_open_is_hidden_for_direct_and_sudo_launches() {
+        let url = "https://vpn.example/remote/saml/start?redirect=1";
+        let direct =
+            saml_browser_command_with_context(url, SamlBrowserPresentation::Background, None, None);
+        assert_eq!(direct.as_std().get_program(), "open");
+        assert_eq!(
+            direct.as_std().get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new("-g"), std::ffi::OsStr::new(url)]
+        );
+
+        let sudo = saml_browser_command_with_context(
+            url,
+            SamlBrowserPresentation::Background,
+            None,
+            Some("vpn-user"),
+        );
+        assert_eq!(sudo.as_std().get_program(), "sudo");
+        assert_eq!(
+            sudo.as_std().get_args().collect::<Vec<_>>(),
+            [
+                std::ffi::OsStr::new("-u"),
+                std::ffi::OsStr::new("vpn-user"),
+                std::ffi::OsStr::new("open"),
+                std::ffi::OsStr::new("-g"),
+                std::ffi::OsStr::new(url),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn saml_attempt_reuses_listener_across_presentations_and_drop_releases_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = AuthClient::new("vpn.example", 10443, false).unwrap();
+        let attempt = client.begin_saml_attempt_with_listener(
+            listener,
+            "https://vpn.example:10443/remote/saml/start?redirect=1".into(),
+            SamlBrowserCommandContext {
+                test_launcher: Some("/usr/bin/true".into()),
+                sudo_user: None,
+            },
+        );
+
+        assert!(tokio::net::TcpListener::bind(address).await.is_err());
+        attempt
+            .present(SamlBrowserPresentation::Background)
+            .await
+            .unwrap();
+        attempt
+            .present(SamlBrowserPresentation::Foreground)
+            .await
+            .unwrap();
+        assert!(tokio::net::TcpListener::bind(address).await.is_err());
+
+        drop(attempt);
+        let rebound = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match tokio::net::TcpListener::bind(address).await {
+                    Ok(listener) => break listener,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("dropping a SAML attempt must release its callback listener");
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn saml_attempt_result_wait_is_cancellation_safe() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = AuthClient::new("vpn.example", 10443, false).unwrap();
+        let mut attempt = client.begin_saml_attempt_with_listener(
+            listener,
+            "https://vpn.example:10443/remote/saml/start?redirect=1".into(),
+            SamlBrowserCommandContext {
+                test_launcher: Some("/usr/bin/true".into()),
+                sudo_user: None,
+            },
+        );
+
+        for _ in 0..2 {
+            tokio::select! {
+                result = attempt.wait_result() => panic!("pending attempt completed: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+            assert!(tokio::net::TcpListener::bind(address).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_wait_is_cancellation_safe_and_excludes_exchange() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (task, callback_received) = spawn_saml_attempt_task(listener, |_session_id| async {
+            std::future::pending::<Result<String>>().await
+        });
+        let mut attempt = SamlAttempt {
+            saml_url: "https://vpn.example:10443/remote/saml/start?redirect=1".into(),
+            task,
+            callback_received,
+            browser_context: SamlBrowserCommandContext {
+                test_launcher: Some("/usr/bin/true".into()),
+                sudo_user: None,
+            },
+        };
+
+        assert!(!attempt.callback_received());
+        for _ in 0..2 {
+            tokio::select! {
+                result = attempt.wait_for_callback() => {
+                    panic!("callback wait completed before a callback: {result:?}")
+                }
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+
+        let mut browser = tokio::net::TcpStream::connect(address).await.unwrap();
+        browser
+            .write_all(b"GET /callback?id=session-123 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), attempt.wait_for_callback())
+            .await
+            .expect("callback stage must complete")
+            .unwrap();
+        assert!(attempt.callback_received());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), attempt.wait_result())
+                .await
+                .is_err(),
+            "cookie exchange must still be pending after the callback stage"
+        );
+    }
+
+    #[test]
     fn ipv4_gateway_wins_over_earlier_ipv6_answer() {
         let ipv6: SocketAddr = "[2001:db8::1]:10443".parse().unwrap();
         let ipv4: SocketAddr = "203.0.113.7:10443".parse().unwrap();
@@ -962,10 +1307,7 @@ mod tests {
             .expect("peer stream must close after read cancellation")
             .unwrap();
         assert_eq!(read, 0);
-        let rebound = tokio::net::TcpListener::bind(address)
-            .await
-            .expect("aborting read must leave the callback address reusable");
-        drop(rebound);
+        drop(client);
     }
 
     struct PendingWriter {

@@ -8,10 +8,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::xml::TunnelConfig;
-use crate::auth::AuthClient;
+use crate::auth::{AuthClient, SamlAttempt, SamlBrowserPresentation};
 use crate::error::{AuthRequirement, ConnectFailureKind, FortiError, Result, SamlFailureKind};
 use crate::network_monitor::{NetworkEvent, NetworkMonitor, ReachabilityTarget};
-use crate::power_monitor::{PowerEvent, PowerMonitor};
+use crate::power_monitor::{PowerCapabilities, PowerEvent, PowerMonitor};
 use crate::ppp::codec::{PppFrame, PppProtocol};
 use crate::ppp::PppEngine;
 use crate::shutdown::Shutdown;
@@ -64,6 +64,127 @@ const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(2);
 const MONITOR_FALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
+/// Safety net for a wake notification that never arrives. Long enough that a
+/// normally-delivered capability change always wins, short enough that a lost
+/// one costs minutes rather than the rest of the session.
+const WAKE_FALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
+const SAML_BACKGROUND_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const SAML_INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Tracks the latest authoritative power capability level while preserving the
+/// existing single-consumer event stream. Unknown capabilities fail open only
+/// before a real sleep edge; after `WillSleep`, a CPU+network capability update
+/// is required before network work resumes.
+pub(crate) struct PowerTracker {
+    rx: mpsc::UnboundedReceiver<PowerEvent>,
+    capabilities: PowerCapabilities,
+    sleeping: bool,
+}
+
+impl PowerTracker {
+    pub(crate) fn new(rx: mpsc::UnboundedReceiver<PowerEvent>) -> Self {
+        let mut tracker = Self {
+            rx,
+            capabilities: PowerCapabilities::UNKNOWN,
+            sleeping: false,
+        };
+        tracker.drain();
+        tracker
+    }
+
+    fn drain(&mut self) {
+        while let Ok(event) = self.rx.try_recv() {
+            self.apply(event);
+        }
+    }
+
+    fn apply(&mut self, event: PowerEvent) {
+        match event {
+            PowerEvent::WillSleep => self.sleeping = true,
+            PowerEvent::HasPoweredOn => {
+                // HasPoweredOn also fires for Dark Wake. Capability changes,
+                // not this legacy edge, decide which work may resume.
+            }
+            PowerEvent::Capabilities(capabilities) => {
+                self.capabilities = capabilities;
+                if capabilities.known {
+                    self.sleeping = !capabilities.cpu;
+                }
+            }
+        }
+    }
+
+    /// Drop back to the fail-open level used before any capability arrived.
+    /// Only for the wake fallback: it lets a bounded reconnect probe run when
+    /// the authoritative signal is missing, without inventing a capability set.
+    fn assume_awake(&mut self) {
+        self.sleeping = false;
+        self.capabilities = PowerCapabilities::UNKNOWN;
+    }
+
+    pub(crate) fn can_run_network(&self) -> bool {
+        !self.sleeping
+            && (!self.capabilities.known || (self.capabilities.cpu && self.capabilities.network))
+    }
+
+    fn can_interact(&self) -> bool {
+        self.can_run_network() && (!self.capabilities.known || self.capabilities.graphics)
+    }
+
+    pub(crate) async fn next_event(&mut self) -> PowerEvent {
+        let event = match self.rx.recv().await {
+            Some(event) => event,
+            None => std::future::pending().await,
+        };
+        self.apply(event);
+        event
+    }
+}
+
+/// Tracks the latest gateway reachability level so browser authentication is
+/// not started from a stale or already-consumed `Unreachable` edge.
+struct NetworkTracker {
+    rx: mpsc::UnboundedReceiver<NetworkEvent>,
+    reachable: Option<bool>,
+}
+
+impl NetworkTracker {
+    fn new(rx: mpsc::UnboundedReceiver<NetworkEvent>) -> Self {
+        let mut tracker = Self {
+            rx,
+            reachable: None,
+        };
+        tracker.drain();
+        tracker
+    }
+
+    fn drain(&mut self) {
+        while let Ok(event) = self.rx.try_recv() {
+            self.apply(event);
+        }
+    }
+
+    fn apply(&mut self, event: NetworkEvent) {
+        self.reachable = Some(event == NetworkEvent::Reachable);
+    }
+
+    fn can_attempt(&self) -> bool {
+        self.reachable != Some(false)
+    }
+
+    fn allow_fallback_probe(&mut self) {
+        self.reachable = None;
+    }
+
+    async fn next_event(&mut self) -> NetworkEvent {
+        let event = match self.rx.recv().await {
+            Some(event) => event,
+            None => std::future::pending().await,
+        };
+        self.apply(event);
+        event
+    }
+}
 
 pub struct Backoff {
     current: Duration,
@@ -216,6 +337,13 @@ impl ReconnectPolicy {
         self.auth_requirement = AuthRequirement::Required;
     }
 
+    /// A pending attempt was shown to the user again. It is not a new attempt —
+    /// the listener and IdP transaction are unchanged — but the counter has to
+    /// advance so a stalled SAML does not read as a frozen attempt in the logs.
+    pub fn on_saml_presented_again(&mut self) {
+        self.saml_attempts = self.saml_attempts.saturating_add(1);
+    }
+
     pub fn on_saml_success(&mut self) {
         self.auth_requirement = AuthRequirement::NotRequired;
         // Deliberately do not reset backoff or the current reconnect episode.
@@ -289,6 +417,7 @@ pub enum ConnectionState {
     Running,
     WaitingToRetry,
     WaitingForNetwork,
+    WaitingForInteractiveAuth,
     SuspendedOnTrustedWifi,
     CleaningUp,
 }
@@ -377,10 +506,49 @@ type DriverConnectResult<Tunnel, Lcp> =
     std::result::Result<ConnectedTunnel<Tunnel, Lcp>, ConnectFailure>;
 type DriverFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+trait ControllerSamlAttempt: Send {
+    fn url(&self) -> &str;
+    /// Borrows nothing, so the controller can keep polling one launch across
+    /// select cancellations instead of dropping and respawning the browser.
+    fn present(
+        &self,
+        presentation: SamlBrowserPresentation,
+    ) -> DriverFuture<'static, std::io::Result<()>>;
+    fn callback_received(&self) -> bool;
+    fn wait_for_callback(&self) -> DriverFuture<'_, Result<()>>;
+    fn wait_result(&mut self) -> DriverFuture<'_, Result<String>>;
+}
+
+impl ControllerSamlAttempt for SamlAttempt {
+    fn url(&self) -> &str {
+        SamlAttempt::url(self)
+    }
+
+    fn present(
+        &self,
+        presentation: SamlBrowserPresentation,
+    ) -> DriverFuture<'static, std::io::Result<()>> {
+        Box::pin(SamlAttempt::present(self, presentation))
+    }
+
+    fn callback_received(&self) -> bool {
+        SamlAttempt::callback_received(self)
+    }
+
+    fn wait_for_callback(&self) -> DriverFuture<'_, Result<()>> {
+        Box::pin(SamlAttempt::wait_for_callback(self))
+    }
+
+    fn wait_result(&mut self) -> DriverFuture<'_, Result<String>> {
+        Box::pin(SamlAttempt::wait_result(self))
+    }
+}
+
 trait ControllerDriver: Send {
     type Tun: Sync;
     type Tunnel: Send;
     type Lcp: Send;
+    type SamlAttempt: ControllerSamlAttempt;
 
     fn setup_tun<'a>(
         &'a mut self,
@@ -399,6 +567,10 @@ trait ControllerDriver: Send {
         mpsc::UnboundedReceiver<NetworkEvent>,
         mpsc::UnboundedReceiver<PowerEvent>,
     )>;
+    fn begin_saml_attempt<'a>(
+        &'a mut self,
+        params: &'a AuthParams,
+    ) -> DriverFuture<'a, Result<Self::SamlAttempt>>;
     fn authenticate<'a>(&'a mut self, params: &'a AuthParams) -> DriverFuture<'a, Result<String>>;
     fn fetch_tunnel_config<'a>(
         &'a mut self,
@@ -427,7 +599,7 @@ trait ControllerDriver: Send {
         lcp: &'a mut Self::Lcp,
         tun: &'a Self::Tun,
         shutdown: &'a Shutdown,
-        power_rx: &'a mut mpsc::UnboundedReceiver<PowerEvent>,
+        power: &'a mut PowerTracker,
         wifi_rx: &'a mut mpsc::UnboundedReceiver<WifiEvent>,
         trusted_ssids: &'a [String],
     ) -> DriverFuture<'a, DisconnectReason>;
@@ -448,6 +620,7 @@ impl ControllerDriver for ProductionDriver {
     type Tun = tun_rs::AsyncDevice;
     type Tunnel = TlsTunnel;
     type Lcp = crate::ppp::lcp::LcpState;
+    type SamlAttempt = SamlAttempt;
 
     fn setup_tun<'a>(
         &'a mut self,
@@ -505,6 +678,16 @@ impl ControllerDriver for ProductionDriver {
                     )
                     .await
             }
+        })
+    }
+
+    fn begin_saml_attempt<'a>(
+        &'a mut self,
+        params: &'a AuthParams,
+    ) -> DriverFuture<'a, Result<Self::SamlAttempt>> {
+        Box::pin(async move {
+            info!("Re-authenticating via SAML...");
+            params.auth_client()?.begin_saml_attempt().await
         })
     }
 
@@ -568,7 +751,7 @@ impl ControllerDriver for ProductionDriver {
         lcp: &'a mut Self::Lcp,
         tun: &'a Self::Tun,
         shutdown: &'a Shutdown,
-        power_rx: &'a mut mpsc::UnboundedReceiver<PowerEvent>,
+        power: &'a mut PowerTracker,
         wifi_rx: &'a mut mpsc::UnboundedReceiver<WifiEvent>,
         trusted_ssids: &'a [String],
     ) -> DriverFuture<'a, DisconnectReason> {
@@ -577,7 +760,7 @@ impl ControllerDriver for ProductionDriver {
             lcp,
             tun,
             shutdown,
-            power_rx,
+            power,
             wifi_rx,
             trusted_ssids,
         ))
@@ -607,6 +790,12 @@ enum Interrupt {
 enum RetryOutcome {
     Retry,
     Shutdown,
+}
+
+enum SamlRunOutcome {
+    Completed(Result<String>),
+    BackgroundTimedOut,
+    Interrupted(Interrupt),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -649,16 +838,13 @@ fn disconnect_failure_class(reason: &DisconnectReason) -> &'static str {
     }
 }
 
-async fn next_network_event(rx: &mut mpsc::UnboundedReceiver<NetworkEvent>) -> NetworkEvent {
-    match rx.recv().await {
-        Some(event) => event,
-        None => std::future::pending().await,
-    }
-}
-
-async fn next_power_event(rx: &mut mpsc::UnboundedReceiver<PowerEvent>) -> PowerEvent {
-    match rx.recv().await {
-        Some(event) => event,
+/// Poll a retained browser launch without consuming it, so a cancelled select
+/// arm leaves the launcher running instead of killing its child on drop.
+async fn poll_launch(
+    launch: &mut Option<DriverFuture<'static, std::io::Result<()>>>,
+) -> std::io::Result<()> {
+    match launch.as_mut() {
+        Some(future) => future.await,
         None => std::future::pending().await,
     }
 }
@@ -681,8 +867,8 @@ fn closed_wifi_receiver() -> mpsc::UnboundedReceiver<WifiEvent> {
 async fn interruptible<T>(
     operation: impl Future<Output = T>,
     shutdown: &Shutdown,
-    network_rx: &mut mpsc::UnboundedReceiver<NetworkEvent>,
-    power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+    network: &mut NetworkTracker,
+    power: &mut PowerTracker,
     wifi_rx: &mut mpsc::UnboundedReceiver<WifiEvent>,
     trusted_ssids: &[String],
 ) -> std::result::Result<T, Interrupt> {
@@ -691,15 +877,21 @@ async fn interruptible<T>(
         if shutdown.is_cancelled() {
             return Err(Interrupt::Shutdown);
         }
+        if !power.can_run_network() {
+            return Err(Interrupt::Sleep);
+        }
+        if !network.can_attempt() {
+            return Err(Interrupt::NetworkDown);
+        }
         tokio::select! {
             _ = shutdown.cancelled() => return Err(Interrupt::Shutdown),
-            power = next_power_event(power_rx) => {
-                if power == PowerEvent::WillSleep {
+            _ = power.next_event() => {
+                if !power.can_run_network() {
                     return Err(Interrupt::Sleep);
                 }
             }
-            network = next_network_event(network_rx) => {
-                if network == NetworkEvent::Unreachable {
+            event = network.next_event() => {
+                if event == NetworkEvent::Unreachable {
                     return Err(Interrupt::NetworkDown);
                 }
             }
@@ -799,7 +991,7 @@ impl ReconnectController {
             Some(addr) => ReachabilityTarget::Address(addr),
             None => ReachabilityTarget::Host(self.auth_params.server.clone()),
         };
-        let (mut network_rx, mut power_rx) = match driver.start_monitors(monitor_target) {
+        let (network_rx, power_rx) = match driver.start_monitors(monitor_target) {
             Ok(receivers) => receivers,
             Err(error) => {
                 if setup_active {
@@ -808,16 +1000,20 @@ impl ReconnectController {
                 return Err(error);
             }
         };
+        let mut network_rx = NetworkTracker::new(network_rx);
+        let mut power = PowerTracker::new(power_rx);
 
         let shutdown = self.shutdown.clone();
         let mut terminal_error: Option<FortiError> = None;
         let mut pending_config_refresh = false;
+        let mut background_saml_attempted = false;
         // VPN DNS servers are typically reachable only through the tunnel. While
         // no tunnel carries them they are withdrawn, otherwise every reconnect
         // attempt (and any SAML browser launch) resolves into a black hole.
         let mut dns_suspended = false;
 
         'reconnect: loop {
+            power.drain();
             // Trusted Wi-Fi gate: the single place that owns suspension. All
             // other observation points only set `wifi_trusted` and loop back
             // here, so the full local teardown exists exactly once.
@@ -837,16 +1033,18 @@ impl ReconnectController {
                     dns_suspended = true;
                 }
                 if self
-                    .wait_while_trusted(&mut wifi_rx, &mut power_rx, &trusted_ssids)
+                    .wait_while_trusted(&mut wifi_rx, &mut power, &trusted_ssids)
                     .await
                 {
                     break;
                 }
-                while let Ok(event) = network_rx.try_recv() {
-                    debug!(
-                        "Draining network event after trusted Wi-Fi resume: {:?}",
-                        event
-                    );
+                network_rx.drain();
+                continue;
+            }
+
+            if !power.can_run_network() {
+                if self.wait_for_wake(&mut power).await {
+                    break;
                 }
                 continue;
             }
@@ -857,7 +1055,7 @@ impl ReconnectController {
                     driver.fetch_tunnel_config(&self.auth_params, &self.svpn_cookie),
                     &shutdown,
                     &mut network_rx,
-                    &mut power_rx,
+                    &mut power,
                     &mut wifi_rx,
                     &trusted_ssids,
                 )
@@ -867,6 +1065,7 @@ impl ReconnectController {
                         self.tunnel_config = config;
                         pending_config_refresh = false;
                         self.policy.on_saml_success();
+                        background_saml_attempted = false;
                         continue;
                     }
                     Ok(Err(FortiError::CookieRejected(status))) => {
@@ -899,7 +1098,7 @@ impl ReconnectController {
                                     failure_class: saml_failure_class(failure_kind),
                                 },
                                 &mut network_rx,
-                                &mut power_rx,
+                                &mut power,
                                 &mut wifi_rx,
                                 &trusted_ssids,
                             )
@@ -912,7 +1111,7 @@ impl ReconnectController {
                     }
                     Err(Interrupt::Shutdown) => break,
                     Err(Interrupt::Sleep) => {
-                        if self.wait_for_wake(&mut power_rx).await {
+                        if self.wait_for_wake(&mut power).await {
                             break;
                         }
                         continue;
@@ -921,7 +1120,7 @@ impl ReconnectController {
                         if self
                             .wait_for_network(
                                 &mut network_rx,
-                                &mut power_rx,
+                                &mut power,
                                 &mut wifi_rx,
                                 &trusted_ssids,
                             )
@@ -938,7 +1137,34 @@ impl ReconnectController {
                 }
             }
 
-            if self.policy.next_auth_attempt() {
+            if self.policy.auth_requirement() == AuthRequirement::Required {
+                if !power.can_run_network() {
+                    if self.wait_for_wake(&mut power).await {
+                        break;
+                    }
+                    continue;
+                }
+
+                if self.auth_params.saml && !power.can_interact() && background_saml_attempted {
+                    if self
+                        .wait_for_interactive_auth(
+                            &mut network_rx,
+                            &mut power,
+                            &mut wifi_rx,
+                            &trusted_ssids,
+                            false,
+                        )
+                        .await
+                    {
+                        break;
+                    }
+                    if self.wifi_trusted {
+                        continue;
+                    }
+                }
+
+                let auth_gate_open = self.policy.next_auth_attempt();
+                debug_assert!(auth_gate_open);
                 self.state = ConnectionState::Authenticating;
                 info!(
                     state = ?self.state,
@@ -949,24 +1175,63 @@ impl ReconnectController {
                 // The cookie was rejected or the failure count escalated — it
                 // must never be presented again.
                 self.svpn_cookie.clear();
-                match interruptible(
-                    driver.authenticate(&self.auth_params),
-                    &shutdown,
-                    &mut network_rx,
-                    &mut power_rx,
-                    &mut wifi_rx,
-                    &trusted_ssids,
-                )
-                .await
-                {
-                    Ok(Ok(cookie)) => {
+
+                let auth_outcome = if self.auth_params.saml {
+                    self.run_saml_attempt(
+                        driver,
+                        &mut network_rx,
+                        &mut power,
+                        &mut wifi_rx,
+                        &trusted_ssids,
+                        &mut background_saml_attempted,
+                    )
+                    .await
+                } else {
+                    match interruptible(
+                        driver.authenticate(&self.auth_params),
+                        &shutdown,
+                        &mut network_rx,
+                        &mut power,
+                        &mut wifi_rx,
+                        &trusted_ssids,
+                    )
+                    .await
+                    {
+                        Ok(result) => SamlRunOutcome::Completed(result),
+                        Err(interrupt) => SamlRunOutcome::Interrupted(interrupt),
+                    }
+                };
+
+                match auth_outcome {
+                    SamlRunOutcome::Completed(Ok(cookie)) => {
                         // Save the cookie before config I/O. A transient config
                         // failure must retry with this cookie, not reopen SAML.
                         self.svpn_cookie = cookie;
                         pending_config_refresh = true;
                         continue;
                     }
-                    Ok(Err(auth_error)) => {
+                    SamlRunOutcome::BackgroundTimedOut => {
+                        background_saml_attempted = true;
+                        info!(
+                            state = ?ConnectionState::WaitingForInteractiveAuth,
+                            saml_attempt = self.policy.saml_attempts(),
+                            "Background SAML probe received no callback; waiting for interactive graphics"
+                        );
+                        if self
+                            .wait_for_interactive_auth(
+                                &mut network_rx,
+                                &mut power,
+                                &mut wifi_rx,
+                                &trusted_ssids,
+                                false,
+                            )
+                            .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    SamlRunOutcome::Completed(Err(auth_error)) => {
                         let failure_kind = SamlFailureKind::classify(&auth_error);
                         error!(
                             state = ?self.state,
@@ -980,6 +1245,23 @@ impl ReconnectController {
                             break 'reconnect;
                         }
                         self.policy.on_saml_failure(failure_kind);
+                        if failure_kind == SamlFailureKind::CallbackTimedOut
+                            && self.auth_params.saml
+                        {
+                            if self
+                                .wait_for_interactive_auth(
+                                    &mut network_rx,
+                                    &mut power,
+                                    &mut wifi_rx,
+                                    &trusted_ssids,
+                                    true,
+                                )
+                                .await
+                            {
+                                break;
+                            }
+                            continue;
+                        }
                         if self
                             .wait_for_retry(
                                 RetryContext {
@@ -988,7 +1270,7 @@ impl ReconnectController {
                                     failure_class: saml_failure_class(failure_kind),
                                 },
                                 &mut network_rx,
-                                &mut power_rx,
+                                &mut power,
                                 &mut wifi_rx,
                                 &trusted_ssids,
                             )
@@ -999,18 +1281,18 @@ impl ReconnectController {
                         }
                         continue;
                     }
-                    Err(Interrupt::Shutdown) => break,
-                    Err(Interrupt::Sleep) => {
-                        if self.wait_for_wake(&mut power_rx).await {
+                    SamlRunOutcome::Interrupted(Interrupt::Shutdown) => break,
+                    SamlRunOutcome::Interrupted(Interrupt::Sleep) => {
+                        if self.wait_for_wake(&mut power).await {
                             break;
                         }
                         continue;
                     }
-                    Err(Interrupt::NetworkDown) => {
+                    SamlRunOutcome::Interrupted(Interrupt::NetworkDown) => {
                         if self
                             .wait_for_network(
                                 &mut network_rx,
-                                &mut power_rx,
+                                &mut power,
                                 &mut wifi_rx,
                                 &trusted_ssids,
                             )
@@ -1020,7 +1302,7 @@ impl ReconnectController {
                         }
                         continue;
                     }
-                    Err(Interrupt::TrustedWifi) => {
+                    SamlRunOutcome::Interrupted(Interrupt::TrustedWifi) => {
                         self.wifi_trusted = true;
                         continue;
                     }
@@ -1040,7 +1322,7 @@ impl ReconnectController {
                 driver.connect_tunnel(&self.auth_params, &self.svpn_cookie),
                 &shutdown,
                 &mut network_rx,
-                &mut power_rx,
+                &mut power,
                 &mut wifi_rx,
                 &trusted_ssids,
             )
@@ -1054,7 +1336,7 @@ impl ReconnectController {
                     // VPN DNS. Withdraw it so the system resolver is usable
                     // again while we wait for wake.
                     suspend_vpn_dns(driver, &mut dns_suspended).await;
-                    if self.wait_for_wake(&mut power_rx).await {
+                    if self.wait_for_wake(&mut power).await {
                         break;
                     }
                     continue;
@@ -1062,12 +1344,7 @@ impl ReconnectController {
                 Err(Interrupt::NetworkDown) => {
                     suspend_vpn_dns(driver, &mut dns_suspended).await;
                     if self
-                        .wait_for_network(
-                            &mut network_rx,
-                            &mut power_rx,
-                            &mut wifi_rx,
-                            &trusted_ssids,
-                        )
+                        .wait_for_network(&mut network_rx, &mut power, &mut wifi_rx, &trusted_ssids)
                         .await
                     {
                         break;
@@ -1118,7 +1395,7 @@ impl ReconnectController {
                                 failure_class: connect_failure_class(connect_failure.kind),
                             },
                             &mut network_rx,
-                            &mut power_rx,
+                            &mut power,
                             &mut wifi_rx,
                             &trusted_ssids,
                         )
@@ -1178,7 +1455,7 @@ impl ReconnectController {
                     &mut lcp,
                     tun_dev.as_ref().expect("active setup has a TUN device"),
                     &shutdown,
-                    &mut power_rx,
+                    &mut power,
                     &mut wifi_rx,
                     &trusted_ssids,
                 )
@@ -1222,12 +1499,10 @@ impl ReconnectController {
             }
 
             if reason == DisconnectReason::SystemSleep {
-                if self.wait_for_wake(&mut power_rx).await {
+                if self.wait_for_wake(&mut power).await {
                     break;
                 }
-                while let Ok(event) = network_rx.try_recv() {
-                    debug!("Draining network event after wake: {:?}", event);
-                }
+                network_rx.drain();
                 continue;
             }
 
@@ -1250,7 +1525,7 @@ impl ReconnectController {
                                 failure_class: disconnect_failure_class(&reason),
                             },
                             &mut network_rx,
-                            &mut power_rx,
+                            &mut power,
                             &mut wifi_rx,
                             &trusted_ssids,
                         )
@@ -1274,11 +1549,354 @@ impl ReconnectController {
         }
     }
 
+    /// Put the SAML URL somewhere the user can actually see it. Logging alone
+    /// is not enough: the launcher failing and the browser being closed are the
+    /// two cases where the user has nothing to click, and both are invisible at
+    /// the default log level.
+    fn print_saml_url(&self, url: &str) {
+        eprintln!("\nPlease open this URL in your browser:\n  {url}\n");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_saml_attempt<Driver: ControllerDriver>(
+        &mut self,
+        driver: &mut Driver,
+        network_rx: &mut NetworkTracker,
+        power: &mut PowerTracker,
+        wifi_rx: &mut mpsc::UnboundedReceiver<WifiEvent>,
+        trusted_ssids: &[String],
+        background_saml_attempted: &mut bool,
+    ) -> SamlRunOutcome {
+        power.drain();
+        network_rx.drain();
+        if self.shutdown.is_cancelled() {
+            return SamlRunOutcome::Interrupted(Interrupt::Shutdown);
+        }
+        if !power.can_run_network() {
+            return SamlRunOutcome::Interrupted(Interrupt::Sleep);
+        }
+        if !network_rx.can_attempt() {
+            return SamlRunOutcome::Interrupted(Interrupt::NetworkDown);
+        }
+
+        let mut attempt = match driver.begin_saml_attempt(&self.auth_params).await {
+            Ok(attempt) => attempt,
+            Err(error) => return SamlRunOutcome::Completed(Err(error)),
+        };
+
+        // Capability and reachability loss may race listener creation. Consume
+        // queued levels before the first browser side effect. Once the attempt
+        // exists, keep its listener across later power/network changes.
+        power.drain();
+        network_rx.drain();
+
+        let mut presentation = None;
+        // An in-flight browser launch. Held across loop iterations so a power or
+        // network event cannot cancel it: the launcher kills its child on drop,
+        // which would silently lose the launch while the latches below still
+        // recorded it as spent.
+        let mut launch: Option<DriverFuture<'static, std::io::Result<()>>> = None;
+        let mut presentation_started = false;
+        let mut callback_received = attempt.callback_received();
+        let mut deadline_remaining: Option<Duration> = None;
+        let mut deadline_started: Option<tokio::time::Instant> = None;
+        // Set once the interactive budget lapses with no callback. The attempt
+        // stays alive for a late callback, and one re-present is allowed after a
+        // full display off→on cycle so the user is not stuck with a stale tab.
+        let mut soft_timed_out = false;
+        let mut saw_noninteractive = false;
+        let deadline = tokio::time::sleep(SAML_INTERACTIVE_TIMEOUT);
+        tokio::pin!(deadline);
+        // A gateway reported unreachable parks this loop with the attempt held,
+        // and `NetworkTracker::next_event` pends forever once the monitor exits.
+        // Because the attempt is deliberately kept alive, the controller never
+        // reaches `wait_for_network`, so its bounded fallback cannot run here —
+        // this timer is the floor that replaces it.
+        let reachability_stall = tokio::time::sleep(MONITOR_FALLBACK_TIMEOUT);
+        tokio::pin!(reachability_stall);
+        let mut reachability_stall_armed = false;
+
+        loop {
+            let runnable = power.can_run_network() && network_rx.can_attempt();
+
+            if presentation.is_none() && runnable && !callback_received {
+                let selected = if power.can_interact() {
+                    SamlBrowserPresentation::Foreground
+                } else {
+                    SamlBrowserPresentation::Background
+                };
+                presentation = Some(selected);
+                launch = Some(attempt.present(selected));
+                presentation_started = false;
+                deadline_remaining = Some(match selected {
+                    SamlBrowserPresentation::Background => SAML_BACKGROUND_PROBE_TIMEOUT,
+                    SamlBrowserPresentation::Foreground => SAML_INTERACTIVE_TIMEOUT,
+                });
+                info!(
+                    state = ?self.state,
+                    auth_requirement = ?self.policy.auth_requirement(),
+                    saml_attempt = self.policy.saml_attempts(),
+                    presentation = ?selected,
+                    "Presenting reconnect SAML attempt"
+                );
+            }
+
+            if presentation == Some(SamlBrowserPresentation::Background)
+                && power.can_interact()
+                && !callback_received
+            {
+                // `open -g` already created this attempt's browser navigation.
+                // Do not open the URL again: doing so can create a second tab
+                // and a second FortiGate SAML transaction. The existing tab is
+                // now available for user interaction.
+                presentation = Some(SamlBrowserPresentation::Foreground);
+                deadline_remaining = Some(SAML_INTERACTIVE_TIMEOUT);
+                deadline_started = None;
+                info!(
+                    state = ?self.state,
+                    saml_attempt = self.policy.saml_attempts(),
+                    "Interactive graphics restored; continuing the existing SAML attempt"
+                );
+            }
+
+            // Re-present only on a fresh interactive epoch: the display must
+            // have gone dark and come back. Reachability alone must never
+            // trigger this — it flaps during interface churn, which is exactly
+            // the popup loop the soft timeout exists to avoid.
+            if soft_timed_out && saw_noninteractive && runnable && power.can_interact() {
+                soft_timed_out = false;
+                saw_noninteractive = false;
+                presentation = Some(SamlBrowserPresentation::Foreground);
+                launch = Some(attempt.present(SamlBrowserPresentation::Foreground));
+                presentation_started = false;
+                deadline_remaining = Some(SAML_INTERACTIVE_TIMEOUT);
+                deadline_started = None;
+                self.policy.on_saml_presented_again();
+                self.state = ConnectionState::Authenticating;
+                info!(
+                    state = ?self.state,
+                    saml_attempt = self.policy.saml_attempts(),
+                    "New interactive session; re-presenting the existing SAML attempt"
+                );
+            }
+
+            // Arm only while reachability is the thing blocking progress. A
+            // sleeping machine is a correct reason to wait, and rearming from
+            // scratch on each event would let a busy event stream starve the
+            // floor — so it is armed once per stall and reset on recovery.
+            let reachability_stalled = !callback_received && !network_rx.can_attempt();
+            if reachability_stalled {
+                if !reachability_stall_armed {
+                    reachability_stall
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + MONITOR_FALLBACK_TIMEOUT);
+                    reachability_stall_armed = true;
+                }
+            } else {
+                reachability_stall_armed = false;
+            }
+
+            if callback_received
+                || deadline_remaining.is_none()
+                || !runnable
+                || !presentation_started
+            {
+                if let Some(started) = deadline_started.take() {
+                    if let Some(remaining) = deadline_remaining.as_mut() {
+                        *remaining = remaining.saturating_sub(started.elapsed());
+                    }
+                }
+            } else if deadline_started.is_none() {
+                if let Some(remaining) = deadline_remaining {
+                    let now = tokio::time::Instant::now();
+                    deadline.as_mut().reset(now + remaining);
+                    deadline_started = Some(now);
+                }
+            }
+
+            enum AttemptEvent {
+                Shutdown,
+                Wifi(WifiEvent),
+                Presented(std::io::Result<()>),
+                Callback(Result<()>),
+                Result(Result<String>),
+                Power,
+                Network(NetworkEvent),
+                Deadline,
+                ReachabilityStalled,
+            }
+
+            let event = if callback_received {
+                tokio::select! {
+                    biased;
+                    _ = self.shutdown.cancelled() => AttemptEvent::Shutdown,
+                    wifi = next_wifi_event(wifi_rx) => AttemptEvent::Wifi(wifi),
+                    result = attempt.wait_result() => AttemptEvent::Result(result),
+                    _ = power.next_event() => AttemptEvent::Power,
+                    network = network_rx.next_event() => AttemptEvent::Network(network),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = self.shutdown.cancelled() => AttemptEvent::Shutdown,
+                    wifi = next_wifi_event(wifi_rx) => AttemptEvent::Wifi(wifi),
+                    callback = attempt.wait_for_callback() => AttemptEvent::Callback(callback),
+                    // Borrows the retained future rather than consuming it, so
+                    // losing this branch to a competing event leaves the
+                    // launcher running and resumable on the next iteration.
+                    result = poll_launch(&mut launch), if launch.is_some() => {
+                        AttemptEvent::Presented(result)
+                    }
+                    _ = power.next_event() => AttemptEvent::Power,
+                    network = network_rx.next_event() => AttemptEvent::Network(network),
+                    _ = &mut deadline, if deadline_started.is_some() => AttemptEvent::Deadline,
+                    _ = &mut reachability_stall, if reachability_stall_armed => {
+                        AttemptEvent::ReachabilityStalled
+                    }
+                }
+            };
+
+            match event {
+                AttemptEvent::Shutdown => return SamlRunOutcome::Interrupted(Interrupt::Shutdown),
+                AttemptEvent::Wifi(event) => {
+                    if is_trusted_wifi(event.ssid.as_deref(), trusted_ssids) {
+                        return SamlRunOutcome::Interrupted(Interrupt::TrustedWifi);
+                    }
+                }
+                AttemptEvent::Presented(result) => {
+                    // The launcher ran to completion, so the browser
+                    // opportunity is genuinely spent — including the one-shot
+                    // headless probe, whose latch must not be charged for a
+                    // launch that never finished.
+                    launch = None;
+                    presentation_started = true;
+                    if presentation == Some(SamlBrowserPresentation::Background) {
+                        *background_saml_attempted = true;
+                    }
+                    if let Err(error) = result {
+                        warn!(
+                            presentation = ?presentation,
+                            error = %error,
+                            "SAML browser launcher failed; callback listener remains active"
+                        );
+                        self.print_saml_url(attempt.url());
+                    }
+                }
+                AttemptEvent::Callback(Ok(())) => {
+                    callback_received = true;
+                    deadline_remaining = None;
+                    deadline_started = None;
+                    soft_timed_out = false;
+                    info!("SAML callback received; waiting for session cookie exchange");
+                }
+                AttemptEvent::Callback(Err(error)) => {
+                    return SamlRunOutcome::Completed(Err(error));
+                }
+                AttemptEvent::Result(result) => {
+                    network_rx.drain();
+                    if result.is_err() && callback_received {
+                        // The browser reached the IdP and the callback came
+                        // back; only the exchange failed. The headless route is
+                        // still viable, so do not spend the user's display on
+                        // the retry.
+                        *background_saml_attempted = false;
+                    }
+                    return SamlRunOutcome::Completed(result);
+                }
+                AttemptEvent::Power => {
+                    if soft_timed_out && !power.can_interact() {
+                        saw_noninteractive = true;
+                    }
+                }
+                AttemptEvent::Network(event) => {
+                    debug!(
+                        ?event,
+                        "Network changed during SAML; preserving single-flight callback listener"
+                    );
+                }
+                AttemptEvent::ReachabilityStalled => {
+                    warn!(
+                        "No gateway reachability update in {}s while SAML is pending — allowing a bounded probe",
+                        MONITOR_FALLBACK_TIMEOUT.as_secs()
+                    );
+                    network_rx.allow_fallback_probe();
+                }
+                AttemptEvent::Deadline => {
+                    deadline_started = None;
+                    deadline_remaining = None;
+                    if presentation == Some(SamlBrowserPresentation::Background) {
+                        return SamlRunOutcome::BackgroundTimedOut;
+                    }
+                    // Soft: the listener stays bound so a late callback still
+                    // completes this attempt. The user may also have abandoned
+                    // or closed the tab, so arm a single re-present for the next
+                    // interactive epoch rather than waiting here forever.
+                    self.state = ConnectionState::WaitingForInteractiveAuth;
+                    soft_timed_out = true;
+                    saw_noninteractive = !power.can_interact();
+                    warn!(
+                        state = ?self.state,
+                        saml_attempt = self.policy.saml_attempts(),
+                        "SAML is still pending after the interactive wait budget; keeping the listener and waiting for a new interactive session"
+                    );
+                    self.print_saml_url(attempt.url());
+                }
+            }
+        }
+    }
+
+    /// Wait for a user-visible authentication epoch. When `require_new_epoch`
+    /// is true, an already-lit display does not immediately reopen a browser;
+    /// the controller first observes a non-interactive level and then a fresh
+    /// graphics transition.
+    async fn wait_for_interactive_auth(
+        &mut self,
+        network_rx: &mut NetworkTracker,
+        power: &mut PowerTracker,
+        wifi_rx: &mut mpsc::UnboundedReceiver<WifiEvent>,
+        trusted_ssids: &[String],
+        require_new_epoch: bool,
+    ) -> bool {
+        self.state = ConnectionState::WaitingForInteractiveAuth;
+        let mut saw_noninteractive = !power.can_interact();
+        info!(
+            state = ?self.state,
+            require_new_epoch,
+            "Waiting for interactive graphics before presenting SAML again"
+        );
+
+        loop {
+            if self.shutdown.is_cancelled() {
+                return true;
+            }
+            if power.can_interact() && (!require_new_epoch || saw_noninteractive) {
+                return false;
+            }
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return true,
+                _ = power.next_event() => {
+                    if !power.can_interact() {
+                        saw_noninteractive = true;
+                    }
+                }
+                event = network_rx.next_event() => {
+                    debug!(?event, "Network changed while waiting for interactive SAML");
+                }
+                event = next_wifi_event(wifi_rx) => {
+                    self.wifi_trusted = is_trusted_wifi(event.ssid.as_deref(), trusted_ssids);
+                    if self.wifi_trusted {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
     /// Returns true when shutdown was requested.
     async fn wait_for_network(
         &mut self,
-        network_rx: &mut mpsc::UnboundedReceiver<NetworkEvent>,
-        power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+        network_rx: &mut NetworkTracker,
+        power: &mut PowerTracker,
         wifi_rx: &mut mpsc::UnboundedReceiver<WifiEvent>,
         trusted_ssids: &[String],
     ) -> bool {
@@ -1292,16 +1910,17 @@ impl ReconnectController {
                 _ = self.shutdown.cancelled() => return true,
                 _ = tokio::time::sleep(MONITOR_FALLBACK_TIMEOUT) => {
                     warn!("No network reachability update after 15s — retrying with bounded connect timeout");
+                    network_rx.allow_fallback_probe();
                     return false;
                 }
-                event = next_network_event(network_rx) => {
+                event = network_rx.next_event() => {
                     if event == NetworkEvent::Reachable {
                         self.policy.on_network_reachable();
                         return false;
                     }
                 }
-                event = next_power_event(power_rx) => {
-                    if event == PowerEvent::WillSleep && self.wait_for_wake(power_rx).await {
+                _ = power.next_event() => {
+                    if !power.can_run_network() && self.wait_for_wake(power).await {
                         return true;
                     }
                 }
@@ -1323,7 +1942,7 @@ impl ReconnectController {
     async fn wait_while_trusted(
         &mut self,
         wifi_rx: &mut mpsc::UnboundedReceiver<WifiEvent>,
-        power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+        power: &mut PowerTracker,
         trusted_ssids: &[String],
     ) -> bool {
         self.state = ConnectionState::SuspendedOnTrustedWifi;
@@ -1357,7 +1976,7 @@ impl ReconnectController {
                         return false;
                     }
                 },
-                event = next_power_event(power_rx) => {
+                event = power.next_event() => {
                     // Sleeping and waking on a trusted network changes nothing;
                     // waking on a different network fires a Wi-Fi event.
                     debug!("Ignoring power event while suspended on trusted Wi-Fi: {:?}", event);
@@ -1367,20 +1986,33 @@ impl ReconnectController {
     }
 
     /// Returns true when shutdown was requested.
-    async fn wait_for_wake(&mut self, power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>) -> bool {
+    async fn wait_for_wake(&mut self, power: &mut PowerTracker) -> bool {
         self.state = ConnectionState::WaitingForNetwork;
+        // Waiting on capability events alone has no floor: a dropped
+        // notification, or a power monitor thread that died and closed its
+        // channel, would park the tunnel here for the rest of the process.
+        // Built once so repeated events cannot keep pushing the floor back.
+        let fallback = tokio::time::sleep(WAKE_FALLBACK_TIMEOUT);
+        tokio::pin!(fallback);
         loop {
             if self.shutdown.is_cancelled() {
                 return true;
             }
+            if power.can_run_network() {
+                self.policy.on_system_wake();
+                return false;
+            }
             tokio::select! {
                 _ = self.shutdown.cancelled() => return true,
-                _ = tokio::time::sleep(MONITOR_FALLBACK_TIMEOUT) => return false,
-                event = next_power_event(power_rx) => {
-                    if event == PowerEvent::HasPoweredOn {
-                        self.policy.on_system_wake();
-                        return false;
-                    }
+                _ = power.next_event() => {}
+                _ = &mut fallback => {
+                    warn!(
+                        "No power capability update in {}s — assuming the system is awake and retrying with bounded timeouts",
+                        WAKE_FALLBACK_TIMEOUT.as_secs()
+                    );
+                    power.assume_awake();
+                    self.policy.on_system_wake();
+                    return false;
                 }
             }
         }
@@ -1409,8 +2041,8 @@ impl ReconnectController {
     async fn wait_for_retry(
         &mut self,
         context: RetryContext,
-        network_rx: &mut mpsc::UnboundedReceiver<NetworkEvent>,
-        power_rx: &mut mpsc::UnboundedReceiver<PowerEvent>,
+        network_rx: &mut NetworkTracker,
+        power: &mut PowerTracker,
         wifi_rx: &mut mpsc::UnboundedReceiver<WifiEvent>,
         trusted_ssids: &[String],
     ) -> RetryOutcome {
@@ -1423,14 +2055,14 @@ impl ReconnectController {
         tokio::select! {
             _ = self.shutdown.cancelled() => RetryOutcome::Shutdown,
             _ = tokio::time::sleep(delay) => RetryOutcome::Retry,
-            event = next_network_event(network_rx) => {
+            event = network_rx.next_event() => {
                 match event {
                     NetworkEvent::Reachable => {
                         self.policy.on_network_reachable();
                         RetryOutcome::Retry
                     }
                     NetworkEvent::Unreachable => {
-                        if self.wait_for_network(network_rx, power_rx, wifi_rx, trusted_ssids).await {
+                        if self.wait_for_network(network_rx, power, wifi_rx, trusted_ssids).await {
                             RetryOutcome::Shutdown
                         } else {
                             RetryOutcome::Retry
@@ -1438,8 +2070,8 @@ impl ReconnectController {
                     }
                 }
             }
-            event = next_power_event(power_rx) => {
-                if event == PowerEvent::WillSleep && self.wait_for_wake(power_rx).await {
+            _ = power.next_event() => {
+                if !power.can_run_network() && self.wait_for_wake(power).await {
                     RetryOutcome::Shutdown
                 } else {
                     RetryOutcome::Retry
@@ -1545,15 +2177,17 @@ mod tests {
     async fn interruptible_operation_observes_shutdown() {
         let shutdown = Shutdown::new();
         let trigger = shutdown.clone();
-        let (_network_tx, mut network_rx) = mpsc::unbounded_channel();
-        let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+        let (_network_tx, network_rx) = mpsc::unbounded_channel();
+        let mut network_rx = NetworkTracker::new(network_rx);
+        let (_power_tx, power_rx) = mpsc::unbounded_channel();
+        let mut power = PowerTracker::new(power_rx);
         let (_wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
         trigger.cancel();
         let result = interruptible(
             std::future::pending::<()>(),
             &shutdown,
             &mut network_rx,
-            &mut power_rx,
+            &mut power,
             &mut wifi_rx,
             &[],
         )
@@ -1564,15 +2198,17 @@ mod tests {
     #[tokio::test]
     async fn interruptible_operation_observes_network_loss() {
         let shutdown = Shutdown::new();
-        let (network_tx, mut network_rx) = mpsc::unbounded_channel();
-        let (_power_tx, mut power_rx) = mpsc::unbounded_channel();
+        let (network_tx, network_rx) = mpsc::unbounded_channel();
+        let mut network_rx = NetworkTracker::new(network_rx);
+        let (_power_tx, power_rx) = mpsc::unbounded_channel();
+        let mut power = PowerTracker::new(power_rx);
         let (_wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
         network_tx.send(NetworkEvent::Unreachable).unwrap();
         let result = interruptible(
             std::future::pending::<()>(),
             &shutdown,
             &mut network_rx,
-            &mut power_rx,
+            &mut power,
             &mut wifi_rx,
             &[],
         )
@@ -1580,23 +2216,89 @@ mod tests {
         assert_eq!(result, Err(Interrupt::NetworkDown));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn network_monitor_fallback_allows_one_bounded_probe() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let (network_tx, network_rx) = mpsc::unbounded_channel();
+        network_tx.send(NetworkEvent::Unreachable).unwrap();
+        let mut network = NetworkTracker::new(network_rx);
+        let (_power_tx, power_rx) = mpsc::unbounded_channel();
+        let mut power = PowerTracker::new(power_rx);
+        let (_wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
+        let started = tokio::time::Instant::now();
+
+        assert!(!network.can_attempt());
+        assert!(
+            !controller
+                .wait_for_network(&mut network, &mut power, &mut wifi_rx, &[])
+                .await
+        );
+        assert_eq!(started.elapsed(), MONITOR_FALLBACK_TIMEOUT);
+        assert!(network.can_attempt());
+    }
+
     #[tokio::test]
     async fn interruptible_operation_observes_sleep() {
         let shutdown = Shutdown::new();
-        let (_network_tx, mut network_rx) = mpsc::unbounded_channel();
-        let (power_tx, mut power_rx) = mpsc::unbounded_channel();
+        let (_network_tx, network_rx) = mpsc::unbounded_channel();
+        let mut network_rx = NetworkTracker::new(network_rx);
+        let (power_tx, power_rx) = mpsc::unbounded_channel();
+        let mut power = PowerTracker::new(power_rx);
         let (_wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
         power_tx.send(PowerEvent::WillSleep).unwrap();
         let result = interruptible(
             std::future::pending::<()>(),
             &shutdown,
             &mut network_rx,
-            &mut power_rx,
+            &mut power,
             &mut wifi_rx,
             &[],
         )
         .await;
         assert_eq!(result, Err(Interrupt::Sleep));
+    }
+
+    #[test]
+    fn legacy_powered_on_does_not_override_capability_gate() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut power = PowerTracker::new(rx);
+        power.apply(PowerEvent::WillSleep);
+        power.apply(PowerEvent::HasPoweredOn);
+        assert!(!power.can_run_network());
+
+        power.apply(PowerEvent::Capabilities(background_power_capabilities()));
+        assert!(power.can_run_network());
+        assert!(!power.can_interact());
+    }
+
+    #[tokio::test]
+    async fn graphics_loss_does_not_interrupt_network_operation() {
+        let shutdown = Shutdown::new();
+        let trigger = shutdown.clone();
+        let (_network_tx, network_rx) = mpsc::unbounded_channel();
+        let mut network_rx = NetworkTracker::new(network_rx);
+        let (power_tx, power_rx) = mpsc::unbounded_channel();
+        let mut power = PowerTracker::new(power_rx);
+        let (_wifi_tx, mut wifi_rx) = mpsc::unbounded_channel();
+        power_tx
+            .send(PowerEvent::Capabilities(background_power_capabilities()))
+            .unwrap();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            trigger.cancel();
+        });
+
+        let result = interruptible(
+            std::future::pending::<()>(),
+            &shutdown,
+            &mut network_rx,
+            &mut power,
+            &mut wifi_rx,
+            &[],
+        )
+        .await;
+        assert_eq!(result, Err(Interrupt::Shutdown));
     }
 
     use crate::auth::xml::Route;
@@ -1608,9 +2310,31 @@ mod tests {
     struct ScriptTunnel;
     struct ScriptLcp;
 
+    fn full_power_capabilities() -> PowerEvent {
+        PowerEvent::Capabilities(PowerCapabilities {
+            known: true,
+            cpu: true,
+            network: true,
+            graphics: true,
+        })
+    }
+
+    fn background_power_capabilities() -> PowerCapabilities {
+        PowerCapabilities {
+            known: true,
+            cpu: true,
+            network: true,
+            graphics: false,
+        }
+    }
+
     enum ScriptConnect {
         Failure(ConnectFailureKind),
         FailureThenSleepWake(ConnectFailureKind),
+        FailureThenNetworkPause {
+            kind: ConnectFailureKind,
+            resume: tokio::sync::oneshot::Receiver<()>,
+        },
         Success(Ipv4Addr),
         Sleep,
         TrustedWifiPending(WifiEvent),
@@ -1620,7 +2344,94 @@ mod tests {
         Result(Result<String>),
         NetworkDown,
         SleepUntil(tokio::sync::oneshot::Receiver<()>),
+        PowerThenResult {
+            event: PowerEvent,
+            release: tokio::sync::oneshot::Receiver<()>,
+            result: Result<String>,
+        },
+        CallbackThenResult {
+            release: tokio::sync::oneshot::Receiver<()>,
+            result: Result<String>,
+        },
         Pending,
+    }
+
+    struct ScriptSamlAttempt {
+        log: StdArc<Mutex<Vec<String>>>,
+        _callback_tx: tokio::sync::watch::Sender<bool>,
+        callback_rx: tokio::sync::watch::Receiver<bool>,
+        presentation_tx: tokio::sync::watch::Sender<Option<SamlBrowserPresentation>>,
+        launch_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        #[allow(clippy::type_complexity)]
+        launch_preempt: Mutex<
+            Option<(
+                mpsc::UnboundedSender<PowerEvent>,
+                mpsc::UnboundedSender<NetworkEvent>,
+            )>,
+        >,
+        result: DriverFuture<'static, Result<String>>,
+    }
+
+    impl ControllerSamlAttempt for ScriptSamlAttempt {
+        fn url(&self) -> &str {
+            "https://vpn.example:10443/remote/saml/start?redirect=1"
+        }
+
+        fn present(
+            &self,
+            presentation: SamlBrowserPresentation,
+        ) -> DriverFuture<'static, std::io::Result<()>> {
+            let log = self.log.clone();
+            let presentation_tx = self.presentation_tx.clone();
+            let gate = self.launch_gate.lock().unwrap().take();
+            let preempt = self.launch_preempt.lock().unwrap().take();
+            Box::pin(async move {
+                // `auth_launch` records that a launcher process was started and
+                // `auth_present` that it finished, so a test can tell a retained
+                // launch from a dropped-and-respawned one.
+                log.lock()
+                    .unwrap()
+                    .push(format!("auth_launch:{presentation:?}"));
+                if let Some((power_tx, network_tx)) = preempt {
+                    // Make competing select arms ready while this launcher is
+                    // still running, which is exactly when a dropped future
+                    // would kill the browser process.
+                    let _ = power_tx.send(full_power_capabilities());
+                    let _ = network_tx.send(NetworkEvent::Reachable);
+                }
+                if let Some(gate) = gate {
+                    let _ = gate.await;
+                }
+                log.lock()
+                    .unwrap()
+                    .push(format!("auth_present:{presentation:?}"));
+                let _ = presentation_tx.send(Some(presentation));
+                Ok(())
+            })
+        }
+
+        fn callback_received(&self) -> bool {
+            *self.callback_rx.borrow()
+        }
+
+        fn wait_for_callback(&self) -> DriverFuture<'_, Result<()>> {
+            let mut rx = self.callback_rx.clone();
+            Box::pin(async move {
+                if *rx.borrow() {
+                    return Ok(());
+                }
+                rx.changed().await.map_err(|_| {
+                    FortiError::SamlCallbackInvalid(
+                        "scripted callback source closed before callback".into(),
+                    )
+                })?;
+                Ok(())
+            })
+        }
+
+        fn wait_result(&mut self) -> DriverFuture<'_, Result<String>> {
+            Box::pin(async move { self.result.as_mut().await })
+        }
     }
 
     struct ScriptDriver {
@@ -1636,6 +2447,20 @@ mod tests {
         setup_calls: usize,
         fail_setup_call: Option<usize>,
         fail_dns_suspend: usize,
+        initial_power: Option<PowerCapabilities>,
+        initial_network: Option<NetworkEvent>,
+        auth_wifi_event: Option<WifiEvent>,
+        /// Delivered as the SAML attempt begins, i.e. after the loop's initial
+        /// drain, so it lands while the attempt is already in flight.
+        auth_network_event: Option<NetworkEvent>,
+        /// Holds the first browser launch pending until released, modelling an
+        /// `open` process that is still running when other events arrive.
+        launch_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        /// Fire power and network events from inside the launcher.
+        preempt_launch: bool,
+        /// Hands the power sender to the test so it can drive capability
+        /// changes after the controller is already running.
+        power_tap: Option<tokio::sync::oneshot::Sender<mpsc::UnboundedSender<PowerEvent>>>,
     }
 
     impl Default for ScriptDriver {
@@ -1653,6 +2478,13 @@ mod tests {
                 setup_calls: 0,
                 fail_setup_call: None,
                 fail_dns_suspend: 0,
+                initial_power: None,
+                initial_network: None,
+                auth_wifi_event: None,
+                auth_network_event: None,
+                launch_gate: None,
+                preempt_launch: false,
+                power_tap: None,
             }
         }
     }
@@ -1671,6 +2503,7 @@ mod tests {
         type Tun = ScriptTun;
         type Tunnel = ScriptTunnel;
         type Lcp = ScriptLcp;
+        type SamlAttempt = ScriptSamlAttempt;
 
         fn setup_tun<'a>(
             &'a mut self,
@@ -1734,6 +2567,17 @@ mod tests {
         )> {
             let (network_tx, network_rx) = mpsc::unbounded_channel();
             let (power_tx, power_rx) = mpsc::unbounded_channel();
+            if let Some(event) = self.initial_network {
+                network_tx.send(event).unwrap();
+            }
+            if let Some(capabilities) = self.initial_power {
+                power_tx
+                    .send(PowerEvent::Capabilities(capabilities))
+                    .unwrap();
+            }
+            if let Some(tap) = self.power_tap.take() {
+                let _ = tap.send(power_tx.clone());
+            }
             self.network_tx = Some(network_tx);
             self.power_tx = Some(power_tx);
             Ok((network_rx, power_rx))
@@ -1757,13 +2601,153 @@ mod tests {
                     tx.send(PowerEvent::WillSleep).unwrap();
                     tokio::spawn(async move {
                         if wake.await.is_ok() {
-                            let _ = tx.send(PowerEvent::HasPoweredOn);
+                            let _ = tx.send(full_power_capabilities());
                         }
                     });
                     Box::pin(std::future::pending())
                 }
+                ScriptAuth::PowerThenResult {
+                    event,
+                    release,
+                    result,
+                } => {
+                    let tx = self.power_tx.as_ref().unwrap().clone();
+                    Box::pin(async move {
+                        tx.send(event).unwrap();
+                        let _ = release.await;
+                        result
+                    })
+                }
+                ScriptAuth::CallbackThenResult { release, result } => Box::pin(async move {
+                    let _ = release.await;
+                    result
+                }),
                 ScriptAuth::Pending => Box::pin(std::future::pending()),
             }
+        }
+
+        fn begin_saml_attempt<'a>(
+            &'a mut self,
+            _params: &'a AuthParams,
+        ) -> DriverFuture<'a, Result<Self::SamlAttempt>> {
+            self.record("auth");
+            if let Some(event) = self.auth_wifi_event.take() {
+                self.wifi_tx.as_ref().unwrap().send(event).unwrap();
+            }
+            if let Some(event) = self.auth_network_event.take() {
+                self.network_tx.as_ref().unwrap().send(event).unwrap();
+            }
+            let behavior = self.auth.pop_front().expect("missing scripted auth");
+            let network_tx = self.network_tx.as_ref().unwrap().clone();
+            let power_tx = self.power_tx.as_ref().unwrap().clone();
+            let (callback_tx, callback_rx) = tokio::sync::watch::channel(false);
+            let (presentation_tx, presentation_rx) = tokio::sync::watch::channel(None);
+            let result: DriverFuture<'static, Result<String>> = match behavior {
+                ScriptAuth::Result(result) => {
+                    let callback_tx = callback_tx.clone();
+                    let mut presentation_rx = presentation_rx.clone();
+                    tokio::spawn(async move {
+                        if presentation_rx.changed().await.is_ok() {
+                            let _ = callback_tx.send(true);
+                        }
+                    });
+                    Box::pin(async move { result })
+                }
+                ScriptAuth::NetworkDown => {
+                    let callback_tx = callback_tx.clone();
+                    let mut presentation_rx = presentation_rx.clone();
+                    tokio::spawn(async move {
+                        if presentation_rx.changed().await.is_err() {
+                            return;
+                        }
+                        network_tx.send(NetworkEvent::Unreachable).unwrap();
+                        tokio::task::yield_now().await;
+                        network_tx.send(NetworkEvent::Reachable).unwrap();
+                        let _ = callback_tx.send(true);
+                    });
+                    Box::pin(async { Ok("new-cookie".to_string()) })
+                }
+                ScriptAuth::SleepUntil(wake) => {
+                    power_tx.send(PowerEvent::WillSleep).unwrap();
+                    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                    let callback_tx = callback_tx.clone();
+                    tokio::spawn(async move {
+                        if wake.await.is_ok() {
+                            let _ = power_tx.send(full_power_capabilities());
+                            let _ = callback_tx.send(true);
+                            let _ = result_tx.send(Ok("new-cookie".to_string()));
+                        }
+                    });
+                    Box::pin(async move {
+                        result_rx.await.unwrap_or_else(|_| {
+                            Err(FortiError::AuthFailed(
+                                "scripted result sender dropped".into(),
+                            ))
+                        })
+                    })
+                }
+                ScriptAuth::PowerThenResult {
+                    event,
+                    release,
+                    result,
+                } => {
+                    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                    let callback_tx = callback_tx.clone();
+                    let mut presentation_rx = presentation_rx.clone();
+                    tokio::spawn(async move {
+                        if presentation_rx.changed().await.is_err() {
+                            return;
+                        }
+                        power_tx.send(event).unwrap();
+                        let _ = release.await;
+                        let _ = callback_tx.send(true);
+                        let _ = result_tx.send(result);
+                    });
+                    Box::pin(async move {
+                        result_rx.await.unwrap_or_else(|_| {
+                            Err(FortiError::AuthFailed(
+                                "scripted result sender dropped".into(),
+                            ))
+                        })
+                    })
+                }
+                ScriptAuth::CallbackThenResult { release, result } => {
+                    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                    let callback_tx = callback_tx.clone();
+                    let mut presentation_rx = presentation_rx.clone();
+                    tokio::spawn(async move {
+                        if presentation_rx.changed().await.is_err() {
+                            return;
+                        }
+                        let _ = callback_tx.send(true);
+                        let _ = release.await;
+                        let _ = result_tx.send(result);
+                    });
+                    Box::pin(async move {
+                        result_rx.await.unwrap_or_else(|_| {
+                            Err(FortiError::AuthFailed(
+                                "scripted result sender dropped".into(),
+                            ))
+                        })
+                    })
+                }
+                ScriptAuth::Pending => Box::pin(std::future::pending()),
+            };
+            let attempt = ScriptSamlAttempt {
+                log: self.log.clone(),
+                _callback_tx: callback_tx,
+                callback_rx,
+                presentation_tx,
+                launch_gate: Mutex::new(self.launch_gate.take()),
+                launch_preempt: Mutex::new(self.preempt_launch.then(|| {
+                    (
+                        self.power_tx.as_ref().unwrap().clone(),
+                        self.network_tx.as_ref().unwrap().clone(),
+                    )
+                })),
+                result,
+            };
+            Box::pin(async move { Ok(attempt) })
         }
 
         fn fetch_tunnel_config<'a>(
@@ -1840,7 +2824,7 @@ mod tests {
                     tokio::spawn(async move {
                         tokio::task::yield_now().await;
                         tx.send(PowerEvent::WillSleep).unwrap();
-                        tx.send(PowerEvent::HasPoweredOn).unwrap();
+                        tx.send(full_power_capabilities()).unwrap();
                     });
                     Box::pin(async move {
                         Err(ConnectFailure {
@@ -1851,13 +2835,28 @@ mod tests {
                         })
                     })
                 }
+                ScriptConnect::FailureThenNetworkPause { kind, resume } => {
+                    let tx = self.network_tx.as_ref().unwrap().clone();
+                    Box::pin(async move {
+                        tx.send(NetworkEvent::Unreachable).unwrap();
+                        tokio::spawn(async move {
+                            if resume.await.is_ok() {
+                                let _ = tx.send(NetworkEvent::Reachable);
+                            }
+                        });
+                        Err(ConnectFailure {
+                            kind,
+                            source: FortiError::CookieRejected(403),
+                        })
+                    })
+                }
                 ScriptConnect::Success(ip) => {
                     Box::pin(async move { Ok((ScriptTunnel, ScriptLcp, ip)) })
                 }
                 ScriptConnect::Sleep => {
                     let tx = self.power_tx.as_ref().unwrap().clone();
                     tx.send(PowerEvent::WillSleep).unwrap();
-                    tx.send(PowerEvent::HasPoweredOn).unwrap();
+                    tx.send(full_power_capabilities()).unwrap();
                     Box::pin(std::future::pending())
                 }
                 ScriptConnect::TrustedWifiPending(event) => {
@@ -1873,7 +2872,7 @@ mod tests {
             _lcp: &'a mut Self::Lcp,
             _tun: &'a Self::Tun,
             _shutdown: &'a Shutdown,
-            _power_rx: &'a mut mpsc::UnboundedReceiver<PowerEvent>,
+            _power: &'a mut PowerTracker,
             _wifi_rx: &'a mut mpsc::UnboundedReceiver<WifiEvent>,
             _trusted_ssids: &'a [String],
         ) -> DriverFuture<'a, DisconnectReason> {
@@ -2043,7 +3042,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn saml_sleep_waits_for_explicit_wake_before_retrying_authentication() {
+    async fn saml_sleep_preserves_the_same_attempt_until_explicit_wake() {
         let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
         let mut controller = controller(initial.clone(), Shutdown::new());
         let mut driver = ScriptDriver::default();
@@ -2052,9 +3051,6 @@ mod tests {
             .connects
             .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
         driver.auth.push_back(ScriptAuth::SleepUntil(wake_rx));
-        driver
-            .auth
-            .push_back(ScriptAuth::Result(Ok("new-cookie".into())));
         driver.configs.push_back(Ok(initial));
         driver
             .connects
@@ -2096,8 +3092,678 @@ mod tests {
         (&mut run).await.unwrap();
 
         let log = log.lock().unwrap();
-        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 2);
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 1);
         assert!(log.contains(&"connect:new-cookie".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn headless_sso_callback_restores_vpn_without_foreground_browser() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver {
+            initial_power: Some(background_power_capabilities()),
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("headless-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+
+        let log = driver.snapshot();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 1);
+        assert_eq!(
+            log.iter()
+                .filter(|entry| *entry == "auth_present:Background")
+                .count(),
+            1
+        );
+        assert!(!log.contains(&"auth_present:Foreground".to_string()));
+        assert!(log.contains(&"connect:headless-cookie".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn known_unreachable_gateway_defers_saml_browser_until_recovery() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        driver
+            .connects
+            .push_back(ScriptConnect::FailureThenNetworkPause {
+                kind: ConnectFailureKind::CookieRejected,
+                resume: resume_rx,
+            });
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("recovered-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        let log = driver.log.clone();
+        let run = controller.run_with_driver(&mut driver);
+        tokio::pin!(run);
+        for _ in 0..100 {
+            tokio::select! {
+                result = &mut run => panic!("controller completed before network recovery: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| *entry == "auth")
+                .count(),
+            0
+        );
+
+        resume_tx.send(()).unwrap();
+        (&mut run).await.unwrap();
+        let snapshot = log.lock().unwrap().clone();
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|entry| entry.starts_with("auth_present:"))
+                .count(),
+            1,
+            "{snapshot:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_untrusted_wifi_event_does_not_consume_background_launch() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let shutdown = Shutdown::new();
+        let trigger = shutdown.clone();
+        let (mut controller, wifi_tx) =
+            trusted_controller(initial, shutdown, EscalationConfig::default());
+        let mut driver = ScriptDriver {
+            initial_power: Some(background_power_capabilities()),
+            wifi_tx: Some(wifi_tx),
+            auth_wifi_event: Some(trusted("Office")),
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver.auth.push_back(ScriptAuth::Pending);
+
+        let log = driver.log.clone();
+        let run = controller.run_with_driver(&mut driver);
+        tokio::pin!(run);
+        for _ in 0..1_000 {
+            if log
+                .lock()
+                .unwrap()
+                .contains(&"auth_present:Background".to_string())
+            {
+                break;
+            }
+            tokio::select! {
+                result = &mut run => panic!("controller unexpectedly completed: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| *entry == "auth_present:Background")
+                .count(),
+            1
+        );
+
+        trigger.cancel();
+        (&mut run).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graphics_restore_continues_the_same_saml_attempt_without_reopening_url() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver {
+            initial_power: Some(background_power_capabilities()),
+            ..ScriptDriver::default()
+        };
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver.auth.push_back(ScriptAuth::PowerThenResult {
+            event: full_power_capabilities(),
+            release: release_rx,
+            result: Ok("promoted-cookie".into()),
+        });
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        let log = driver.log.clone();
+        let run = controller.run_with_driver(&mut driver);
+        tokio::pin!(run);
+        let wait_for_background_presentation = async {
+            for _ in 0..1_000 {
+                if log
+                    .lock()
+                    .unwrap()
+                    .contains(&"auth_present:Background".to_string())
+                {
+                    tokio::task::yield_now().await;
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("background attempt was not presented");
+        };
+        tokio::select! {
+            result = &mut run => panic!("controller finished before callback: {result:?}"),
+            _ = wait_for_background_presentation => {}
+        }
+        release_tx.send(()).unwrap();
+        (&mut run).await.unwrap();
+
+        let log = log.lock().unwrap();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 1);
+        assert_eq!(
+            log.iter()
+                .filter(|entry| *entry == "auth_present:Background")
+                .count(),
+            1
+        );
+        assert!(!log.contains(&"auth_present:Foreground".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn headless_saml_timeout_waits_for_graphics_without_popup_loop() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let shutdown = Shutdown::new();
+        let trigger = shutdown.clone();
+        let mut controller = controller(initial, shutdown);
+        let mut driver = ScriptDriver {
+            initial_power: Some(background_power_capabilities()),
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver.auth.push_back(ScriptAuth::Pending);
+
+        let log = driver.log.clone();
+        let run = controller.run_with_driver(&mut driver);
+        tokio::pin!(run);
+        let wait_for_background_launch = async {
+            for _ in 0..1_000 {
+                if log
+                    .lock()
+                    .unwrap()
+                    .contains(&"auth_present:Background".to_string())
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("background SAML did not start");
+        };
+        tokio::select! {
+            result = &mut run => panic!("controller unexpectedly completed: {result:?}"),
+            _ = wait_for_background_launch => {}
+        }
+        tokio::select! {
+            result = &mut run => panic!("controller unexpectedly completed: {result:?}"),
+            _ = tokio::time::advance(Duration::from_secs(10 * 60)) => {}
+        }
+        for _ in 0..100 {
+            tokio::select! {
+                result = &mut run => panic!("controller unexpectedly completed: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+
+        {
+            let log = log.lock().unwrap();
+            assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 1);
+            assert_eq!(
+                log.iter()
+                    .filter(|entry| *entry == "auth_present:Background")
+                    .count(),
+                1
+            );
+            assert!(!log.contains(&"auth_present:Foreground".to_string()));
+        }
+
+        trigger.cancel();
+        (&mut run).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_callback_stops_probe_deadline_while_exchange_finishes() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver {
+            initial_power: Some(background_power_capabilities()),
+            ..ScriptDriver::default()
+        };
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver.auth.push_back(ScriptAuth::CallbackThenResult {
+            release: release_rx,
+            result: Ok("headless-cookie".into()),
+        });
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        let log = driver.log.clone();
+        let run = controller.run_with_driver(&mut driver);
+        tokio::pin!(run);
+        for _ in 0..100 {
+            tokio::select! {
+                result = &mut run => panic!("controller finished before exchange: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        tokio::select! {
+            result = &mut run => panic!("controller finished before exchange: {result:?}"),
+            _ = tokio::time::advance(Duration::from_secs(10 * 60)) => {}
+        }
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| *entry == "auth")
+                .count(),
+            1
+        );
+
+        release_tx.send(()).unwrap();
+        (&mut run).await.unwrap();
+        assert!(log
+            .lock()
+            .unwrap()
+            .contains(&"connect:headless-cookie".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_background_saml_cookie_does_not_open_another_tab() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let shutdown = Shutdown::new();
+        let trigger = shutdown.clone();
+        let mut controller = controller(initial, shutdown);
+        let mut driver = ScriptDriver {
+            initial_power: Some(background_power_capabilities()),
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("rejected-new-cookie".into())));
+        driver
+            .configs
+            .push_back(Err(FortiError::CookieRejected(403)));
+
+        let log = driver.log.clone();
+        let run = controller.run_with_driver(&mut driver);
+        tokio::pin!(run);
+        for _ in 0..200 {
+            tokio::select! {
+                result = &mut run => panic!("controller unexpectedly completed: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| *entry == "auth_present:Background")
+                .count(),
+            1
+        );
+
+        trigger.cancel();
+        (&mut run).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interactive_timeout_keeps_listener_for_late_callback() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver.auth.push_back(ScriptAuth::PowerThenResult {
+            event: full_power_capabilities(),
+            release: release_rx,
+            result: Ok("late-cookie".into()),
+        });
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        let log = driver.log.clone();
+        let run = controller.run_with_driver(&mut driver);
+        tokio::pin!(run);
+        for _ in 0..100 {
+            tokio::select! {
+                result = &mut run => panic!("controller finished before callback: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        tokio::select! {
+            result = &mut run => panic!("controller finished before callback: {result:?}"),
+            _ = tokio::time::advance(Duration::from_secs(10 * 60)) => {}
+        }
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| *entry == "auth")
+                .count(),
+            1
+        );
+
+        release_tx.send(()).unwrap();
+        (&mut run).await.unwrap();
+        assert!(log
+            .lock()
+            .unwrap()
+            .contains(&"connect:late-cookie".to_string()));
+    }
+
+    fn count_entries(log: &StdArc<Mutex<Vec<String>>>, entry: &str) -> usize {
+        log.lock().unwrap().iter().filter(|e| *e == entry).count()
+    }
+
+    /// Poll the controller without letting it finish, so a test can observe an
+    /// intermediate state.
+    macro_rules! spin {
+        ($run:expr, $rounds:expr) => {
+            for _ in 0..$rounds {
+                tokio::select! {
+                    result = &mut $run => panic!("controller completed early: {result:?}"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+        };
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn power_and_network_events_do_not_cancel_a_running_browser_launch() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut driver = ScriptDriver {
+            launch_gate: Some(release_rx),
+            preempt_launch: true,
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("survived-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        let log = driver.log.clone();
+        let run = controller.run_with_driver(&mut driver);
+        tokio::pin!(run);
+        spin!(run, 100);
+
+        assert_eq!(
+            count_entries(&log, "auth_launch:Foreground"),
+            1,
+            "a preempted launch must never be respawned: {:?}",
+            log.lock().unwrap()
+        );
+        assert_eq!(
+            count_entries(&log, "auth_present:Foreground"),
+            0,
+            "the launcher is still running"
+        );
+
+        release_tx.send(()).unwrap();
+        (&mut run).await.unwrap();
+
+        let snapshot = log.lock().unwrap().clone();
+        assert_eq!(count_entries(&log, "auth_launch:Foreground"), 1);
+        assert_eq!(
+            count_entries(&log, "auth_present:Foreground"),
+            1,
+            "the retained launch must complete: {snapshot:?}"
+        );
+        assert!(snapshot.contains(&"connect:survived-cookie".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreground_soft_timeout_re_presents_on_the_next_interactive_session() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let shutdown = Shutdown::new();
+        let trigger = shutdown.clone();
+        let mut controller = controller(initial, shutdown);
+        let (tap_tx, tap_rx) = tokio::sync::oneshot::channel();
+        let mut driver = ScriptDriver {
+            initial_power: Some(PowerCapabilities {
+                known: true,
+                cpu: true,
+                network: true,
+                graphics: true,
+            }),
+            power_tap: Some(tap_tx),
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        // The user never completes the login, so no callback ever arrives.
+        driver.auth.push_back(ScriptAuth::Pending);
+
+        let log = driver.log.clone();
+        let run = controller.run_with_driver(&mut driver);
+        tokio::pin!(run);
+        spin!(run, 100);
+        let power_tx = tap_rx.await.expect("power sender");
+        assert_eq!(count_entries(&log, "auth_present:Foreground"), 1);
+
+        // The interactive budget lapses with the display still lit.
+        tokio::select! {
+            result = &mut run => panic!("controller completed early: {result:?}"),
+            _ = tokio::time::advance(SAML_INTERACTIVE_TIMEOUT + Duration::from_secs(1)) => {}
+        }
+        spin!(run, 100);
+        assert_eq!(
+            count_entries(&log, "auth_present:Foreground"),
+            1,
+            "a lit display must not re-present on its own"
+        );
+        assert_eq!(count_entries(&log, "auth"), 1);
+
+        // Display off, then on: a genuinely new interactive session.
+        power_tx
+            .send(PowerEvent::Capabilities(background_power_capabilities()))
+            .unwrap();
+        spin!(run, 20);
+        assert_eq!(
+            count_entries(&log, "auth_present:Foreground"),
+            1,
+            "losing graphics must not re-present"
+        );
+        power_tx.send(full_power_capabilities()).unwrap();
+        spin!(run, 20);
+
+        assert_eq!(
+            count_entries(&log, "auth_present:Foreground"),
+            2,
+            "a new interactive session must re-present: {:?}",
+            log.lock().unwrap()
+        );
+        assert_eq!(
+            count_entries(&log, "auth"),
+            1,
+            "re-presenting must reuse the same attempt and its callback listener"
+        );
+
+        trigger.cancel();
+        (&mut run).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_failure_after_a_callback_keeps_the_headless_route() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver {
+            initial_power: Some(background_power_capabilities()),
+            ..ScriptDriver::default()
+        };
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        release_tx.send(()).unwrap();
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        // The browser reached the IdP and the callback came back; only the
+        // cookie exchange failed.
+        driver.auth.push_back(ScriptAuth::CallbackThenResult {
+            release: release_rx,
+            result: Err(FortiError::TunnelError("transient exchange failure".into())),
+        });
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("retried-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+
+        let log = driver.snapshot();
+        assert_eq!(
+            log.iter()
+                .filter(|entry| *entry == "auth_present:Background")
+                .count(),
+            2,
+            "the headless route proved itself, so the retry must not need the display: {log:?}"
+        );
+        assert!(!log.contains(&"auth_present:Foreground".to_string()));
+        assert!(log.contains(&"connect:retried-cookie".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_reachability_during_saml_still_allows_a_bounded_probe() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver {
+            // Unreachable lands while the attempt is in flight, and no recovery
+            // edge ever follows — the monitor missed it or exited.
+            auth_network_event: Some(NetworkEvent::Unreachable),
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("probe-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        let log = driver.log.clone();
+        let run = controller.run_with_driver(&mut driver);
+        tokio::pin!(run);
+        spin!(run, 100);
+        assert_eq!(
+            count_entries(&log, "auth_launch:Foreground"),
+            0,
+            "a known-unreachable gateway must still defer the browser"
+        );
+
+        tokio::select! {
+            result = &mut run => panic!("controller completed before the floor: {result:?}"),
+            _ = tokio::time::advance(MONITOR_FALLBACK_TIMEOUT + Duration::from_secs(1)) => {}
+        }
+        // Bounded so a regression reports a stalled controller instead of
+        // hanging the suite: without the floor this never resolves.
+        tokio::time::timeout(Duration::from_secs(600), &mut run)
+            .await
+            .expect("a stalled reachability signal must not park SAML forever")
+            .unwrap();
+
+        let snapshot = log.lock().unwrap().clone();
+        assert_eq!(
+            count_entries(&log, "auth"),
+            1,
+            "the single SAML attempt must survive the stall: {snapshot:?}"
+        );
+        assert_eq!(count_entries(&log, "auth_present:Foreground"), 1);
+        assert!(snapshot.contains(&"connect:probe-cookie".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_without_a_capability_update_resumes_after_the_fallback() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let (_power_tx, power_rx) = mpsc::unbounded_channel();
+        let mut power = PowerTracker::new(power_rx);
+        power.apply(PowerEvent::WillSleep);
+        assert!(!power.can_run_network());
+        let started = tokio::time::Instant::now();
+
+        assert!(!controller.wait_for_wake(&mut power).await);
+        assert_eq!(started.elapsed(), WAKE_FALLBACK_TIMEOUT);
+        assert!(
+            power.can_run_network(),
+            "the fallback must leave the tracker able to run a bounded probe"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dark_wake_capabilities_allow_cached_cookie_reconnect() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver {
+            initial_power: Some(background_power_capabilities()),
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+        assert!(log.contains(&"connect:old-cookie".to_string()));
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2475,7 +4141,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn sleep_during_connect_and_network_loss_during_auth_are_interruptible() {
+    async fn sleep_interrupts_connect_but_network_flap_preserves_saml_single_flight() {
         let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
         let mut controller = controller(initial.clone(), Shutdown::new());
         let mut driver = ScriptDriver::default();
@@ -2484,9 +4150,6 @@ mod tests {
             ScriptConnect::Failure(ConnectFailureKind::CookieRejected),
         ]);
         driver.auth.push_back(ScriptAuth::NetworkDown);
-        driver
-            .auth
-            .push_back(ScriptAuth::Result(Ok("new-cookie".into())));
         driver.configs.push_back(Ok(initial));
         driver
             .connects
@@ -2495,7 +4158,7 @@ mod tests {
 
         controller.run_with_driver(&mut driver).await.unwrap();
         let log = driver.snapshot();
-        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 2);
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 1);
         assert!(log.contains(&"connect:new-cookie".to_string()));
     }
 
