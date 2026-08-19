@@ -12,7 +12,7 @@ use crate::wifi_monitor::WifiEvent;
 use std::future::Future;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 async fn finish_tun_setup<
     RouteSetup,
@@ -56,7 +56,9 @@ pub async fn setup_tun(
     finish_tun_setup(
         || tun::routes::install_routes(&config.routes, &iface_name, shutdown),
         || tun::dns::configure_dns(&config.dns_servers, shutdown),
-        || cleanup_tun(config, &iface_name),
+        || async {
+            let _ = cleanup_tun(config, &iface_name).await;
+        },
     )
     .await?;
 
@@ -71,50 +73,31 @@ pub async fn setup_tun(
     Ok((tun_dev, iface_name))
 }
 
-async fn cleanup_with_deadline<RouteCleanup, DnsCleanup>(
-    route_cleanup: RouteCleanup,
-    dns_cleanup: DnsCleanup,
-    deadline: Duration,
-) -> bool
-where
-    RouteCleanup: Future<Output = ()>,
-    DnsCleanup: Future<Output = ()>,
-{
-    tokio::time::timeout(deadline, async {
-        route_cleanup.await;
-        dns_cleanup.await;
-    })
-    .await
-    .is_ok()
-}
-
-const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Remove routes and DNS configuration under one global deadline.
-pub async fn cleanup_tun(config: &TunnelConfig, iface_name: &str) {
+/// Remove routes, then DNS. Returns whether the VPN DNS key is known to be gone.
+///
+/// The two removals are bounded independently. Sharing one budget meant a slow
+/// route pass could consume all of it and skip DNS entirely — and route removal
+/// scales with the batch size, so the bigger the split tunnel the likelier that
+/// became. Leaving VPN-only resolvers installed breaks name resolution
+/// machine-wide, which is far worse than routes outliving their interface (the
+/// kernel drops those when the utun disappears).
+///
+/// Callers must not assume DNS was withdrawn: the return value is the only
+/// honest answer, because scutil can stall or fail on its own.
+pub async fn cleanup_tun(config: &TunnelConfig, iface_name: &str) -> bool {
     info!("Starting bounded VPN route/DNS cleanup");
-    let cleanup_phase = std::sync::atomic::AtomicU8::new(0);
-    let completed = cleanup_with_deadline(
-        async {
-            info!("Removing VPN routes");
-            tun::routes::remove_routes(&config.routes, iface_name).await;
-        },
-        async {
-            cleanup_phase.store(1, std::sync::atomic::Ordering::Relaxed);
-            info!("Removing VPN DNS configuration");
-            if let Err(error) = tun::dns::remove_dns().await {
-                warn!(error = %error, "Failed to remove VPN DNS during cleanup");
-            }
-        },
-        CLEANUP_TIMEOUT,
-    )
-    .await;
+    info!("Removing VPN routes");
+    tun::routes::remove_routes(&config.routes, iface_name).await;
 
-    if !completed {
-        if cleanup_phase.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            error!("Route cleanup exceeded the global 10s deadline; DNS cleanup was skipped");
-        } else {
-            error!("DNS cleanup exceeded the remaining global 10s deadline");
+    info!("Removing VPN DNS configuration");
+    match tun::dns::remove_dns().await {
+        Ok(()) => true,
+        Err(error) => {
+            error!(
+                %error,
+                "Failed to remove VPN DNS during cleanup; system name resolution may stay broken"
+            );
+            false
         }
     }
 }
@@ -392,16 +375,6 @@ async fn send_ppp<Tunnel: TunnelIo>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test(start_paused = true)]
-    async fn cleanup_deadline_covers_routes_and_dns_as_one_budget() {
-        let cleanup = cleanup_with_deadline(
-            async { tokio::time::sleep(Duration::from_secs(8)).await },
-            async { tokio::time::sleep(Duration::from_secs(8)).await },
-            Duration::from_secs(10),
-        );
-        assert!(!cleanup.await);
-    }
 
     #[tokio::test]
     async fn interruptible_observes_already_cancelled_shutdown() {

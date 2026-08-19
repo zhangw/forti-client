@@ -59,6 +59,13 @@ pub enum FortiError {
     #[error("tunnel error: {0}")]
     TunnelError(String),
 
+    /// A local network-setup command (route/scutil) exceeded its deadline.
+    /// This is a busy-system condition — typically configd stalled by the same
+    /// interface churn that triggered the reconnect — so callers should retry
+    /// rather than treat it as unrecoverable.
+    #[error("local setup timed out: {0}")]
+    LocalSetupTimedOut(String),
+
     #[error("PPP negotiation failed: {0}")]
     PppError(String),
 
@@ -88,6 +95,9 @@ impl SamlFailureKind {
             | FortiError::PostUpgradeNegotiation(_)
             | FortiError::TunnelClosed
             | FortiError::TunnelError(_)
+            // A busy local system is not a SAML configuration problem; treat
+            // it like an unreachable gateway so auth retries rather than stops.
+            | FortiError::LocalSetupTimedOut(_)
             | FortiError::ProtocolError(_) => Self::GatewayUnavailable,
             FortiError::AuthFailed(_)
             | FortiError::CookieRejected(_)

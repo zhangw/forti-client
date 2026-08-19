@@ -214,6 +214,14 @@ impl Backoff {
     pub fn reset(&mut self) {
         self.current = BACKOFF_INITIAL;
     }
+
+    /// Put the backoff back to a previously observed level. Used to undo the
+    /// [`Backoff::reset`] that a successful handshake performs when the very
+    /// same cycle then fails for a local reason the handshake says nothing
+    /// about.
+    pub fn restore(&mut self, current: Duration) {
+        self.current = current;
+    }
 }
 
 /// When repeated reconnect failures escalate from cookie retries to full
@@ -253,6 +261,11 @@ pub struct ReconnectPolicy {
     /// tunnel that dies within the flap window was never a real success, so
     /// the flap handler restores this evidence before counting the flap.
     failed_cycles_at_establishment: u32,
+    /// The backoff level as it was when the current tunnel came up. A
+    /// successful handshake resets the backoff, but a local setup stall in
+    /// the same cycle is not evidence the trouble is gone — repeated stalls
+    /// restore this level so their retries still escalate.
+    backoff_at_establishment: Duration,
     escalation: EscalationConfig,
     saml_attempts: u32,
 }
@@ -276,6 +289,7 @@ impl ReconnectPolicy {
             transport_attempts: 0,
             failed_cycles: 0,
             failed_cycles_at_establishment: 0,
+            backoff_at_establishment: BACKOFF_INITIAL,
             escalation,
             saml_attempts: 0,
         }
@@ -368,7 +382,17 @@ impl ReconnectPolicy {
         self.record_failed_cycle();
     }
 
+    /// A transient local setup stall after a successful handshake: the
+    /// handshake reset the backoff, but it says nothing about local system
+    /// health, so restore the level captured at establishment. Repeated
+    /// stalls then escalate 1s→2s→…→60s instead of retrying at the floor
+    /// forever.
+    pub fn on_transient_setup_retry(&mut self) {
+        self.backoff.restore(self.backoff_at_establishment);
+    }
+
     pub fn on_tunnel_established(&mut self) {
+        self.backoff_at_establishment = self.backoff.current();
         self.backoff.reset();
         self.auth_requirement = AuthRequirement::NotRequired;
         self.connect_attempts = 0;
@@ -447,6 +471,11 @@ pub struct AuthParams {
     /// may have pointed at VPN-internal DNS servers.
     pub server_addr: Option<SocketAddr>,
     pub saml: bool,
+    /// Restrict SAML re-authentication to moments the user can see the browser,
+    /// and spend at most one unattended probe per reconnect. Off by default:
+    /// browser-mediated SAML completes without a human whenever the IdP session
+    /// is still valid, so display state must not decide whether it may run.
+    pub saml_interactive_only: bool,
     pub username: Option<String>,
     pub password: Option<SecretString>,
     pub realm: Option<String>,
@@ -493,12 +522,21 @@ fn classify_tunnel_connect_error(error: &FortiError) -> ConnectFailureKind {
         | FortiError::SamlCallbackPortUnavailable(_)
         | FortiError::SamlTerminalConfiguration(_)
         | FortiError::Http(_) => ConnectFailureKind::TransportUnavailable,
+        FortiError::LocalSetupTimedOut(_) => ConnectFailureKind::LocalSetup,
     }
 }
 
 struct ConnectFailure {
     kind: ConnectFailureKind,
     source: FortiError,
+}
+
+/// Whether a TUN setup failure is a busy-system stall (wedged /sbin/route or
+/// scutil while configd churns) rather than a deterministic local error such
+/// as utun creation failing. A stall clears on its own, so the setup is worth
+/// retrying behind the normal backoff; a deterministic error never will.
+fn is_transient_local_setup(error: &FortiError) -> bool {
+    matches!(error, FortiError::LocalSetupTimedOut(_))
 }
 
 type ConnectedTunnel<Tunnel, Lcp> = (Tunnel, Lcp, std::net::Ipv4Addr);
@@ -555,11 +593,14 @@ trait ControllerDriver: Send {
         config: &'a TunnelConfig,
         shutdown: &'a Shutdown,
     ) -> DriverFuture<'a, Result<(Self::Tun, String)>>;
+    /// Tear down routes and DNS. Resolves to whether the VPN DNS key is known
+    /// to be gone; callers must not assume it was, since scutil can stall or
+    /// fail independently of the route pass.
     fn cleanup_tun<'a>(
         &'a mut self,
         config: &'a TunnelConfig,
         iface_name: &'a str,
-    ) -> DriverFuture<'a, ()>;
+    ) -> DriverFuture<'a, bool>;
     fn start_monitors(
         &mut self,
         target: ReachabilityTarget,
@@ -634,7 +675,7 @@ impl ControllerDriver for ProductionDriver {
         &'a mut self,
         config: &'a TunnelConfig,
         iface_name: &'a str,
-    ) -> DriverFuture<'a, ()> {
+    ) -> DriverFuture<'a, bool> {
         Box::pin(vpn::cleanup_tun(config, iface_name))
     }
 
@@ -794,7 +835,10 @@ enum RetryOutcome {
 
 enum SamlRunOutcome {
     Completed(Result<String>),
-    BackgroundTimedOut,
+    /// The wait budget lapsed with no callback. Fires for an unattended probe,
+    /// and for a presented attempt no browser ever answered — in both cases the
+    /// attempt is spent, but nothing was left half-done at the gateway.
+    NoCallbackReceived,
     Interrupted(Interrupt),
 }
 
@@ -969,6 +1013,10 @@ impl ReconnectController {
         let mut iface_name = String::new();
         let mut setup_active = false;
         let mut applied_config = self.tunnel_config.clone();
+        // VPN DNS servers are typically reachable only through the tunnel. While
+        // no tunnel carries them they are withdrawn, otherwise every reconnect
+        // attempt (and any SAML browser launch) resolves into a black hole.
+        let mut dns_suspended = false;
         if !self.wifi_trusted {
             match driver.setup_tun(&self.tunnel_config, &self.shutdown).await {
                 Ok((initial_tun, initial_iface)) => {
@@ -977,6 +1025,26 @@ impl ReconnectController {
                     setup_active = true;
                 }
                 Err(_) if self.shutdown.is_cancelled() => return Ok(()),
+                // A transient stall must not kill the process: run without a
+                // TUN for now. The loop's rebuild step (tun_dev stays None)
+                // retries the setup once the tunnel is connected, behind the
+                // normal backoff.
+                Err(error) if is_transient_local_setup(&error) => {
+                    warn!(
+                        error = %error,
+                        "Transient local setup stall at startup; deferring TUN setup to the reconnect loop"
+                    );
+                    // A scutil stall does not prove the DNS key was never
+                    // applied, and `setup_tun`'s own rollback shares one
+                    // deadline with route removal — so it can be skipped
+                    // entirely — and reports nothing back either way. Worse, a
+                    // key applied by a timed-out scutil is never recorded as
+                    // installed, so neither `remove_dns_blocking` nor `DnsGuard`
+                    // would clean it up on the way out. Withdraw it explicitly:
+                    // the removal is idempotent, and an absent key counts as
+                    // success.
+                    suspend_vpn_dns(driver, &mut dns_suspended).await;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -1007,10 +1075,6 @@ impl ReconnectController {
         let mut terminal_error: Option<FortiError> = None;
         let mut pending_config_refresh = false;
         let mut background_saml_attempted = false;
-        // VPN DNS servers are typically reachable only through the tunnel. While
-        // no tunnel carries them they are withdrawn, otherwise every reconnect
-        // attempt (and any SAML browser launch) resolves into a black hole.
-        let mut dns_suspended = false;
 
         'reconnect: loop {
             power.drain();
@@ -1026,11 +1090,17 @@ impl ReconnectController {
                         state = ?ConnectionState::SuspendedOnTrustedWifi,
                         "Trusted Wi-Fi detected — tearing down VPN locally"
                     );
-                    driver.cleanup_tun(&applied_config, &iface_name).await;
+                    let dns_removed = driver.cleanup_tun(&applied_config, &iface_name).await;
                     setup_active = false;
                     drop(tun_dev.take());
-                    // cleanup_tun withdrew the VPN DNS along with the routes.
-                    dns_suspended = true;
+                    // Only record the withdrawal that actually happened. scutil
+                    // can stall or fail on its own, and claiming success here
+                    // would make `suspend_vpn_dns` skip the retry — leaving
+                    // VPN-only resolvers installed for the whole suspension.
+                    dns_suspended = dns_removed;
+                    if !dns_removed {
+                        suspend_vpn_dns(driver, &mut dns_suspended).await;
+                    }
                 }
                 if self
                     .wait_while_trusted(&mut wifi_rx, &mut power, &trusted_ssids)
@@ -1145,7 +1215,15 @@ impl ReconnectController {
                     continue;
                 }
 
-                if self.auth_params.saml && !power.can_interact() && background_saml_attempted {
+                // Only an explicit opt-in parks re-authentication on display
+                // state. By default a dark machine still drives SAML: the
+                // browser carries the IdP session, and needing a browser is not
+                // the same as needing a person.
+                if self.auth_params.saml_interactive_only
+                    && self.auth_params.saml
+                    && !power.can_interact()
+                    && background_saml_attempted
+                {
                     if self
                         .wait_for_interactive_auth(
                             &mut network_rx,
@@ -1210,8 +1288,39 @@ impl ReconnectController {
                         pending_config_refresh = true;
                         continue;
                     }
-                    SamlRunOutcome::BackgroundTimedOut => {
+                    SamlRunOutcome::NoCallbackReceived => {
                         background_saml_attempted = true;
+                        if !self.auth_params.saml_interactive_only {
+                            // The probe is one reconnect attempt, not a lifetime
+                            // budget. Fall through to the retry wait so the next
+                            // cycle presents again on the existing backoff; a
+                            // live IdP session then completes with no one
+                            // present. Escalation stays with the failure
+                            // counters, which is where evidence of a dead
+                            // session actually accumulates.
+                            info!(
+                                saml_attempt = self.policy.saml_attempts(),
+                                "Unattended SAML probe received no callback; retrying on the reconnect backoff"
+                            );
+                            if self
+                                .wait_for_retry(
+                                    RetryContext {
+                                        current_operation: "authentication",
+                                        retry_reason: "unattended_saml_no_callback",
+                                        failure_class: "saml_no_callback",
+                                    },
+                                    &mut network_rx,
+                                    &mut power,
+                                    &mut wifi_rx,
+                                    &trusted_ssids,
+                                )
+                                .await
+                                == RetryOutcome::Shutdown
+                            {
+                                break;
+                            }
+                            continue;
+                        }
                         info!(
                             state = ?ConnectionState::WaitingForInteractiveAuth,
                             saml_attempt = self.policy.saml_attempts(),
@@ -1432,6 +1541,62 @@ impl ReconnectController {
                         dns_suspended = false;
                     }
                     Err(_) if shutdown.is_cancelled() => break 'reconnect,
+                    // A wedged route/scutil batch is a busy-system stall, not
+                    // an unrecoverable error — and the interface churn that
+                    // triggered this rebuild is exactly what stalls configd.
+                    // Retry behind the normal backoff instead of exiting. The
+                    // next iteration reconnects the tunnel first, then rebuilds
+                    // because tun_dev is None. This does not count as a failed
+                    // cycle: the cookie is fine, so escalating to
+                    // re-authentication cannot help and must not fire.
+                    Err(error) if is_transient_local_setup(&error) => {
+                        warn!(
+                            state = ?self.state,
+                            error = %error,
+                            "Transient local setup stall while rebuilding TUN; retrying after backoff"
+                        );
+                        // The tunnel is abandoned, not paused: it sat idle
+                        // through the setup timeout and will sit through the
+                        // backoff too. Terminate it like the data-plane exit
+                        // does — an unclean close leaves a zombie server
+                        // session behind, and this path repeats once per
+                        // retry.
+                        let _ = tokio::time::timeout(
+                            TERMINATE_TIMEOUT,
+                            driver.send_terminate(&mut tunnel, &mut lcp),
+                        )
+                        .await;
+                        drop(tunnel);
+                        // The rollback cleanup can skip DNS removal when its
+                        // shared deadline is consumed by stalled route
+                        // commands, and the flag can be stale after the
+                        // pre-rebuild teardown. Withdraw explicitly, like
+                        // every other path that waits without a tunnel.
+                        suspend_vpn_dns(driver, &mut dns_suspended).await;
+                        // The successful handshake reset the backoff; restore
+                        // the establishment level so repeated stalls escalate.
+                        self.policy.on_transient_setup_retry();
+                        if self
+                            .wait_for_retry(
+                                RetryContext {
+                                    current_operation: "tun_setup",
+                                    retry_reason: "local_setup_timed_out",
+                                    failure_class: connect_failure_class(
+                                        ConnectFailureKind::LocalSetup,
+                                    ),
+                                },
+                                &mut network_rx,
+                                &mut power,
+                                &mut wifi_rx,
+                                &trusted_ssids,
+                            )
+                            .await
+                            == RetryOutcome::Shutdown
+                        {
+                            break 'reconnect;
+                        }
+                        continue;
+                    }
                     Err(error) => {
                         terminal_error = Some(error);
                         break 'reconnect;
@@ -1605,6 +1770,11 @@ impl ReconnectController {
         // full display off→on cycle so the user is not stuck with a stale tab.
         let mut soft_timed_out = false;
         let mut saw_noninteractive = false;
+        // Whether a browser launch for this attempt ever completed while the
+        // machine could actually render one. Only then is there reason to
+        // believe a tab exists — and therefore a gateway transaction worth not
+        // duplicating, and a person who might still be mid-login.
+        let mut presented_with_graphics = false;
         let deadline = tokio::time::sleep(SAML_INTERACTIVE_TIMEOUT);
         tokio::pin!(deadline);
         // A gateway reported unreachable parks this loop with the attempt held,
@@ -1645,18 +1815,39 @@ impl ReconnectController {
                 && power.can_interact()
                 && !callback_received
             {
-                // `open -g` already created this attempt's browser navigation.
-                // Do not open the URL again: doing so can create a second tab
-                // and a second FortiGate SAML transaction. The existing tab is
-                // now available for user interaction.
+                // Every presentation so far ran with no graphics, where `open
+                // -g` exiting 0 means only that LaunchServices accepted the URL
+                // — a machine that never scheduled a browser has no tab to
+                // return to. Present again now that one can actually render.
+                //
+                // The callback listener cannot answer this question: a browser
+                // reaches it only after the whole gateway→IdP→gateway redirect
+                // chain completes, so a tab parked on the IdP login page looks
+                // exactly like a tab that was never opened.
+                //
+                // Residual risk, taken deliberately: if the unattended `open -g`
+                // did navigate, this opens a second tab and a second gateway
+                // SAML transaction. The abandoned one expires on its own, which
+                // is a far smaller cost than stranding the client forever on a
+                // tab that does not exist.
                 presentation = Some(SamlBrowserPresentation::Foreground);
                 deadline_remaining = Some(SAML_INTERACTIVE_TIMEOUT);
                 deadline_started = None;
-                info!(
-                    state = ?self.state,
-                    saml_attempt = self.policy.saml_attempts(),
-                    "Interactive graphics restored; continuing the existing SAML attempt"
-                );
+                if presented_with_graphics {
+                    info!(
+                        state = ?self.state,
+                        saml_attempt = self.policy.saml_attempts(),
+                        "Interactive graphics restored; continuing the existing SAML attempt"
+                    );
+                } else {
+                    launch = Some(attempt.present(SamlBrowserPresentation::Foreground));
+                    presentation_started = false;
+                    info!(
+                        state = ?self.state,
+                        saml_attempt = self.policy.saml_attempts(),
+                        "Interactive graphics restored; the unattended probe ran with no display, so presenting again"
+                    );
+                }
             }
 
             // Re-present only on a fresh interactive epoch: the display must
@@ -1773,6 +1964,12 @@ impl ReconnectController {
                     if presentation == Some(SamlBrowserPresentation::Background) {
                         *background_saml_attempted = true;
                     }
+                    // Foreground is chosen only while the machine can interact,
+                    // so a launcher that completed under it did have a display
+                    // to render into.
+                    if result.is_ok() && presentation == Some(SamlBrowserPresentation::Foreground) {
+                        presented_with_graphics = true;
+                    }
                     if let Err(error) = result {
                         warn!(
                             presentation = ?presentation,
@@ -1825,8 +2022,28 @@ impl ReconnectController {
                     deadline_started = None;
                     deadline_remaining = None;
                     if presentation == Some(SamlBrowserPresentation::Background) {
-                        return SamlRunOutcome::BackgroundTimedOut;
+                        // The unattended retry loop re-runs `open -g`, which
+                        // renders nothing while the machine stays dark. stderr
+                        // is then the only channel that can reach a person, so
+                        // emit the URL rather than retry silently forever. The
+                        // interactive-only path is already parked waiting for a
+                        // display that will present a real browser, so it needs
+                        // no print. Paced by the reconnect backoff, which caps
+                        // at 60s.
+                        if !self.auth_params.saml_interactive_only {
+                            self.print_saml_url(attempt.url());
+                        }
+                        return SamlRunOutcome::NoCallbackReceived;
                     }
+                    // Everything below is a foreground presentation, which is
+                    // only ever chosen while the machine can interact. A person
+                    // may therefore be mid-login right now — in the tab that was
+                    // opened, or against the URL printed for them when the
+                    // launcher failed. Either way the listener must stay bound,
+                    // because dropping it refuses the callback they are about to
+                    // produce. Only the unattended branch above, where no
+                    // display was ever involved, hands the attempt back.
+                    //
                     // Soft: the listener stays bound so a late callback still
                     // completes this attempt. The user may also have abandoned
                     // or closed the tab, so arm a single re-present for the next
@@ -2130,6 +2347,34 @@ mod tests {
             classify_tunnel_connect_error(&FortiError::CookieRejected(403)),
             ConnectFailureKind::CookieRejected
         );
+        assert_eq!(
+            classify_tunnel_connect_error(&FortiError::LocalSetupTimedOut(
+                "route installation timed out after 10s".into()
+            )),
+            ConnectFailureKind::LocalSetup
+        );
+    }
+
+    #[test]
+    fn setup_retry_backoff_survives_re_establishment() {
+        // Each cycle: handshake succeeds (resetting the backoff), then the
+        // local setup stalls and the retry runs. Without restoring the
+        // establishment level every delay would stay at the 1s floor.
+        let mut policy = ReconnectPolicy::new();
+        let mut delays = Vec::new();
+        for _ in 0..3 {
+            policy.on_tunnel_established();
+            policy.on_transient_setup_retry();
+            delays.push(policy.next_delay());
+        }
+        assert_eq!(
+            delays,
+            [
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4)
+            ]
+        );
     }
 
     #[test]
@@ -2360,6 +2605,8 @@ mod tests {
         log: StdArc<Mutex<Vec<String>>>,
         _callback_tx: tokio::sync::watch::Sender<bool>,
         callback_rx: tokio::sync::watch::Receiver<bool>,
+        /// Model `open` failing, which prints the URL for manual completion.
+        fail_launch: bool,
         presentation_tx: tokio::sync::watch::Sender<Option<SamlBrowserPresentation>>,
         launch_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
         #[allow(clippy::type_complexity)]
@@ -2383,6 +2630,7 @@ mod tests {
         ) -> DriverFuture<'static, std::io::Result<()>> {
             let log = self.log.clone();
             let presentation_tx = self.presentation_tx.clone();
+            let fail_launch = self.fail_launch;
             let gate = self.launch_gate.lock().unwrap().take();
             let preempt = self.launch_preempt.lock().unwrap().take();
             Box::pin(async move {
@@ -2406,6 +2654,9 @@ mod tests {
                     .unwrap()
                     .push(format!("auth_present:{presentation:?}"));
                 let _ = presentation_tx.send(Some(presentation));
+                if fail_launch {
+                    return Err(std::io::Error::other("scripted launcher failure"));
+                }
                 Ok(())
             })
         }
@@ -2446,7 +2697,16 @@ mod tests {
         wifi_tx: Option<mpsc::UnboundedSender<WifiEvent>>,
         setup_calls: usize,
         fail_setup_call: Option<usize>,
+        /// These setup_tun calls fail with a transient local-setup timeout,
+        /// modelling a route/scutil batch wedged on a busy configd.
+        transient_setup_fail_calls: Vec<usize>,
         fail_dns_suspend: usize,
+        /// Cleanups whose DNS removal reports failure, modelling a scutil that
+        /// could not withdraw the key during teardown.
+        fail_cleanup_dns: usize,
+        /// Browser launches that report failure, so the controller falls back to
+        /// printing the URL for the user to open by hand.
+        fail_browser_launch: bool,
         initial_power: Option<PowerCapabilities>,
         initial_network: Option<NetworkEvent>,
         auth_wifi_event: Option<WifiEvent>,
@@ -2477,7 +2737,10 @@ mod tests {
                 wifi_tx: None,
                 setup_calls: 0,
                 fail_setup_call: None,
+                transient_setup_fail_calls: Vec::new(),
                 fail_dns_suspend: 0,
+                fail_cleanup_dns: 0,
+                fail_browser_launch: false,
                 initial_power: None,
                 initial_network: None,
                 auth_wifi_event: None,
@@ -2527,9 +2790,14 @@ mod tests {
                     .unwrap_or(Ipv4Addr::UNSPECIFIED)
             ));
             let fail = self.fail_setup_call == Some(call);
+            let transient_fail = self.transient_setup_fail_calls.contains(&call);
             Box::pin(async move {
                 if fail {
                     Err(FortiError::TunnelError("scripted setup failure".into()))
+                } else if transient_fail {
+                    Err(FortiError::LocalSetupTimedOut(
+                        "scripted transient setup stall".into(),
+                    ))
                 } else {
                     Ok((ScriptTun, format!("utun{call}")))
                 }
@@ -2540,7 +2808,7 @@ mod tests {
             &'a mut self,
             config: &'a TunnelConfig,
             iface_name: &'a str,
-        ) -> DriverFuture<'a, ()> {
+        ) -> DriverFuture<'a, bool> {
             self.record(format!(
                 "cleanup:{iface_name}:{}:{}:{}",
                 config.ip_address,
@@ -2555,7 +2823,11 @@ mod tests {
                     .copied()
                     .unwrap_or(Ipv4Addr::UNSPECIFIED)
             ));
-            Box::pin(async {})
+            // Model a cleanup whose DNS removal did not complete, so a caller
+            // that assumes it did is caught.
+            let dns_removed = self.fail_cleanup_dns == 0;
+            self.fail_cleanup_dns = self.fail_cleanup_dns.saturating_sub(1);
+            Box::pin(async move { dns_removed })
         }
 
         fn start_monitors(
@@ -2737,6 +3009,7 @@ mod tests {
                 log: self.log.clone(),
                 _callback_tx: callback_tx,
                 callback_rx,
+                fail_launch: self.fail_browser_launch,
                 presentation_tx,
                 launch_gate: Mutex::new(self.launch_gate.take()),
                 launch_preempt: Mutex::new(self.preempt_launch.then(|| {
@@ -2939,6 +3212,22 @@ mod tests {
             saml,
             escalation,
             TrustedWifiConfig::default(),
+            false,
+        )
+    }
+
+    /// A controller that parks SAML on display state, i.e. `--saml-interactive-only`.
+    fn controller_interactive_only(
+        initial: TunnelConfig,
+        shutdown: Shutdown,
+    ) -> ReconnectController {
+        controller_full(
+            initial,
+            shutdown,
+            true,
+            EscalationConfig::default(),
+            TrustedWifiConfig::default(),
+            true,
         )
     }
 
@@ -2948,6 +3237,7 @@ mod tests {
         saml: bool,
         escalation: EscalationConfig,
         trusted_wifi: TrustedWifiConfig,
+        saml_interactive_only: bool,
     ) -> ReconnectController {
         let auth_client = AuthClient::new("vpn.example", 443, false).unwrap();
         ReconnectController::new(
@@ -2956,6 +3246,7 @@ mod tests {
                 port: 443,
                 server_addr: None,
                 saml,
+                saml_interactive_only,
                 username: None,
                 password: None,
                 realm: None,
@@ -3229,8 +3520,31 @@ mod tests {
         (&mut run).await.unwrap();
     }
 
+    fn count_entries(log: &StdArc<Mutex<Vec<String>>>, entry: &str) -> usize {
+        log.lock().unwrap().iter().filter(|e| *e == entry).count()
+    }
+
+    /// Poll the controller without letting it finish, so a test can observe an
+    /// intermediate state.
+    macro_rules! spin {
+        ($run:expr, $rounds:expr) => {
+            for _ in 0..$rounds {
+                tokio::select! {
+                    result = &mut $run => panic!("controller completed early: {result:?}"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+        };
+    }
+
+    /// An unattended `open -g` exits 0 as soon as LaunchServices accepts the
+    /// URL, so a machine that never scheduled a browser records a spent
+    /// presentation with no tab behind it. Treating that as "the tab exists"
+    /// stranded the client: it burned the interactive budget waiting on a
+    /// listener nothing would ever connect to, then parked for a display
+    /// off→on cycle that a still-lit screen never produces.
     #[tokio::test(start_paused = true)]
-    async fn graphics_restore_continues_the_same_saml_attempt_without_reopening_url() {
+    async fn graphics_restore_re_presents_when_the_probe_never_reached_a_browser() {
         let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
         let mut controller = controller(initial.clone(), Shutdown::new());
         let mut driver = ScriptDriver {
@@ -3244,7 +3558,7 @@ mod tests {
         driver.auth.push_back(ScriptAuth::PowerThenResult {
             event: full_power_capabilities(),
             release: release_rx,
-            result: Ok("promoted-cookie".into()),
+            result: Ok("re-presented-cookie".into()),
         });
         driver.configs.push_back(Ok(initial));
         driver
@@ -3255,36 +3569,88 @@ mod tests {
         let log = driver.log.clone();
         let run = controller.run_with_driver(&mut driver);
         tokio::pin!(run);
-        let wait_for_background_presentation = async {
+        let wait_for_re_presentation = async {
             for _ in 0..1_000 {
                 if log
                     .lock()
                     .unwrap()
-                    .contains(&"auth_present:Background".to_string())
+                    .contains(&"auth_present:Foreground".to_string())
                 {
-                    tokio::task::yield_now().await;
                     return;
                 }
                 tokio::task::yield_now().await;
             }
-            panic!("background attempt was not presented");
+            panic!("the attempt was never re-presented after graphics returned");
         };
         tokio::select! {
-            result = &mut run => panic!("controller finished before callback: {result:?}"),
-            _ = wait_for_background_presentation => {}
+            result = &mut run => panic!("controller finished early: {result:?}"),
+            _ = wait_for_re_presentation => {}
         }
         release_tx.send(()).unwrap();
         (&mut run).await.unwrap();
 
-        let log = log.lock().unwrap();
-        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 1);
+        // One attempt, presented twice: the unattended probe that reached
+        // nothing, then the real browser once graphics returned.
+        assert_eq!(count_entries(&log, "auth"), 1);
+        assert_eq!(count_entries(&log, "auth_present:Background"), 1);
+        assert_eq!(count_entries(&log, "auth_present:Foreground"), 1);
+    }
+
+    /// Needing a browser is not needing a human, and neither is tied to the
+    /// lid: with the display dark and the probe unanswered, the reconnect must
+    /// keep driving SAML on its own backoff rather than parking until someone
+    /// opens the laptop.
+    #[tokio::test(start_paused = true)]
+    async fn unattended_saml_probe_retries_instead_of_waiting_for_a_display() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let shutdown = Shutdown::new();
+        let trigger = shutdown.clone();
+        let mut controller = controller(initial.clone(), shutdown);
+        let mut driver = ScriptDriver {
+            // Graphics never return: the lid stays shut for the whole test.
+            initial_power: Some(background_power_capabilities()),
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        // First probe reaches no browser and no callback ever lands.
+        driver.auth.push_back(ScriptAuth::Pending);
+        // The retry must come back for a second attempt on its own.
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("retried-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        let log = driver.log.clone();
+        let run = controller.run_with_driver(&mut driver);
+        tokio::pin!(run);
+        spin!(run, 100);
+        assert_eq!(count_entries(&log, "auth"), 1);
         assert_eq!(
-            log.iter()
-                .filter(|entry| *entry == "auth_present:Background")
-                .count(),
-            1
+            count_entries(&log, "auth_present:Background"),
+            1,
+            "the dark machine still gets its unattended browser probe"
         );
-        assert!(!log.contains(&"auth_present:Foreground".to_string()));
+
+        // The probe budget lapses with the display still dark. The run then
+        // completes on its own: retry, second attempt, connect, UserQuit.
+        (&mut run).await.unwrap();
+
+        assert_eq!(
+            count_entries(&log, "auth"),
+            2,
+            "a dark display must not stop SAML from retrying on its own"
+        );
+        assert!(log
+            .lock()
+            .unwrap()
+            .contains(&"connect:retried-cookie".to_string()));
+        drop(trigger);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3406,7 +3772,9 @@ mod tests {
         let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
         let shutdown = Shutdown::new();
         let trigger = shutdown.clone();
-        let mut controller = controller(initial, shutdown);
+        // Parking on graphics is the opt-in behaviour; by default this reconnect
+        // keeps retrying SAML on its own instead of waiting for a display.
+        let mut controller = controller_interactive_only(initial, shutdown);
         let mut driver = ScriptDriver {
             initial_power: Some(background_power_capabilities()),
             ..ScriptDriver::default()
@@ -3447,7 +3815,9 @@ mod tests {
     async fn interactive_timeout_keeps_listener_for_late_callback() {
         let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
         let mut controller = controller(initial.clone(), Shutdown::new());
-        let mut driver = ScriptDriver::default();
+        let mut driver = ScriptDriver {
+            ..ScriptDriver::default()
+        };
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         driver
             .connects
@@ -3491,23 +3861,6 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&"connect:late-cookie".to_string()));
-    }
-
-    fn count_entries(log: &StdArc<Mutex<Vec<String>>>, entry: &str) -> usize {
-        log.lock().unwrap().iter().filter(|e| *e == entry).count()
-    }
-
-    /// Poll the controller without letting it finish, so a test can observe an
-    /// intermediate state.
-    macro_rules! spin {
-        ($run:expr, $rounds:expr) => {
-            for _ in 0..$rounds {
-                tokio::select! {
-                    result = &mut $run => panic!("controller completed early: {result:?}"),
-                    _ = tokio::task::yield_now() => {}
-                }
-            }
-        };
     }
 
     #[tokio::test(start_paused = true)]
@@ -3560,6 +3913,64 @@ mod tests {
             "the retained launch must complete: {snapshot:?}"
         );
         assert!(snapshot.contains(&"connect:survived-cookie".to_string()));
+    }
+
+    /// A failed foreground launcher prints the URL so the user can open it by
+    /// hand. That manual login is still in flight when the interactive budget
+    /// lapses, so the attempt — and its callback listener — must survive.
+    /// Dropping it here would refuse the very callback the user is producing.
+    #[tokio::test(start_paused = true)]
+    async fn failed_foreground_launch_keeps_listener_for_a_manual_login() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut driver = ScriptDriver {
+            // `open` fails, so only the printed URL can complete this login.
+            fail_browser_launch: true,
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver.auth.push_back(ScriptAuth::PowerThenResult {
+            event: full_power_capabilities(),
+            release: release_rx,
+            result: Ok("manual-cookie".into()),
+        });
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        let log = driver.log.clone();
+        let run = controller.run_with_driver(&mut driver);
+        tokio::pin!(run);
+        spin!(run, 100);
+
+        // Let the interactive budget lapse with the login still unfinished.
+        tokio::select! {
+            result = &mut run => panic!("controller dropped the manual attempt: {result:?}"),
+            _ = tokio::time::advance(SAML_INTERACTIVE_TIMEOUT + Duration::from_secs(1)) => {}
+        }
+        spin!(run, 100);
+        assert_eq!(
+            count_entries(&log, "auth"),
+            1,
+            "the attempt must not be abandoned and retried: {:?}",
+            log.lock().unwrap()
+        );
+
+        // The user finishes in the browser well after the budget lapsed.
+        release_tx.send(()).unwrap();
+        (&mut run).await.unwrap();
+        assert!(
+            log.lock()
+                .unwrap()
+                .contains(&"connect:manual-cookie".to_string()),
+            "the late manual callback must still complete the attempt: {:?}",
+            log.lock().unwrap()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -4309,6 +4720,161 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn transient_setup_stall_on_rebuild_retries_instead_of_exiting() {
+        // Regression test for the route-installation timeout incident: a wedged
+        // /sbin/route batch during the TUN rebuild used to set terminal_error
+        // and exit the process, bypassing the entire reconnect machinery.
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver {
+            // Initial setup succeeds; the rebuild after the IPCP IP change
+            // stalls twice, then succeeds.
+            transient_setup_fail_calls: vec![2, 3],
+            ..ScriptDriver::default()
+        };
+        driver.connects.extend([
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 9)),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 9)),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 9)),
+        ]);
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        let started = tokio::time::Instant::now();
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        // setup: initial + two stalled rebuilds + the successful rebuild.
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.starts_with("setup:"))
+                .count(),
+            4,
+            "{log:?}"
+        );
+        // Each retry reconnects the tunnel first, so three connects.
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.starts_with("connect:"))
+                .count(),
+            3,
+            "{log:?}"
+        );
+        // The stalls must not consume the cookie on re-authentication.
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 0);
+
+        // Every abandoned tunnel is terminated before its retry (two stalls
+        // plus the final user-quit exit), and VPN DNS is withdrawn exactly
+        // once before the first retry — before any subsequent connect.
+        assert_eq!(log.iter().filter(|entry| *entry == "terminate").count(), 3);
+        assert_eq!(
+            log.iter().filter(|entry| *entry == "dns_suspend").count(),
+            1
+        );
+        let second_connect = log
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.starts_with("connect:"))
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("the retry must reconnect");
+        let first_terminate = log
+            .iter()
+            .position(|entry| *entry == "terminate")
+            .expect("the abandoned tunnel must be terminated");
+        let dns_suspend = log
+            .iter()
+            .position(|entry| *entry == "dns_suspend")
+            .expect("VPN DNS must be withdrawn before waiting");
+        assert!(first_terminate < second_connect, "{log:?}");
+        assert!(dns_suspend < second_connect, "{log:?}");
+
+        // The successful handshake must not flatten the backoff: the two
+        // stalls wait 1s then 2s, not 1s twice.
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_setup_stall_at_startup_defers_to_reconnect_loop() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver {
+            transient_setup_fail_calls: vec![1],
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        // setup: the stalled initial attempt, then the rebuild after connect.
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.starts_with("setup:"))
+                .count(),
+            2,
+            "{log:?}"
+        );
+        // The deferred setup must run only after the tunnel is connected.
+        let first_connect = log
+            .iter()
+            .position(|entry| entry.starts_with("connect:"))
+            .expect("must connect");
+        let second_setup = log
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.starts_with("setup:"))
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("must retry the setup");
+        assert!(first_connect < second_setup, "{log:?}");
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 0);
+
+        // A stalled scutil may have applied the DNS key without recording it as
+        // installed, in which case nothing else would ever remove it. The
+        // withdrawal must happen here, before the deferred setup runs.
+        let suspend = log
+            .iter()
+            .position(|entry| entry == "dns_suspend")
+            .expect("startup stall must withdraw VPN DNS");
+        assert!(
+            suspend < second_setup,
+            "DNS must be withdrawn before the deferred setup: {log:?}"
+        );
+    }
+
+    /// A route stall at startup withdraws DNS just as a scutil stall does: the
+    /// caller cannot tell which stage timed out, and `setup_tun`'s own rollback
+    /// shares one deadline with route removal, so it may never reach DNS.
+    #[tokio::test(start_paused = true)]
+    async fn startup_setup_stall_withdraws_dns_before_deferring() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver {
+            transient_setup_fail_calls: vec![1],
+            // The first withdrawal fails, modelling a scutil that is still
+            // wedged. The controller must not record a withdrawal that did not
+            // happen, so it retries rather than assuming DNS is gone.
+            fail_dns_suspend: 1,
+            ..ScriptDriver::default()
+        };
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        assert!(
+            log.iter().filter(|entry| *entry == "dns_suspend").count() >= 1,
+            "the startup stall must attempt a DNS withdrawal: {log:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn data_plane_disconnect_withdraws_vpn_dns_until_tunnel_returns() {
         let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
         let mut controller = controller(initial, Shutdown::new());
@@ -4498,6 +5064,7 @@ mod tests {
                 ssids: vec!["Home".into()],
                 wifi_rx: Some(wifi_rx),
             },
+            false,
         );
         (controller, wifi_tx)
     }
@@ -4569,6 +5136,46 @@ mod tests {
             .map(|(index, _)| index)
             .expect("TUN must be rebuilt on resume");
         assert!(second_connect < second_setup, "{log:?}");
+    }
+
+    /// `cleanup_tun` cannot promise DNS was withdrawn — scutil stalls and fails
+    /// on its own. Recording a withdrawal that did not happen would make
+    /// `suspend_vpn_dns` skip its retry, leaving VPN-only resolvers installed
+    /// for the whole trusted-Wi-Fi suspension and black-holing name resolution.
+    #[tokio::test(start_paused = true)]
+    async fn trusted_wifi_retries_dns_withdrawal_when_cleanup_could_not_remove_it() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let (mut controller, wifi_tx) =
+            trusted_controller(initial, Shutdown::new(), EscalationConfig::default());
+        let mut driver = ScriptDriver {
+            // The teardown's own DNS removal reports failure.
+            fail_cleanup_dns: 1,
+            ..ScriptDriver::default()
+        };
+        driver.connects.extend([
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+            ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)),
+        ]);
+        driver
+            .events
+            .extend([DisconnectReason::TrustedNetwork, DisconnectReason::UserQuit]);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = wifi_tx.send(no_wifi());
+        });
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+
+        let cleanup = log
+            .iter()
+            .position(|entry| entry.starts_with("cleanup:"))
+            .expect("routes/TUN must be cleaned up");
+        // A withdrawal must follow the failed cleanup rather than be assumed.
+        assert!(
+            log.iter().skip(cleanup).any(|entry| entry == "dns_suspend"),
+            "a cleanup that could not remove DNS must be followed by a retry: {log:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

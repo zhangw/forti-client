@@ -96,7 +96,15 @@ pub async fn configure_dns(servers: &[Ipv4Addr], shutdown: &Shutdown) -> Result<
             return Err(FortiError::TunnelError("DNS configuration cancelled".into()));
         }
         result = run_scutil(&scutil_input) => {
-            result.map_err(|e| FortiError::TunnelError(format!("failed to run scutil: {}", e)))?
+            result.map_err(|e| match e.kind() {
+                // scutil wedged on a busy configd — the same transient stall
+                // that can hang /sbin/route during interface churn.
+                std::io::ErrorKind::TimedOut => FortiError::LocalSetupTimedOut(format!(
+                    "scutil DNS configuration timed out after {}s",
+                    SCUTIL_TIMEOUT.as_secs()
+                )),
+                _ => FortiError::TunnelError(format!("failed to run scutil: {}", e)),
+            })?
         }
     };
 

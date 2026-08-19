@@ -36,6 +36,14 @@ struct Cli {
     #[arg(long)]
     saml: bool,
 
+    /// Only re-authenticate via SAML while the display is on, and give the
+    /// browser one unattended attempt per reconnect. The default assumes the
+    /// browser's IdP session is still valid, so a reconnect keeps driving SAML
+    /// on its own — needing a browser is not the same as needing a human, and
+    /// neither is tied to whether the lid is open.
+    #[arg(long = "saml-interactive-only")]
+    saml_interactive_only: bool,
+
     /// Enable TLS key logging to file (for Wireshark debugging)
     #[arg(long)]
     tls_keylog_file: Option<String>,
@@ -332,6 +340,7 @@ async fn main() -> anyhow::Result<()> {
         port: cli.port,
         server_addr: Some(server_addr),
         saml: cli.saml,
+        saml_interactive_only: cli.saml_interactive_only,
         username: cli.username,
         password,
         realm: cli.realm,
