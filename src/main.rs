@@ -59,7 +59,19 @@ struct Cli {
     /// Wi-Fi SSID on which the VPN must stay disconnected (repeatable, exact match)
     #[arg(long = "trusted-wifi", value_name = "SSID")]
     trusted_wifi: Vec<String>,
+
+    /// Mirror logs to this file in addition to the console.
+    ///
+    /// Capturing logs with a shell pipeline instead (`... | tee`) breaks Ctrl+C:
+    /// sudo runs the client in its own pty session, so a terminal-generated
+    /// SIGINT reaches the pipeline but never the client. Writing the file here
+    /// keeps both the console output and a durable log with no pipeline in the
+    /// signal path. Point it at /dev/null to disable.
+    #[arg(long = "log-file", value_name = "PATH", default_value = LOG_FILE_DEFAULT)]
+    log_file: String,
 }
+
+const LOG_FILE_DEFAULT: &str = "/tmp/forti-client.log";
 
 const FORCED_SIGINT_EXIT_CODE: i32 = 130;
 
@@ -98,15 +110,75 @@ fn shutdown_signal_action(signal_number: u8) -> ShutdownSignalAction {
     }
 }
 
+/// Open the log file without ever following a symlink at the final component.
+///
+/// The client normally runs as root and the default path lives in /tmp, which
+/// is world-writable: a symlink planted there would otherwise redirect root's
+/// appends into a file of the attacker's choosing. `O_NOFOLLOW` refuses that at
+/// open time, which — unlike an `is_symlink` check followed by an open — leaves
+/// no window between the test and the use. The mode stays 0644 so the log can
+/// be read (and tailed) without sudo; nothing secret is logged, and session ids
+/// are deliberately kept out of it.
+fn open_log_file(path: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    // A regular file is the only thing worth appending to; a fifo would block
+    // the process on its first log line if nothing is reading.
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Log to the console, and to `log_file` as well when it can be opened.
+///
+/// A log destination that cannot be opened must not stop the VPN from
+/// connecting, so a failure here degrades to console-only and says so.
+fn init_logging(log_file: &str) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let console = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+
+    match open_log_file(log_file) {
+        Ok(file) => {
+            // Colour codes belong on a terminal; in a file they are noise that
+            // every later reader has to strip back out.
+            let to_file = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Arc::new(file));
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(console)
+                .with(to_file)
+                .init();
+        }
+        Err(error) => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(console)
+                .init();
+            tracing::warn!(
+                %error,
+                path = log_file,
+                "Could not open log file; logging to the console only"
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
     let mut cli = Cli::parse();
+    init_logging(&cli.log_file);
 
     let enable_keylog = if let Some(ref path) = cli.tls_keylog_file {
         // Validate the keylog output path before enabling

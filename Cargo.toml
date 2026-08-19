@@ -29,6 +29,8 @@ clap = { version = "4", features = ["derive"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# O_NOFOLLOW when opening the log file as root; see init_logging.
+libc = "0.2"
 
 # Error handling
 thiserror = "2"
