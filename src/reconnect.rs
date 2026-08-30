@@ -70,6 +70,13 @@ const MONITOR_FALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 const WAKE_FALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
 const SAML_BACKGROUND_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const SAML_INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Re-presents allowed after a foreground soft timeout while the display never
+/// cycles. `open` exiting 0 does not prove a tab exists, so a lapsed budget
+/// with no callback most cheaply means the launch never navigated; presenting
+/// again is the same act a person performs on the printed URL. Bounded so a
+/// broken browser cannot loop popups — once spent, the listener stays bound
+/// and the printed URL remains the manual path.
+const MAX_SAME_SESSION_RE_PRESENTS: u32 = 3;
 
 /// Tracks the latest authoritative power capability level while preserving the
 /// existing single-consumer event stream. Unknown capabilities fail open only
@@ -1770,6 +1777,9 @@ impl ReconnectController {
         // full display off→on cycle so the user is not stuck with a stale tab.
         let mut soft_timed_out = false;
         let mut saw_noninteractive = false;
+        // Same-session re-presents spent since the last fresh interactive
+        // epoch; see MAX_SAME_SESSION_RE_PRESENTS.
+        let mut same_session_re_presents: u32 = 0;
         // Whether a browser launch for this attempt ever completed while the
         // machine could actually render one. Only then is there reason to
         // believe a tab exists — and therefore a gateway transaction worth not
@@ -1850,13 +1860,29 @@ impl ReconnectController {
                 }
             }
 
-            // Re-present only on a fresh interactive epoch: the display must
-            // have gone dark and come back. Reachability alone must never
-            // trigger this — it flaps during interface churn, which is exactly
-            // the popup loop the soft timeout exists to avoid.
-            if soft_timed_out && saw_noninteractive && runnable && power.can_interact() {
+            // Re-present on a fresh interactive epoch (display dark→lit), or —
+            // bounded by MAX_SAME_SESSION_RE_PRESENTS — while the display never
+            // cycles at all. A screen that stays lit is exactly the state where
+            // a person can read the printed URL and click it; presenting again
+            // performs that click for them. Reachability alone still never
+            // triggers this — it flaps during interface churn, which is the
+            // popup loop the soft timeout exists to avoid.
+            let fresh_epoch =
+                soft_timed_out && saw_noninteractive && runnable && power.can_interact();
+            let same_session = soft_timed_out
+                && !saw_noninteractive
+                && runnable
+                && power.can_interact()
+                && same_session_re_presents < MAX_SAME_SESSION_RE_PRESENTS;
+            if fresh_epoch || same_session {
                 soft_timed_out = false;
                 saw_noninteractive = false;
+                if fresh_epoch {
+                    // A genuine epoch change is a fresh human presence.
+                    same_session_re_presents = 0;
+                } else {
+                    same_session_re_presents += 1;
+                }
                 presentation = Some(SamlBrowserPresentation::Foreground);
                 launch = Some(attempt.present(SamlBrowserPresentation::Foreground));
                 presentation_started = false;
@@ -1864,11 +1890,20 @@ impl ReconnectController {
                 deadline_started = None;
                 self.policy.on_saml_presented_again();
                 self.state = ConnectionState::Authenticating;
-                info!(
-                    state = ?self.state,
-                    saml_attempt = self.policy.saml_attempts(),
-                    "New interactive session; re-presenting the existing SAML attempt"
-                );
+                if fresh_epoch {
+                    info!(
+                        state = ?self.state,
+                        saml_attempt = self.policy.saml_attempts(),
+                        "New interactive session; re-presenting the existing SAML attempt"
+                    );
+                } else {
+                    info!(
+                        state = ?self.state,
+                        saml_attempt = self.policy.saml_attempts(),
+                        re_presents_left = MAX_SAME_SESSION_RE_PRESENTS - same_session_re_presents,
+                        "SAML still pending in the same interactive session; presenting again"
+                    );
+                }
             }
 
             // Arm only while reachability is the thing blocking progress. A
@@ -4003,7 +4038,9 @@ mod tests {
         let power_tx = tap_rx.await.expect("power sender");
         assert_eq!(count_entries(&log, "auth_present:Foreground"), 1);
 
-        // The interactive budget lapses with the display still lit.
+        // The interactive budget lapses with the display still lit. A person
+        // can read the printed URL in this state, so the client performs that
+        // click itself — bounded, never looping.
         tokio::select! {
             result = &mut run => panic!("controller completed early: {result:?}"),
             _ = tokio::time::advance(SAML_INTERACTIVE_TIMEOUT + Duration::from_secs(1)) => {}
@@ -4011,27 +4048,48 @@ mod tests {
         spin!(run, 100);
         assert_eq!(
             count_entries(&log, "auth_present:Foreground"),
-            1,
-            "a lit display must not re-present on its own"
+            2,
+            "a lit display must re-present once per lapsed budget: {:?}",
+            log.lock().unwrap()
         );
         assert_eq!(count_entries(&log, "auth"), 1);
 
-        // Display off, then on: a genuinely new interactive session.
+        // Every further lapsed budget spends one same-session re-present, until
+        // the bound stops the popup loop and the printed URL is all that is
+        // left. The listener stays bound throughout.
+        for expected in 3..=(MAX_SAME_SESSION_RE_PRESENTS as usize + 1) {
+            tokio::select! {
+                result = &mut run => panic!("controller completed early: {result:?}"),
+                _ = tokio::time::advance(SAML_INTERACTIVE_TIMEOUT + Duration::from_secs(1)) => {}
+            }
+            spin!(run, 100);
+            assert_eq!(count_entries(&log, "auth_present:Foreground"), expected);
+        }
+        tokio::select! {
+            result = &mut run => panic!("controller completed early: {result:?}"),
+            _ = tokio::time::advance(SAML_INTERACTIVE_TIMEOUT + Duration::from_secs(1)) => {}
+        }
+        spin!(run, 100);
+        assert_eq!(
+            count_entries(&log, "auth_present:Foreground"),
+            MAX_SAME_SESSION_RE_PRESENTS as usize + 1,
+            "the same-session bound must stop the re-presents: {:?}",
+            log.lock().unwrap()
+        );
+
+        // Display off, then on: a genuinely new interactive session. It both
+        // re-presents and renews the same-session budget.
         power_tx
             .send(PowerEvent::Capabilities(background_power_capabilities()))
             .unwrap();
         spin!(run, 20);
-        assert_eq!(
-            count_entries(&log, "auth_present:Foreground"),
-            1,
-            "losing graphics must not re-present"
-        );
+        let before_display_cycle = count_entries(&log, "auth_present:Foreground");
         power_tx.send(full_power_capabilities()).unwrap();
         spin!(run, 20);
 
         assert_eq!(
             count_entries(&log, "auth_present:Foreground"),
-            2,
+            before_display_cycle + 1,
             "a new interactive session must re-present: {:?}",
             log.lock().unwrap()
         );
