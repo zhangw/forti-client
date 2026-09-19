@@ -1,5 +1,6 @@
 //! launchd supervisor, user-session browser bridge, and authenticated local control.
 //! The existing VPN stays in a child process so monitor threads have its lifetime.
+use crate::diagnostics::{self, ErrorThrottle, Resources};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -7,6 +8,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -74,8 +76,18 @@ enum Request {
     Resume {},
     Reconnect {},
     Authenticate {},
-    Logs {},
-    Poll {},
+    Logs {
+        #[serde(default)]
+        daemon: bool,
+    },
+    Poll {
+        #[serde(default)]
+        resources: Option<Resources>,
+    },
+    Resources {
+        token: String,
+        resources: Resources,
+    },
     BrowserDone {
         id: u64,
         success: bool,
@@ -107,6 +119,26 @@ pub struct Status {
     pub agent_present: bool,
     pub last_error: Option<String>,
     pub retry_in_seconds: u64,
+    #[serde(default)]
+    pub resources: ResourceStatus,
+    #[serde(default)]
+    pub control: ControlHealth,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourceStatus {
+    pub daemon: Option<Resources>,
+    pub worker: Option<Resources>,
+    pub agent: Option<Resources>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ControlHealth {
+    pub state: String,
+    pub accept_errors: u64,
+    pub restarts: u64,
+    pub last_errno: Option<i32>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -190,8 +222,8 @@ fn console_uid() -> Option<u32> {
 
 fn authorized(uid: u32, owner: u32, request: &Request) -> bool {
     match request {
-        Request::State { .. } | Request::Browser { .. } => uid == 0,
-        Request::Poll {} | Request::BrowserDone { .. } => {
+        Request::State { .. } | Request::Browser { .. } | Request::Resources { .. } => uid == 0,
+        Request::Poll { .. } | Request::BrowserDone { .. } => {
             uid == owner && console_uid() == Some(owner)
         }
         _ => uid == 0 || uid == owner,
@@ -249,6 +281,35 @@ pub async fn report_state(state: &str) {
     }
 }
 
+pub fn start_worker_diagnostics() {
+    let initial = diagnostics::log_startup("worker");
+    let Ok(token) = std::env::var("FORTI_SERVICE_TOKEN") else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut resources = initial;
+        let mut errors = ErrorThrottle::default();
+        loop {
+            if let Err(error) = request(Request::Resources {
+                token: token.clone(),
+                resources: resources.clone(),
+            })
+            .await
+            {
+                if errors.allow() {
+                    tracing::warn!(%error, operation = "resource_report", "Supervisor resource report failed");
+                }
+            } else {
+                errors.reset();
+            }
+            tokio::time::sleep(diagnostics::SAMPLE_INTERVAL).await;
+            let current = Resources::current();
+            diagnostics::log_resource_change(&resources, &current);
+            resources = current;
+        }
+    });
+}
+
 pub async fn open_browser(url: &str, background: bool) -> std::io::Result<()> {
     let token = std::env::var("FORTI_SERVICE_TOKEN").map_err(std::io::Error::other)?;
     request(Request::Browser {
@@ -267,11 +328,59 @@ struct Incoming {
     reply: oneshot::Sender<Response>,
 }
 
-async fn accept_requests(listener: UnixListener, tx: mpsc::Sender<Incoming>) {
-    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
+fn accept_retry_delay(error: &std::io::Error, failures: u32) -> Option<Duration> {
+    match error.raw_os_error() {
+        Some(libc::EINTR | libc::EAGAIN | libc::ECONNABORTED) => Some(Duration::from_millis(50)),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+            Some(Duration::from_millis((250u64 << failures.min(5)).min(5000)))
+        }
+        _ => None,
+    }
+}
+
+async fn accept_requests<F, Fut>(
+    mut accept: F,
+    tx: mpsc::Sender<Incoming>,
+    slots: Arc<tokio::sync::Semaphore>,
+    health: Arc<Mutex<ControlHealth>>,
+    errors: Arc<Mutex<ErrorThrottle>>,
+) -> std::io::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<UnixStream>>,
+{
+    let mut failures = 0u32;
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            break;
+        let mut stream = match accept().await {
+            Ok(stream) => {
+                if failures > 0 {
+                    tracing::info!("Control socket accept recovered");
+                }
+                failures = 0;
+                errors.lock().unwrap().reset();
+                health.lock().unwrap().state = "accepting".into();
+                stream
+            }
+            Err(error) => {
+                {
+                    let mut state = health.lock().unwrap();
+                    state.state = "backoff".into();
+                    state.accept_errors = state.accept_errors.saturating_add(1);
+                    state.last_errno = error.raw_os_error();
+                    state.last_error = Some(error.to_string());
+                }
+                if errors.lock().unwrap().allow() {
+                    tracing::error!(operation = "accept", errno = ?error.raw_os_error(), %error,
+                        resources = %serde_json::to_string(&Resources::current()).unwrap_or_default(),
+                        "Control socket accept failed");
+                }
+                let Some(delay) = accept_retry_delay(&error, failures) else {
+                    return Err(error);
+                };
+                failures = failures.saturating_add(1);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
         };
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             continue;
@@ -307,6 +416,101 @@ async fn accept_requests(listener: UnixListener, tx: mpsc::Sender<Incoming>) {
                 _ = tokio::time::sleep(Duration::from_secs(11)) => {},
             }
         });
+    }
+}
+
+// Own the listener outside the task so a panic/error cannot silently disable IPC.
+struct ControlServer {
+    listener: Arc<UnixListener>,
+    tx: mpsc::Sender<Incoming>,
+    slots: Arc<tokio::sync::Semaphore>,
+    health: Arc<Mutex<ControlHealth>>,
+    accept_errors: Arc<Mutex<ErrorThrottle>>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    errors: ErrorThrottle,
+}
+
+impl ControlServer {
+    fn spawn_task(
+        listener: Arc<UnixListener>,
+        tx: mpsc::Sender<Incoming>,
+        slots: Arc<tokio::sync::Semaphore>,
+        health: Arc<Mutex<ControlHealth>>,
+        errors: Arc<Mutex<ErrorThrottle>>,
+        delay: Duration,
+    ) -> tokio::task::JoinHandle<std::io::Result<()>> {
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            accept_requests(
+                || async { listener.accept().await.map(|(s, _)| s) },
+                tx,
+                slots,
+                health,
+                errors,
+            )
+            .await
+        })
+    }
+
+    fn start(listener: UnixListener, tx: mpsc::Sender<Incoming>) -> Self {
+        let listener = Arc::new(listener);
+        let slots = Arc::new(tokio::sync::Semaphore::new(32));
+        let health = Arc::new(Mutex::new(ControlHealth {
+            state: "starting".into(),
+            ..ControlHealth::default()
+        }));
+        let accept_errors = Arc::new(Mutex::new(ErrorThrottle::default()));
+        let task = Self::spawn_task(
+            listener.clone(),
+            tx.clone(),
+            slots.clone(),
+            health.clone(),
+            accept_errors.clone(),
+            Duration::ZERO,
+        );
+        Self {
+            listener,
+            tx,
+            slots,
+            health,
+            accept_errors,
+            task,
+            errors: ErrorThrottle::default(),
+        }
+    }
+
+    async fn supervise(&mut self) {
+        if !self.task.is_finished() {
+            return;
+        }
+        let result = (&mut self.task).await;
+        if self.errors.allow() {
+            tracing::error!(
+                ?result,
+                operation = "control_task",
+                "Control task exited; restarting after one second"
+            );
+        }
+        {
+            let mut health = self.health.lock().unwrap();
+            health.state = "restarting".into();
+            health.restarts = health.restarts.saturating_add(1);
+            health.last_error = Some(format!("control task exited: {result:?}"));
+        }
+        self.task = Self::spawn_task(
+            self.listener.clone(),
+            self.tx.clone(),
+            self.slots.clone(),
+            self.health.clone(),
+            self.accept_errors.clone(),
+            Duration::from_secs(1),
+        );
+    }
+}
+
+impl Drop for ControlServer {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -363,6 +567,7 @@ fn spawn_worker(config: &Config, token: &str, foreground: bool) -> Result<Child>
     let mut stderr = child.stderr.take().context("worker stderr")?;
     tokio::spawn(async move {
         let mut buffer = [0u8; 4096];
+        let mut errors = ErrorThrottle::default();
         while let Ok(count) = stderr.read(&mut buffer).await {
             if count == 0 {
                 break;
@@ -380,7 +585,11 @@ fn spawn_worker(config: &Config, token: &str, foreground: bool) -> Result<Child>
                 Ok(())
             })();
             if let Err(e) = result {
-                eprintln!("VPN log write failed: {e}");
+                if errors.allow() {
+                    tracing::error!(operation = "worker_log_write", error = %e, "VPN log write failed");
+                }
+            } else {
+                errors.reset();
             }
         }
     });
@@ -390,6 +599,11 @@ fn spawn_worker(config: &Config, token: &str, foreground: bool) -> Result<Child>
 fn begin_stop(child: &Option<Child>, deadline: &mut Option<Instant>) {
     if deadline.is_none() {
         if let Some(pid) = child.as_ref().and_then(|c| c.id()) {
+            tracing::info!(
+                worker_pid = pid,
+                operation = "worker_stop",
+                "Stopping VPN worker"
+            );
             unsafe {
                 libc::kill(pid as i32, libc::SIGTERM);
             }
@@ -406,6 +620,7 @@ pub async fn daemon() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("service requires root");
     }
+    let initial_resources = diagnostics::log_startup("daemon");
     let _lock = lock(&format!("{DIRECTORY}/daemon.lock"))?;
     validate_root_file(CONFIG)?;
     validate_root_file(INTENT)?;
@@ -421,10 +636,12 @@ pub async fn daemon() -> Result<()> {
     }
     std::fs::set_permissions(runtime, std::fs::Permissions::from_mode(0o755))?;
     let _ = std::fs::remove_file(SOCKET);
-    let listener = UnixListener::bind(SOCKET)?;
+    let listener = UnixListener::bind(SOCKET).inspect_err(|error| {
+        tracing::error!(operation = "control_bind", errno = ?error.raw_os_error(), %error, "Control socket bind failed");
+    })?;
     std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o666))?;
     let (tx, mut rx) = mpsc::channel(32);
-    let accept = tokio::spawn(accept_requests(listener, tx));
+    let mut control = ControlServer::start(listener, tx);
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -439,6 +656,9 @@ pub async fn daemon() -> Result<()> {
     let mut cleanup_needed = true;
     let mut needs_attention: Option<String> = None;
     let mut foreground = false;
+    let mut next_sample = Instant::now() + diagnostics::SAMPLE_INTERVAL;
+    let mut cleanup_errors = ErrorThrottle::default();
+    let mut spawn_errors = ErrorThrottle::default();
     let mut status = Status {
         desired: if connected { "connected" } else { "paused" }.into(),
         state: "Starting".into(),
@@ -447,8 +667,23 @@ pub async fn daemon() -> Result<()> {
         agent_present: false,
         last_error: None,
         retry_in_seconds: 0,
+        resources: ResourceStatus {
+            daemon: Some(initial_resources),
+            ..ResourceStatus::default()
+        },
+        control: ControlHealth::default(),
     };
     loop {
+        control.supervise().await;
+        status.control = control.health.lock().unwrap().clone();
+        if Instant::now() >= next_sample {
+            let current = Resources::current();
+            if let Some(ref previous) = status.resources.daemon {
+                diagnostics::log_resource_change(previous, &current);
+            }
+            status.resources.daemon = Some(current);
+            next_sample = Instant::now() + diagnostics::SAMPLE_INTERVAL;
+        }
         status.agent_present = console_uid() == Some(config.uid)
             && last_agent.is_some_and(|t| t.elapsed() < Duration::from_secs(30));
         status.worker_pid = child.as_ref().and_then(|c| c.id());
@@ -464,7 +699,10 @@ pub async fn daemon() -> Result<()> {
                 if !authorized(uid, config.uid, &req) { let _ = reply.send(error("unauthorized user/session")); continue; }
                 let mut response = Response::default();
                 match req {
-                    Request::Status {} => response.status = Some(status.clone()),
+                    Request::Status {} => {
+                        status.control = control.health.lock().unwrap().clone();
+                        response.status = Some(status.clone());
+                    },
                     Request::Pause {} | Request::Resume {} => {
                         let desired = matches!(req, Request::Resume {});
                         match write_intent(Path::new(INTENT), desired) {
@@ -481,8 +719,9 @@ pub async fn daemon() -> Result<()> {
                         if !connected { response = error("paused; run forti-client ctl resume first"); }
                         else { begin_stop(&child, &mut stopping); pending = None; next_start = Instant::now(); needs_attention = None; foreground = matches!(req, Request::Authenticate {}); }
                     },
-                    Request::Poll {} => {
+                    Request::Poll { resources } => {
                         last_agent = Some(Instant::now());
+                        if let Some(resources) = resources { status.resources.agent = Some(resources); }
                         if let Some(p) = pending.as_mut() {
                             if !p.delivered && !p.reply.is_closed() && p.expires > Instant::now() && stopping.is_none() && connected {
                                 response.browser = Some(p.value.clone()); p.delivered = true;
@@ -503,6 +742,11 @@ pub async fn daemon() -> Result<()> {
                             status.state = state;
                         }
                     },
+                    Request::Resources { token: supplied, resources } => {
+                        if supplied != token || child.as_ref().and_then(|c| c.id()) != Some(resources.pid) {
+                            response = error("stale worker resource report");
+                        } else { status.resources.worker = Some(resources); }
+                    },
                     Request::Browser { token: supplied, url, background } => {
                         if supplied != token || child.is_none() || stopping.is_some() || !connected || !status.agent_present || url != config.saml_url() {
                             response = error("browser request has no active authorized session");
@@ -511,9 +755,10 @@ pub async fn daemon() -> Result<()> {
                             continue;
                         }
                     },
-                    Request::Logs {} => {
+                    Request::Logs { daemon } => {
                         use std::io::{Read, Seek, SeekFrom};
-                        match File::open(LOG) {
+                        let path = if daemon { "/Library/Logs/FortiClient/daemon.log" } else { LOG };
+                        match File::open(path) {
                             Ok(mut f) => {
                                 let len = f.metadata()?.len(); f.seek(SeekFrom::Start(len.saturating_sub(4096)))?;
                                 let mut buf = Vec::new(); f.read_to_end(&mut buf)?;
@@ -542,6 +787,8 @@ pub async fn daemon() -> Result<()> {
             }
             if let Some(exit) = c.try_wait()? {
                 let intentional = stopping.take().is_some();
+                tracing::info!(worker_pid = status.worker_pid, %exit, intentional, state = %status.state,
+                    "VPN worker exited");
                 if !intentional {
                     needs_attention = worker_exit_attention(&status.state);
                     status.last_error = Some(format!(
@@ -556,6 +803,7 @@ pub async fn daemon() -> Result<()> {
                 }
                 child = None;
                 status.worker_pid = None;
+                status.resources.worker = None;
                 pending = None;
                 cleanup_needed = true;
             }
@@ -566,8 +814,18 @@ pub async fn daemon() -> Result<()> {
         if child.is_none() {
             if cleanup_needed {
                 match cleanup().await {
-                    Ok(()) => cleanup_needed = false,
+                    Ok(()) => {
+                        tracing::info!(
+                            operation = "dns_cleanup",
+                            "Post-worker DNS cleanup complete"
+                        );
+                        cleanup_errors.reset();
+                        cleanup_needed = false;
+                    }
                     Err(e) => {
+                        if cleanup_errors.allow() {
+                            tracing::error!(operation = "dns_cleanup", error = %e, "Post-worker cleanup failed; retrying");
+                        }
                         status.state = "CleanupFailed".into();
                         status.last_error = Some(e.to_string());
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -591,11 +849,22 @@ pub async fn daemon() -> Result<()> {
                 token = format!("{:032x}", rand::random::<u128>());
                 match spawn_worker(&config, &token, foreground) {
                     Ok(c) => {
+                        tracing::info!(
+                            worker_pid = c.id(),
+                            operation = "worker_spawn",
+                            "VPN worker started"
+                        );
+                        spawn_errors.reset();
                         child = Some(c);
                         foreground = false;
                         status.state = "Starting".into();
                     }
                     Err(e) => {
+                        if spawn_errors.allow() {
+                            tracing::error!(operation = "worker_spawn", error = %e,
+                                errno = ?e.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error()),
+                                "VPN worker spawn failed; retrying in 30 seconds");
+                        }
                         status.last_error = Some(e.to_string());
                         next_start = Instant::now() + Duration::from_secs(30);
                     }
@@ -603,7 +872,7 @@ pub async fn daemon() -> Result<()> {
             }
         }
     }
-    accept.abort();
+    drop(control);
     let _ = std::fs::remove_file(SOCKET);
     Ok(())
 }
@@ -612,24 +881,57 @@ pub async fn agent() -> Result<()> {
     if unsafe { libc::geteuid() } == 0 {
         bail!("agent must run as the logged-in user");
     }
+    let mut resources = diagnostics::log_startup("agent");
+    let mut next_sample = Instant::now() + diagnostics::SAMPLE_INTERVAL;
+    let mut errors = ErrorThrottle::default();
+    let mut disconnected = false;
     loop {
-        if let Ok(response) = request(Request::Poll {}).await {
-            if let Some(browser) = response.browser {
-                let mut cmd = Command::new("/usr/bin/open");
-                if browser.background {
-                    cmd.arg("-g");
+        if Instant::now() >= next_sample {
+            let current = Resources::current();
+            diagnostics::log_resource_change(&resources, &current);
+            resources = current;
+            next_sample = Instant::now() + diagnostics::SAMPLE_INTERVAL;
+        }
+        match request(Request::Poll {
+            resources: Some(resources.clone()),
+        })
+        .await
+        {
+            Ok(response) => {
+                if disconnected {
+                    tracing::info!("Supervisor connection recovered");
                 }
-                let result = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    cmd.arg(&browser.url).kill_on_drop(true).status(),
-                )
-                .await;
-                let success = matches!(result, Ok(Ok(s)) if s.success());
-                let _ = request(Request::BrowserDone {
-                    id: browser.id,
-                    success,
-                })
-                .await;
+                disconnected = false;
+                errors.reset();
+                if let Some(browser) = response.browser {
+                    let mut cmd = Command::new("/usr/bin/open");
+                    if browser.background {
+                        cmd.arg("-g");
+                    }
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        cmd.arg(&browser.url).kill_on_drop(true).status(),
+                    )
+                    .await;
+                    let success = matches!(result, Ok(Ok(s)) if s.success());
+                    if !success {
+                        tracing::warn!(
+                            operation = "browser_open",
+                            "Browser launch failed or timed out"
+                        );
+                    }
+                    let _ = request(Request::BrowserDone {
+                        id: browser.id,
+                        success,
+                    })
+                    .await;
+                }
+            }
+            Err(error) => {
+                disconnected = true;
+                if errors.allow() {
+                    tracing::warn!(operation = "agent_poll", %error, "Supervisor unavailable");
+                }
             }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -637,13 +939,17 @@ pub async fn agent() -> Result<()> {
 }
 
 pub async fn control(args: &[String]) -> Result<()> {
-    const USAGE: &str = "usage: forti-client ctl status [--json] | pause | resume | reconnect | authenticate | logs";
+    const USAGE: &str = "usage: forti-client ctl status [--json] | pause | resume | reconnect | authenticate | logs [--daemon]";
     let command = args.first().map(String::as_str).unwrap_or("status");
     if args.len() == 1 && matches!(command, "--help" | "-h" | "help") {
         println!("{USAGE}");
         return Ok(());
     }
-    if args.len() > 2 || (args.len() == 2 && (command != "status" || args[1] != "--json")) {
+    if args.len() > 2
+        || (args.len() == 2
+            && !((command == "status" && args[1] == "--json")
+                || (command == "logs" && args[1] == "--daemon")))
+    {
         bail!("invalid control arguments");
     }
     let value = match command {
@@ -652,7 +958,9 @@ pub async fn control(args: &[String]) -> Result<()> {
         "resume" => Request::Resume {},
         "reconnect" => Request::Reconnect {},
         "authenticate" => Request::Authenticate {},
-        "logs" => Request::Logs {},
+        "logs" => Request::Logs {
+            daemon: args.get(1).is_some_and(|arg| arg == "--daemon"),
+        },
         _ => bail!("{USAGE}"),
     };
     let response = request(value).await?;
@@ -688,6 +996,122 @@ pub async fn control(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn fd_exhaustion_backs_off_then_serves_a_real_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (mut client, stream) = UnixStream::pair().unwrap();
+        write_message(&mut client, &Request::Status {})
+            .await
+            .unwrap();
+        let mut outcomes = std::collections::VecDeque::from([
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+            Err(std::io::Error::from_raw_os_error(libc::ENFILE)),
+            Ok(stream),
+        ]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let health = Arc::new(Mutex::new(ControlHealth::default()));
+        let (tx, mut rx) = mpsc::channel(32);
+        let task = tokio::spawn(accept_requests(
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let outcome = outcomes.pop_front();
+                async move {
+                    match outcome {
+                        Some(result) => result,
+                        None => std::future::pending().await,
+                    }
+                }
+            },
+            tx,
+            Arc::new(tokio::sync::Semaphore::new(32)),
+            health.clone(),
+            Arc::new(Mutex::new(ErrorThrottle::default())),
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(health.lock().unwrap().state, "backoff");
+        tokio::time::advance(Duration::from_millis(249)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "must not busy-loop on EMFILE"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let incoming = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(incoming.request, Request::Status {}));
+        incoming.reply.send(Response::default()).unwrap();
+        let response: Response = read_message(&mut client).await.unwrap();
+        assert!(response.error.is_none());
+        let state = health.lock().unwrap();
+        assert_eq!(state.state, "accepting");
+        assert_eq!(state.accept_errors, 2);
+        assert_eq!(state.last_errno, Some(libc::ENFILE));
+        assert_eq!(
+            accept_retry_delay(&std::io::Error::from_raw_os_error(libc::EMFILE), 100),
+            Some(Duration::from_secs(5))
+        );
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_recovers_failed_and_panicked_accept_tasks() {
+        let path = format!("/private/tmp/forti-control-{}.sock", rand::random::<u64>());
+        let listener = UnixListener::bind(&path).unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut server = ControlServer::start(listener, tx);
+        for (index, panic) in [false, true].into_iter().enumerate() {
+            server.task.abort();
+            let _ = (&mut server.task).await;
+            server.task = tokio::spawn(async move {
+                assert!(!panic, "injected accept task panic");
+                Err(std::io::Error::from_raw_os_error(libc::EBADF))
+            });
+            tokio::task::yield_now().await;
+            server.supervise().await;
+            assert_eq!(server.health.lock().unwrap().state, "restarting");
+            assert_eq!(server.health.lock().unwrap().restarts, index as u64 + 1);
+            let mut client = UnixStream::connect(&path).await.unwrap();
+            write_message(&mut client, &Request::Status {})
+                .await
+                .unwrap();
+            let incoming = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            incoming.reply.send(Response::default()).unwrap();
+            let response: Response = read_message(&mut client).await.unwrap();
+            assert!(response.error.is_none());
+            assert_eq!(server.health.lock().unwrap().state, "accepting");
+        }
+        drop(server);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn resource_reporting_is_privileged_and_old_messages_still_decode() {
+        let req = Request::Resources {
+            token: "test".into(),
+            resources: Resources::current(),
+        };
+        assert!(!authorized(501, 501, &req));
+        assert!(authorized(0, 501, &req));
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"command":"poll"}"#).unwrap(),
+            Request::Poll { resources: None }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"command":"logs"}"#).unwrap(),
+            Request::Logs { daemon: false }
+        ));
+    }
     #[test]
     fn protocol_rejects_unknown_fields_and_commands() {
         assert!(serde_json::from_str::<Request>(r#"{"command":"pause","shell":"bad"}"#).is_err());

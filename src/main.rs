@@ -194,14 +194,28 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("configuration path required"))?,
             )
         }
-        Some("service") => return forti_client::service::daemon().await,
-        Some("agent") => return forti_client::service::agent().await,
+        Some("service") | Some("agent") => {
+            let daemon = args[1] == "service";
+            forti_client::diagnostics::init_logging(if daemon { "daemon" } else { "agent" });
+            let result = if daemon {
+                forti_client::service::daemon().await
+            } else {
+                forti_client::service::agent().await
+            };
+            if let Err(ref error) = result {
+                tracing::error!(operation = "process_exit", error = %error,
+                    errno = ?error.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error()),
+                    "Managed process failed");
+            }
+            return result;
+        }
         Some("ctl") => return forti_client::service::control(&args[2..]).await,
         _ => {}
     }
     let mut cli = Cli::parse();
     let _instance = forti_client::service::worker_lock()?;
     init_logging(&cli.log_file);
+    forti_client::service::start_worker_diagnostics();
 
     let enable_keylog = if let Some(ref path) = cli.tls_keylog_file {
         // Validate the keylog output path before enabling

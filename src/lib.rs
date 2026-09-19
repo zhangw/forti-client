@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod diagnostics;
 pub mod error;
 pub mod network_monitor;
 pub mod power_monitor;

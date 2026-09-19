@@ -10,6 +10,7 @@
 vpn='/Library/Application Support/FortiClient/forti-client'
 "$vpn" ctl status
 "$vpn" ctl logs
+"$vpn" ctl logs --daemon
 "$vpn" ctl pause
 "$vpn" ctl resume
 "$vpn" ctl reconnect
@@ -49,6 +50,8 @@ python3 scripts/prepare-service.py
 | `/var/run/forti-client/control.sock` | Unix socket，逐请求核验真实 UID |
 | `/var/run/forti-client-vpn.lock` | 前台/工作进程共享的全机独占锁 |
 | `/Library/Logs/FortiClient/vpn.log`、`.1` | 每份约 5 MiB 上限的轮转工作进程日志 |
+| `/Library/Logs/FortiClient/daemon.log`、`.1` | Daemon 启动、控制接口错误、worker 启停及清理日志 |
+| `~/Library/Logs/FortiClient/agent.log`、`.1` | 登录用户的 Agent 启动、IPC 失联/恢复及浏览器启动失败日志 |
 | `/Library/Logs/FortiClient/smoke-report.json` | 最近一次冒烟结果 |
 
 需要 macOS 管理员授权。若系统后台项目权限被禁用，需要用户在系统设置恢复；程序不绕过该设置。传统 launchd 注册已经实现，SMAppService 的 App 签名/打包没有实现。
@@ -62,6 +65,27 @@ Daemon 和 Agent 均设置 KeepAlive，launchd 启动节流为 30 秒。工作�
 登录代理每秒登记一次；30 秒失联停止 VPN，控制台 UID 变化更快触发停止。会话边界的实际注销、快速切换及合盖行为需要在相应使用场景验证；冒烟不自动注销当前桌面。Agent 能重新连接重启后的 Daemon。KeepAlive 不检测活进程挂死；控制请求超时会报告服务无响应。
 
 ## 冒烟和诊断
+
+Daemon、Agent、worker 各自在启动时记录版本、PID/PPID、UID/EUID、工作目录、PATH、代理环境变量的存在性，以及实际 FD 限额和使用量。不记录完整环境变量、控制 token、密码或 cookie。代理变量存在不代表 VPN 会使用代理。
+
+`ctl status --json` 新增以下诊断信息，无需 sudo：
+
+- `resources.daemon/worker/agent`：进程自行采集的 `pid`、`sampled_at`（Unix 秒）、`fd_count`、`limits.soft/hard`；每 60 秒更新一次。`fd_count=null` 或 `limits=null` 表示未知，原因见 `fd_error/limits_error`；已知 `limits` 内的 `soft/hard=null` 表示 unlimited。没有 worker 时，`resources.worker=null`。
+- `control.state`：`starting`、`accepting`、`backoff` 或 `restarting`；`accept_errors` 和 `restarts` 是本次 Daemon 生命周期累计值。`last_errno/last_error` 保留最近历史错误，恢复后不清零，以 `state` 判断当前健康状态。
+
+FD 达到软限额 80% 或读取状态从正常变为未知时记录资源状态变化；恢复后也记录。不会调整进程或系统的资源限额。`accept()` 遇到 EMFILE/ENFILE 等资源不足会从 250 ms 退避至最多 5 秒，重复错误最多每 30 秒记录一次；接收任务返回错误或 panic 后，由监督器延迟 1 秒重新启动，保留监听 socket。控制接口完全不可达时，巡检报告连接失败，不能依赖不可达接口返回自己的健康状态。
+
+Daemon/Agent 日志为 0600，每份最多 5 MiB，保留一份 `.1`。文件初始化、写入或轮转失败时尝试限频写入 macOS 系统日志；系统资源耗尽时该兜底也不保证成功。worker 日志继续由 Daemon 轮转。安装升级时应一起重载 Daemon 和 Agent，旧版服务没有资源字段，不能据此判断资源健康。
+
+低成本巡检（替换为实际目标域名）：
+
+```sh
+python3 scripts/probe-connectivity.py vpn-app.example.com
+```
+
+脚本默认每 60 秒检查一次 DNS、路由、TCP 443、控制状态及资源快照。不需要 sudo，但运行环境必须允许本地网络及路由查询。首次、异常变化、恢复或 Daemon/worker PID 变化时输出 JSON；相同异常不重复输出。FD 达到 80%、快照超过 180 秒、采集失败或旧服务缺少字段都会明确报告。`ok` 是综合结果，`connectivity_ok` 单独表示路由查询/TCP 连接结果。TCP 成功不代表 TLS、HTTP 或页面依赖正常。DNS 解析由系统 resolver 负责，耗时超出间隔时不会并发堆积新一轮。
+
+相关回归检查：`cargo test --locked --lib` 和 `python3 -m unittest discover -s scripts -p 'test_probe_connectivity.py'`。控制接口故障测试通过注入错误模拟 FD 耗尽和任务 panic，不改变系统 FD 上限，不接触已安装 VPN。
 
 `sudo /usr/bin/python3 scripts/smoke-service.py` 会短暂断开 VPN、故意 SIGKILL 托管工作进程和 Daemon。仅在允许中断时运行。它验证：
 
