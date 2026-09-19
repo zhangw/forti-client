@@ -595,6 +595,10 @@ trait ControllerDriver: Send {
     type Lcp: Send;
     type SamlAttempt: ControllerSamlAttempt;
 
+    fn report_state<'a>(&'a mut self, state: &'a str) -> DriverFuture<'a, ()> {
+        Box::pin(crate::service::report_state(state))
+    }
+
     fn setup_tun<'a>(
         &'a mut self,
         config: &'a TunnelConfig,
@@ -1080,6 +1084,7 @@ impl ReconnectController {
 
         let shutdown = self.shutdown.clone();
         let mut terminal_error: Option<FortiError> = None;
+        let mut terminal_auth_failure = false;
         let mut pending_config_refresh = false;
         let mut background_saml_attempted = false;
 
@@ -1128,6 +1133,7 @@ impl ReconnectController {
 
             if pending_config_refresh {
                 self.state = ConnectionState::RefreshingConfig;
+                crate::service::report_state("RefreshingConfig").await;
                 match interruptible(
                     driver.fetch_tunnel_config(&self.auth_params, &self.svpn_cookie),
                     &shutdown,
@@ -1251,6 +1257,7 @@ impl ReconnectController {
                 let auth_gate_open = self.policy.next_auth_attempt();
                 debug_assert!(auth_gate_open);
                 self.state = ConnectionState::Authenticating;
+                crate::service::report_state("Authenticating").await;
                 info!(
                     state = ?self.state,
                     auth_requirement = ?self.policy.auth_requirement(),
@@ -1357,6 +1364,7 @@ impl ReconnectController {
                             "Re-authentication failed"
                         );
                         if saml_failure_is_terminal(failure_kind) {
+                            terminal_auth_failure = true;
                             terminal_error = Some(auth_error);
                             break 'reconnect;
                         }
@@ -1426,6 +1434,7 @@ impl ReconnectController {
             }
 
             self.state = ConnectionState::EstablishingTunnel;
+            crate::service::report_state("EstablishingTunnel").await;
             self.policy.on_connect_attempt();
             info!(
                 state = ?self.state,
@@ -1621,6 +1630,7 @@ impl ReconnectController {
 
             info!("Tunnel established, entering data plane");
             self.state = ConnectionState::Running;
+            crate::service::report_state("Running").await;
             let reason = driver
                 .event_loop(
                     &mut tunnel,
@@ -1711,8 +1721,15 @@ impl ReconnectController {
         }
 
         self.state = ConnectionState::CleaningUp;
+        driver.report_state("CleaningUp").await;
         if setup_active {
             driver.cleanup_tun(&applied_config, &iface_name).await;
+        }
+        // CleaningUp is a progress state, not the reason this worker exits.
+        // Preserve terminal authentication failures for the supervisor only
+        // after teardown, without classifying unrelated setup errors as auth.
+        if terminal_auth_failure {
+            driver.report_state("ConfigurationError").await;
         }
         info!("VPN disconnected.");
         match terminal_error {
@@ -1890,6 +1907,7 @@ impl ReconnectController {
                 deadline_started = None;
                 self.policy.on_saml_presented_again();
                 self.state = ConnectionState::Authenticating;
+                crate::service::report_state("Authenticating").await;
                 if fresh_epoch {
                     info!(
                         state = ?self.state,
@@ -2084,6 +2102,7 @@ impl ReconnectController {
                     // or closed the tab, so arm a single re-present for the next
                     // interactive epoch rather than waiting here forever.
                     self.state = ConnectionState::WaitingForInteractiveAuth;
+                    crate::service::report_state("WaitingForInteractiveAuth").await;
                     soft_timed_out = true;
                     saw_noninteractive = !power.can_interact();
                     warn!(
@@ -2110,6 +2129,7 @@ impl ReconnectController {
         require_new_epoch: bool,
     ) -> bool {
         self.state = ConnectionState::WaitingForInteractiveAuth;
+        crate::service::report_state("WaitingForInteractiveAuth").await;
         let mut saw_noninteractive = !power.can_interact();
         info!(
             state = ?self.state,
@@ -2153,6 +2173,7 @@ impl ReconnectController {
         trusted_ssids: &[String],
     ) -> bool {
         self.state = ConnectionState::WaitingForNetwork;
+        crate::service::report_state("WaitingForNetwork").await;
         info!("Network unreachable — waiting for reachability");
         loop {
             if self.shutdown.is_cancelled() {
@@ -2198,6 +2219,7 @@ impl ReconnectController {
         trusted_ssids: &[String],
     ) -> bool {
         self.state = ConnectionState::SuspendedOnTrustedWifi;
+        crate::service::report_state("SuspendedOnTrustedWifi").await;
         info!(
             state = ?self.state,
             "On trusted Wi-Fi — VPN suspended until the network changes"
@@ -2240,6 +2262,7 @@ impl ReconnectController {
     /// Returns true when shutdown was requested.
     async fn wait_for_wake(&mut self, power: &mut PowerTracker) -> bool {
         self.state = ConnectionState::WaitingForNetwork;
+        crate::service::report_state("WaitingForNetwork").await;
         // Waiting on capability events alone has no floor: a dropped
         // notification, or a power monitor thread that died and closed its
         // channel, would park the tunnel here for the rest of the process.
@@ -2299,6 +2322,7 @@ impl ReconnectController {
         trusted_ssids: &[String],
     ) -> RetryOutcome {
         self.state = ConnectionState::WaitingToRetry;
+        crate::service::report_state("WaitingToRetry").await;
         let delay = self.policy.next_delay();
         self.log_retry_transition(context, delay, &self.state);
         if self.shutdown.is_cancelled() {
@@ -2802,6 +2826,11 @@ mod tests {
         type Tunnel = ScriptTunnel;
         type Lcp = ScriptLcp;
         type SamlAttempt = ScriptSamlAttempt;
+
+        fn report_state<'a>(&'a mut self, state: &'a str) -> DriverFuture<'a, ()> {
+            self.record(format!("state:{state}"));
+            Box::pin(async {})
+        }
 
         fn setup_tun<'a>(
             &'a mut self,
@@ -4369,6 +4398,75 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn terminal_reconnect_auth_reports_attention_after_cleanup() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial, Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver.auth.push_back(ScriptAuth::Result(Err(
+            FortiError::SamlTerminalConfiguration(
+                "scripted terminal authentication failure".into(),
+            ),
+        )));
+
+        let result = controller.run_with_driver(&mut driver).await;
+        assert!(matches!(
+            result,
+            Err(FortiError::SamlTerminalConfiguration(_))
+        ));
+        let log = driver.snapshot();
+        let cleaning = log
+            .iter()
+            .position(|entry| entry == "state:CleaningUp")
+            .unwrap();
+        let cleanup = log
+            .iter()
+            .rposition(|entry| entry.starts_with("cleanup:"))
+            .unwrap();
+        assert!(cleaning < cleanup, "{log:?}");
+        assert_eq!(
+            log.last().map(String::as_str),
+            Some("state:ConfigurationError")
+        );
+        assert_eq!(
+            crate::service::worker_exit_attention("ConfigurationError"),
+            Some("ConfigurationError".into())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_reconnect_auth_retries_without_terminal_report() {
+        let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
+        let mut controller = controller(initial.clone(), Shutdown::new());
+        let mut driver = ScriptDriver::default();
+        driver
+            .connects
+            .push_back(ScriptConnect::Failure(ConnectFailureKind::CookieRejected));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Err(FortiError::TransportUnavailable(
+                "temporary outage".into(),
+            ))));
+        driver
+            .auth
+            .push_back(ScriptAuth::Result(Ok("new-cookie".into())));
+        driver.configs.push_back(Ok(initial));
+        driver
+            .connects
+            .push_back(ScriptConnect::Success(Ipv4Addr::new(10, 0, 0, 2)));
+        driver.events.push_back(DisconnectReason::UserQuit);
+
+        controller.run_with_driver(&mut driver).await.unwrap();
+        let log = driver.snapshot();
+        assert_eq!(log.iter().filter(|entry| *entry == "auth").count(), 2);
+        assert!(log.contains(&"connect:new-cookie".into()));
+        assert!(!log.contains(&"state:ConfigurationError".into()));
+        assert_eq!(crate::service::worker_exit_attention("CleaningUp"), None);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn rejected_old_cookie_and_saml_timeout_never_reuses_old_cookie() {
         let initial = config([10, 0, 0, 2], [10, 1, 0, 0], [10, 0, 0, 53]);
         let shutdown = Shutdown::new();
@@ -4763,6 +4861,7 @@ mod tests {
 
         assert!(controller.run_with_driver(&mut driver).await.is_err());
         let log = driver.snapshot();
+        assert!(!log.contains(&"state:ConfigurationError".into()));
         assert_eq!(
             log.iter()
                 .filter(|entry| entry.starts_with("setup:"))

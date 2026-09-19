@@ -124,6 +124,15 @@ TLS (rustls) → Fortinet Wire Frame (0x5050 magic)
   → PPP (LCP/IPCP/IPv4) → Raw IP packets → utun
 ```
 
+## macOS managed service
+
+A launchd daemon and login agent can run the SAML client without a terminal,
+restart it after a crash, and provide `ctl status`, `pause`, `resume`,
+`reconnect`, `authenticate`, and `logs` commands. See the
+[installation and operations guide](docs/macos-service-operations.md).
+Administrator authentication is required for installation; daily controls do
+not require sudo. A menu-bar app is not included.
+
 ## Limitations
 
 - macOS only (uses utun kernel interface)

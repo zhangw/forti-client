@@ -163,6 +163,13 @@ async fn launch_saml_browser_with_context(
     presentation: SamlBrowserPresentation,
     context: &SamlBrowserCommandContext,
 ) -> std::io::Result<()> {
+    if std::env::var_os("FORTI_SERVICE_TOKEN").is_some() {
+        return crate::service::open_browser(
+            url,
+            presentation == SamlBrowserPresentation::Background,
+        )
+        .await;
+    }
     let mut command = saml_browser_command_with_context(
         url,
         presentation,
@@ -219,7 +226,9 @@ impl SamlAttempt {
         let context = self.browser_context.clone();
         async move {
             info!(?presentation, "Opening browser for SAML authentication...");
-            info!("If browser doesn't open, navigate to: {url}");
+            if std::env::var_os("FORTI_SERVICE_TOKEN").is_none() {
+                info!("If browser doesn't open, navigate to: {url}");
+            }
             launch_saml_browser_with_context(&url, presentation, &context).await
         }
     }
@@ -642,8 +651,14 @@ impl AuthClient {
 
     /// Authenticate via SAML/SSO and return only the session cookie.
     pub async fn authenticate_saml(&self) -> Result<String> {
-        self.authenticate_saml_with_presentation(SamlBrowserPresentation::Foreground)
-            .await
+        let presentation = if std::env::var_os("FORTI_SERVICE_TOKEN").is_some()
+            && std::env::var_os("FORTI_SERVICE_FOREGROUND").is_none()
+        {
+            SamlBrowserPresentation::Background
+        } else {
+            SamlBrowserPresentation::Foreground
+        };
+        self.authenticate_saml_with_presentation(presentation).await
     }
 
     /// Authenticate via SAML/SSO with explicit browser presentation.
@@ -654,10 +669,12 @@ impl AuthClient {
         let mut attempt = self.begin_saml_attempt().await?;
         if let Err(error) = attempt.present(presentation).await {
             debug!("Browser launcher failed: {}", error);
-            eprintln!(
-                "\nPlease open this URL in your browser:\n  {}\n",
-                attempt.url()
-            );
+            if std::env::var_os("FORTI_SERVICE_TOKEN").is_none() {
+                eprintln!(
+                    "\nPlease open this URL in your browser:\n  {}\n",
+                    attempt.url()
+                );
+            }
         }
 
         info!("Waiting for SAML authentication (complete login in your browser)...");

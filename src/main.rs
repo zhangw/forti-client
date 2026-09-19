@@ -146,7 +146,16 @@ fn init_logging(log_file: &str) {
     use tracing_subscriber::util::SubscriberInitExt;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let console = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    let console = tracing_subscriber::fmt::layer()
+        .with_ansi(std::env::var_os("FORTI_SERVICE_TOKEN").is_none())
+        .with_writer(std::io::stderr);
+    if log_file == "/dev/null" {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(console)
+            .init();
+        return;
+    }
 
     match open_log_file(log_file) {
         Ok(file) => {
@@ -177,7 +186,21 @@ fn init_logging(log_file: &str) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("check-service-config") => {
+            return forti_client::service::validate_config(
+                args.get(2)
+                    .ok_or_else(|| anyhow::anyhow!("configuration path required"))?,
+            )
+        }
+        Some("service") => return forti_client::service::daemon().await,
+        Some("agent") => return forti_client::service::agent().await,
+        Some("ctl") => return forti_client::service::control(&args[2..]).await,
+        _ => {}
+    }
     let mut cli = Cli::parse();
+    let _instance = forti_client::service::worker_lock()?;
     init_logging(&cli.log_file);
 
     let enable_keylog = if let Some(ref path) = cli.tls_keylog_file {
@@ -222,33 +245,6 @@ async fn main() -> anyhow::Result<()> {
         true
     } else {
         false
-    };
-
-    // Resolve the gateway once, up front, while the system resolver is still
-    // pointed at physical DNS servers. Every later connection and reconnect
-    // uses this address, so a tunnel that installs VPN-internal DNS servers
-    // cannot black-hole its own reconnect path.
-    let server_addr = forti_client::auth::resolve_server_addr(&cli.server, cli.port).await?;
-    tracing::info!("Resolved {} to {}", cli.server, server_addr);
-
-    let auth_client =
-        AuthClient::new(&cli.server, cli.port, enable_keylog)?.with_pinned_addr(server_addr);
-
-    // Prompt for password early (before we need sudo/root)
-    let password: Option<SecretString> = if !cli.saml {
-        match cli.password.take() {
-            Some(p) => Some(SecretString::from(p)),
-            None if cli.username.is_some() => {
-                eprint!("Password: ");
-                std::io::stderr().flush()?;
-                let mut p = String::new();
-                std::io::stdin().read_line(&mut p)?;
-                Some(SecretString::from(p.trim().to_string()))
-            }
-            None => None,
-        }
-    } else {
-        None
     };
 
     // Tokio keeps the signal handlers installed for the process lifetime. The
@@ -314,6 +310,44 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // SIGKILL cannot run Drop. Clean the previous owner's DNS before DNS lookup.
+    if _instance.is_some() {
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            result = forti_client::tun::dns::remove_dns() => result?,
+        }
+    }
+    forti_client::service::report_state("ResolvingGateway").await;
+    // Resolve the gateway once, up front, while the system resolver is still
+    // pointed at physical DNS servers. Every later connection and reconnect
+    // uses this address, so a tunnel that installs VPN-internal DNS servers
+    // cannot black-hole its own reconnect path.
+    let server_addr = tokio::select! {
+        _ = shutdown.cancelled() => return Ok(()),
+        result = forti_client::auth::resolve_server_addr(&cli.server, cli.port) => result?,
+    };
+    tracing::info!("Resolved {} to {}", cli.server, server_addr);
+
+    let auth_client =
+        AuthClient::new(&cli.server, cli.port, enable_keylog)?.with_pinned_addr(server_addr);
+
+    // Prompt for password early (before we need sudo/root)
+    let password: Option<SecretString> = if !cli.saml {
+        match cli.password.take() {
+            Some(p) => Some(SecretString::from(p)),
+            None if cli.username.is_some() => {
+                eprint!("Password: ");
+                std::io::stderr().flush()?;
+                let mut p = String::new();
+                std::io::stdin().read_line(&mut p)?;
+                Some(SecretString::from(p.trim().to_string()))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // Trusted Wi-Fi startup gate: while the machine sits on a whitelisted
     // SSID no VPN may exist, so even the initial authentication (and its SAML
     // browser popup) waits until the network drifts off the whitelist — and a
@@ -336,6 +370,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     event = wifi_rx.recv() => match event {
                         Some(event) if is_trusted_wifi(event.ssid.as_deref(), &cli.trusted_wifi) => {
+                            forti_client::service::report_state("SuspendedOnTrustedWifi").await;
                             tracing::info!(
                                 ssid = ?event.ssid,
                                 "On trusted Wi-Fi — deferring VPN connection until the network changes"
@@ -352,6 +387,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        forti_client::service::report_state("Authenticating").await;
         let auth_future = async {
             if cli.saml {
                 tracing::info!(
@@ -396,7 +432,18 @@ async fn main() -> anyhow::Result<()> {
                 );
                 continue;
             }
-            result = auth_future => break result?,
+            result = auth_future => {
+                if let Err(ref error) = result {
+                    use forti_client::error::SamlFailureKind;
+                    let state = match SamlFailureKind::classify(error) {
+                        SamlFailureKind::CallbackTimedOut | SamlFailureKind::CallbackInvalid | SamlFailureKind::UserCancelled => "NeedsAuthentication",
+                        SamlFailureKind::TerminalConfiguration => "ConfigurationError",
+                        _ => "WaitingToRetry",
+                    };
+                    forti_client::service::report_state(state).await;
+                }
+                break result?;
+            },
         }
     };
 
