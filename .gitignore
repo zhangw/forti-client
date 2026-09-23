@@ -28,3 +28,6 @@ target
 
 local-run.sh
 probe-targets.json
+
+# Generated package artifacts
+/dist/

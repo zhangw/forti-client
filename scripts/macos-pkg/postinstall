@@ -1,0 +1,12 @@
+#!/bin/bash
+set -euo pipefail
+[[ $EUID == 0 ]] || { echo 'Administrator authentication required.' >&2; exit 1; }
+# The package payload is prepared by the root postinstall script. Run the
+# transaction as root so service files and the binary stay protected.
+scripts_dir="$(cd "$(dirname "$0")" && pwd)"
+stage=$(mktemp -d /private/tmp/forti-client-pkg.XXXXXX)
+cleanup() { rm -rf "$stage"; }
+trap cleanup EXIT
+cp -p "$scripts_dir/payload"/* "$stage/"
+cp -p "$scripts_dir/install-user.sh" "$stage/install-user.sh"
+/bin/bash "$stage/install-user.sh"
