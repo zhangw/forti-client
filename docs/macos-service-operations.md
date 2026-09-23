@@ -83,9 +83,18 @@ Daemon/Agent 日志为 0600，每份最多 5 MiB，保留一份 `.1`。文件初
 python3 scripts/probe-connectivity.py vpn-app.example.com
 ```
 
-脚本默认每 60 秒检查一次 DNS、路由、TCP 443、控制状态及资源快照。不需要 sudo，但运行环境必须允许本地网络及路由查询。首次、异常变化、恢复或 Daemon/worker PID 变化时输出 JSON；相同异常不重复输出。FD 达到 80%、快照超过 180 秒、采集失败或旧服务缺少字段都会明确报告。`ok` 是综合结果，`connectivity_ok` 单独表示路由查询/TCP 连接结果。TCP 成功不代表 TLS、HTTP 或页面依赖正常。DNS 解析由系统 resolver 负责，耗时超出间隔时不会并发堆积新一轮。
+脚本默认每 60 秒检查 DNS、每个唯一 IPv4 地址的路由和 TCP、控制状态及资源快照。不需要 sudo，但运行环境必须允许本地网络及路由查询。首次、异常变化、恢复或 Daemon/worker PID 变化时输出 JSON；相同异常不重复输出。FD 达到 80%、快照超过 180 秒、采集失败或旧服务缺少字段都会明确报告。`dns_ok`、`route_ok`、`tcp_ok`、`service_ok` 分别表示各层结果，`connectivity_ok` 汇总前三项，`ok` 是最终综合结果。TCP 成功不代表 TLS、HTTP 或页面依赖正常。DNS 解析由系统 resolver 负责，耗时超出间隔时不会并发堆积新一轮。
 
-相关回归检查：`cargo test --locked --lib` 和 `python3 -m unittest discover -s scripts -p 'test_probe_connectivity.py'`。控制接口故障测试通过注入错误模拟 FD 耗尽和任务 panic，不改变系统 FD 上限，不接触已安装 VPN。
+可重复使用 `--target HOST:PORT=INTERFACE` 检查多个目标；`INTERFACE` 可为任意 `utunN` 对应的 `utun`、精确接口名或不检查接口的 `any`。本机专用目标也可放在 Git 忽略的 `probe-targets.json`，由准备脚本复制到 staging。对已安装的服务，仅部署巡检文件，不需要替换 FortiClient 或重启 VPN：
+
+```sh
+python3 scripts/prepare-service.py
+sudo target/service-install/install-probe.sh
+/usr/bin/python3 "/Library/Application Support/FortiClient/probe-connectivity.py" \
+  --targets-file "/Library/Application Support/FortiClient/probe-targets.json" --count 1
+```
+
+`install-probe.sh` 只原子替换 root 所有的巡检脚本和非敏感目标配置，不修改 VPN 配置、连接意图或 launchd 服务。相关回归检查：`cargo test --locked --lib` 和 `python3 -m unittest discover -s scripts -p 'test_probe_connectivity.py'`。控制接口故障测试通过注入错误模拟 FD 耗尽和任务 panic，不改变系统 FD 上限，不接触已安装 VPN。
 
 `sudo /usr/bin/python3 scripts/smoke-service.py` 会短暂断开 VPN、故意 SIGKILL 托管工作进程和 Daemon。仅在允许中断时运行。它验证：
 

@@ -1,0 +1,9 @@
+{
+  "targets": [
+    {
+      "host": "office.example",
+      "port": 443,
+      "expected_interface": "utun"
+    }
+  ]
+}

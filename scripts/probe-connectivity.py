@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Probe route selection, TCP connectivity, and the managed service."""
+"""Probe every target address, route selection, TCP connectivity, and Forti service."""
 import argparse
 import json
+import pathlib
 import socket
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
+
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+from probe_targets import load_targets_file, validate_target
 
 DEFAULT_BINARY = "/Library/Application Support/FortiClient/forti-client"
 
@@ -27,22 +34,98 @@ def route_for(address):
     return interface
 
 
-def probe(host, port):
-    started = time.monotonic()
-    addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    address = addresses[0][4][0]
-    interface = route_for(address)
-    with socket.create_connection((address, port), timeout=5):
-        pass
-    return {
-        "time": datetime.now(timezone.utc).isoformat(),
-        "host": host,
-        "address": address,
-        "port": port,
-        "interface": interface,
-        "tcp_ms": round((time.monotonic() - started) * 1000, 1),
-        "ok": True,
-    }
+def resolve_ipv4(host, port):
+    addresses = []
+    seen = set()
+    for entry in socket.getaddrinfo(
+        host, port, family=socket.AF_INET, type=socket.SOCK_STREAM
+    ):
+        address = entry[4][0]
+        if address not in seen:
+            seen.add(address)
+            addresses.append(address)
+    if not addresses:
+        raise RuntimeError("no IPv4 addresses returned")
+    return addresses
+
+
+def interface_matches(actual, expected):
+    if expected == "any":
+        return True
+    if expected == "utun":
+        return bool(actual) and actual.startswith("utun")
+    return actual == expected
+
+
+def parse_target(value):
+    try:
+        endpoint, expected = value.rsplit("=", 1)
+        host, port_text = endpoint.rsplit(":", 1)
+        port = int(port_text)
+    except (ValueError, AttributeError) as error:
+        raise ValueError(
+            f"invalid target {value!r}; expected HOST:PORT=INTERFACE"
+        ) from error
+    return validate_target(
+        {"host": host, "port": port, "expected_interface": expected}
+    )
+
+
+def probe_target(target, resolver=resolve_ipv4, route_lookup=route_for,
+                 connector=socket.create_connection, clock=time.monotonic):
+    target = validate_target(target)
+    result = dict(target, addresses=[], issues=[])
+    try:
+        addresses = resolver(target["host"], target["port"])
+    except Exception as error:
+        result.update(
+            dns_ok=False,
+            route_ok=False,
+            tcp_ok=False,
+            ok=False,
+            error=f"{type(error).__name__}: {error}",
+        )
+        result["issues"].append(f"DNS: {result['error']}")
+        return result
+
+    result["dns_ok"] = True
+    for address in addresses:
+        endpoint = {"address": address}
+        try:
+            interface = route_lookup(address)
+            endpoint["interface"] = interface
+            endpoint["route_ok"] = interface_matches(
+                interface, target["expected_interface"]
+            )
+            if not endpoint["route_ok"]:
+                result["issues"].append(
+                    f"{address}: expected interface={target['expected_interface']}, "
+                    f"actual={interface}"
+                )
+        except Exception as error:
+            endpoint["route_ok"] = False
+            endpoint["route_error"] = f"{type(error).__name__}: {error}"
+            result["issues"].append(f"{address}: route: {endpoint['route_error']}")
+
+        started = clock()
+        connection = None
+        try:
+            connection = connector((address, target["port"]), timeout=5)
+            endpoint["tcp_ok"] = True
+            endpoint["tcp_ms"] = round((clock() - started) * 1000, 1)
+        except Exception as error:
+            endpoint["tcp_ok"] = False
+            endpoint["tcp_error"] = f"{type(error).__name__}: {error}"
+            result["issues"].append(f"{address}: TCP: {endpoint['tcp_error']}")
+        finally:
+            if connection is not None:
+                connection.close()
+        result["addresses"].append(endpoint)
+
+    result["route_ok"] = all(item["route_ok"] for item in result["addresses"])
+    result["tcp_ok"] = all(item["tcp_ok"] for item in result["addresses"])
+    result["ok"] = result["dns_ok"] and result["route_ok"] and result["tcp_ok"]
+    return result
 
 
 def service_status(binary):
@@ -93,62 +176,157 @@ def service_issues(status):
     return issues
 
 
+def collect_result(targets, binary, target_probe=probe_target,
+                   status_probe=service_status):
+    target_results = [target_probe(target) for target in targets]
+    result = {
+        "time": datetime.now(timezone.utc).isoformat(),
+        "targets": target_results,
+        "dns_ok": all(item["dns_ok"] for item in target_results),
+        "route_ok": all(item["route_ok"] for item in target_results),
+        "tcp_ok": all(item["tcp_ok"] for item in target_results),
+    }
+    result["connectivity_ok"] = (
+        result["dns_ok"] and result["route_ok"] and result["tcp_ok"]
+    )
+    issues = [
+        f"{item['host']}:{item['port']}: {issue}"
+        for item in target_results
+        for issue in item["issues"]
+    ]
+    try:
+        status = status_probe(binary)
+        result["service"] = status
+        service_problems = service_issues(status)
+    except Exception as error:
+        result["service"] = None
+        service_problems = [f"ctl status: {type(error).__name__}: {error}"]
+    result["service_ok"] = not service_problems
+    result["issues"] = issues + service_problems
+    result["ok"] = result["connectivity_ok"] and result["service_ok"]
+
+    # Preserve the most-used fields from the former single-target output while
+    # exposing every address under targets[0].addresses.
+    if len(target_results) == 1:
+        target = target_results[0]
+        result["host"] = target["host"]
+        result["port"] = target["port"]
+        if target["addresses"]:
+            first = target["addresses"][0]
+            result["address"] = first["address"]
+            result["interface"] = first.get("interface")
+            result["tcp_ms"] = first.get("tcp_ms")
+    return result
+
+
 def report_signature(result):
     service = result.get("service") or {}
-    return (result["ok"], result.get("interface"), tuple(result["issues"]),
-            service.get("state"), service.get("desired"),
-            service.get("daemon_pid"), service.get("worker_pid"))
+    targets = result.get("targets")
+    if targets is None:
+        # Compatibility for callers constructing the old result shape.
+        network = (result.get("interface"),)
+    else:
+        network = tuple(
+            (
+                target.get("host"),
+                target.get("port"),
+                target.get("expected_interface"),
+                target.get("dns_ok"),
+                target.get("route_ok"),
+                target.get("tcp_ok"),
+                tuple(sorted(
+                    (
+                        item.get("address"),
+                        item.get("interface"),
+                        item.get("route_ok"),
+                        item.get("tcp_ok"),
+                        item.get("route_error"),
+                        item.get("tcp_error"),
+                    )
+                    for item in target.get("addresses", [])
+                )),
+            )
+            for target in targets
+        )
+    return (
+        result["ok"],
+        network,
+        tuple(result["issues"]),
+        service.get("state"),
+        service.get("desired"),
+        service.get("daemon_pid"),
+        service.get("worker_pid"),
+    )
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("host")
+    parser.add_argument("host", nargs="?", help="legacy single target hostname")
     parser.add_argument("--port", type=int, default=443)
+    parser.add_argument(
+        "--expected-interface",
+        default="utun",
+        help="legacy target interface: utun, any, or an exact interface",
+    )
+    parser.add_argument(
+        "--target",
+        action="append",
+        default=[],
+        metavar="HOST:PORT=INTERFACE",
+        help="repeatable target; INTERFACE is utun, any, or an exact name",
+    )
+    parser.add_argument("--targets-file", help="JSON file containing a targets array")
     parser.add_argument("--interval", type=int, default=60)
     parser.add_argument("--count", type=int, default=0, help="0 means run forever")
     parser.add_argument("--binary", default=DEFAULT_BINARY, help="forti-client control binary")
-    args = parser.parse_args()
-    if not args.host or args.interval < 1 or args.count < 0 or not 1 <= args.port <= 65535:
-        parser.error("nonempty host, positive interval, nonnegative count and valid port required")
-    completed = 0
-    previous_signature = None
-    while args.count == 0 or completed < args.count:
-        started = time.monotonic()
-        try:
-            result = probe(args.host, args.port)
-        except Exception as error:
-            result = {
-                "time": datetime.now(timezone.utc).isoformat(),
+    args = parser.parse_args(argv)
+    if args.interval < 1 or args.count < 0:
+        parser.error("positive interval and nonnegative count required")
+    try:
+        targets = []
+        if args.host is not None:
+            targets.append(validate_target({
                 "host": args.host,
                 "port": args.port,
-                "ok": False,
-                "error": f"{type(error).__name__}: {error}",
-            }
-        try:
-            status = service_status(args.binary)
-            result["service"] = status
-            result["service_issues"] = service_issues(status)
-        except Exception as error:
-            result["service"] = None
-            result["service_issues"] = [f"ctl status: {type(error).__name__}: {error}"]
-        if result.get("interface") and not result["interface"].startswith("utun"):
-            result.setdefault("issues", []).append(f"unexpected interface={result['interface']}")
-        if not result.get("ok"):
-            result.setdefault("issues", []).append(result.get("error", "connectivity failed"))
-        result["issues"] = result.get("issues", []) + result.pop("service_issues")
-        result["connectivity_ok"] = result["ok"]
-        result["ok"] = not result["issues"]
-        signature = report_signature(result)
-        if signature != previous_signature:
-            result["event"] = ("anomaly" if result["issues"] else
-                               "recovered" if previous_signature and not previous_signature[0] else
-                               "initial" if previous_signature is None else "changed")
-            print(json.dumps(result, sort_keys=True), flush=True)
-        previous_signature = signature
-        completed += 1
-        if args.count == 0 or completed < args.count:
-            time.sleep(max(0, args.interval - (time.monotonic() - started)))
+                "expected_interface": args.expected_interface,
+            }))
+        targets.extend(parse_target(value) for value in args.target)
+        if args.targets_file:
+            targets.extend(load_targets_file(args.targets_file)["targets"])
+        if not targets:
+            raise ValueError("provide host, --target, or --targets-file")
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    args.targets = targets
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    completed = 0
+    previous_signature = None
+    had_failure = False
+    try:
+        while args.count == 0 or completed < args.count:
+            started = time.monotonic()
+            result = collect_result(args.targets, args.binary)
+            had_failure = had_failure or not result["ok"]
+            signature = report_signature(result)
+            if signature != previous_signature:
+                result["event"] = (
+                    "anomaly" if result["issues"] else
+                    "recovered" if previous_signature and not previous_signature[0] else
+                    "initial" if previous_signature is None else "changed"
+                )
+                print(json.dumps(result, sort_keys=True), flush=True)
+            previous_signature = signature
+            completed += 1
+            if args.count == 0 or completed < args.count:
+                time.sleep(max(0, args.interval - (time.monotonic() - started)))
+    except KeyboardInterrupt:
+        return 0
+    return int(args.count > 0 and had_failure)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
